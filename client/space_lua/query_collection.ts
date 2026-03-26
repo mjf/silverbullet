@@ -39,6 +39,50 @@ import type { KvKey } from "../../plug-api/types/datastore.ts";
 import { executeAggregate, getAggregateSpec } from "./aggregates.ts";
 import { Config } from "../config.ts";
 
+import { HyperLogLog } from "./hll.ts";
+
+// Collection statistics for the cost-based planner
+export type CollectionStats = {
+  rowCount: number;
+  ndv: Map<string, number>;
+};
+
+// Mutable stats tracker for collections that support indexing
+export class StatsTracker {
+  rowCount = 0;
+  private hllMap = new Map<string, HyperLogLog>();
+
+  index(item: Record<string, any>): void {
+    this.rowCount++;
+    for (const key of Object.keys(item)) {
+      let hll = this.hllMap.get(key);
+      if (!hll) {
+        hll = new HyperLogLog();
+        this.hllMap.set(key, hll);
+      }
+      hll.add(String(item[key]));
+    }
+  }
+
+  unindex(): void {
+    // Decrement only (HLL cannot remove but approximation stays valid)
+    if (this.rowCount > 0) this.rowCount--;
+  }
+
+  getStats(): CollectionStats {
+    const ndv = new Map<string, number>();
+    for (const [col, hll] of this.hllMap) {
+      ndv.set(col, hll.estimate());
+    }
+    return { rowCount: this.rowCount, ndv };
+  }
+
+  clear(): void {
+    this.rowCount = 0;
+    this.hllMap.clear();
+  }
+}
+
 // Implicit single group map key (aggregates without `group by`)
 const IMPLICIT_GROUP_KEY: unique symbol = Symbol("implicit-group");
 
@@ -194,6 +238,7 @@ export interface LuaQueryCollection {
  */
 export class ArrayQueryCollection<T> implements LuaQueryCollection {
   constructor(private readonly array: T[]) {}
+
   query(
     query: LuaCollectionQuery,
     env: LuaEnv,
@@ -201,6 +246,28 @@ export class ArrayQueryCollection<T> implements LuaQueryCollection {
     config?: Config,
   ): Promise<any[]> {
     return applyQuery(this.array, query, env, sf, config);
+  }
+
+  getStats(): CollectionStats {
+    const ndv = new Map<string, number>();
+    // Scan items for distinct values
+    const seen = new Map<string, Set<string>>();
+    for (const item of this.array) {
+      if (typeof item === "object" && item !== null) {
+        for (const key of Object.keys(item as any)) {
+          let s = seen.get(key);
+          if (!s) {
+            s = new Set();
+            seen.set(key, s);
+          }
+          s.add(String((item as any)[key]));
+        }
+      }
+    }
+    for (const [k, s] of seen) {
+      ndv.set(k, s.size);
+    }
+    return { rowCount: this.array.length, ndv };
   }
 }
 
