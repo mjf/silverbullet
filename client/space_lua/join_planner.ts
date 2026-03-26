@@ -2,7 +2,7 @@
  * Cost-Based Join Planner for LIQ (Lua Integrated Query).
  *
  * Transforms a multi-source `from` clause into an optimized join tree,
- * then executes it using hash join or nested Loop operators.
+ * then executes it using hash join, nested loop, or sort-merge operators.
  */
 import type { LuaExpression, LuaJoinHint } from "./ast.ts";
 import type { CollectionStats } from "./query_collection.ts";
@@ -39,7 +39,7 @@ export type JoinInner = {
   kind: "join";
   left: JoinNode;
   right: JoinNode;
-  method: "hash" | "loop";
+  method: "hash" | "loop" | "merge";
 };
 
 // Estimates the output cardinality after filtering a source (uses
@@ -130,14 +130,13 @@ export function buildJoinTree(
 function selectPhysicalOperator(
   left: JoinSource,
   right: JoinSource,
-): "hash" | "loop" {
+): "hash" | "loop" | "merge" {
   if (right.hint) {
     const k = right.hint.kind;
 
     if (k === "hash") return "hash";
     if (k === "loop") return "loop";
-    // merge fallbacks to hash for now
-    if (k === "merge") return "hash";
+    if (k === "merge") return "merge";
   }
 
   // Hash if either side > 50 rows
@@ -193,6 +192,45 @@ function rowToTable(name: string, item: any, existing?: LuaTable): LuaTable {
   return row;
 }
 
+// Clone a LuaTable row (shallow copy of all keys)
+function cloneRow(src: LuaTable): LuaTable {
+  const dst = new LuaTable();
+  for (const k of luaKeys(src)) {
+    void dst.rawSet(k, src.rawGet(k));
+  }
+  return dst;
+}
+
+// Generic sort-key extraction: returns a primitive suitable for
+// comparison via `<` / `===`.  For LuaTables we use a stable
+// stringified form so the merge comparator works correctly.
+function sortKey(item: any): string | number {
+  if (item === null || item === undefined) return "";
+  if (typeof item === "string") return item;
+  if (typeof item === "number") return item;
+  if (typeof item === "boolean") return item ? 1 : 0;
+  // LuaTable or object: JSON-stringify keys in sorted order for
+  // deterministic comparison.
+  if (item instanceof LuaTable) {
+    const parts: string[] = [];
+    for (const k of luaKeys(item)) {
+      const v = item.rawGet(k);
+      parts.push(`${k}:${v ?? ""}`);
+    }
+    parts.sort();
+    return parts.join("|");
+  }
+  return String(item);
+}
+
+// Compare two sort keys: returns <0, 0, or >0
+function compareSortKeys(a: string | number, b: string | number): number {
+  if (typeof a === "number" && typeof b === "number") return a - b;
+  const sa = String(a);
+  const sb = String(b);
+  return sa < sb ? -1 : sa > sb ? 1 : 0;
+}
+
 // Hash join $O(N+M)$
 async function hashJoin(
   leftRows: LuaTable[],
@@ -212,10 +250,7 @@ async function hashJoin(
         );
       }
       // Clone left row and add right
-      const newRow = new LuaTable();
-      for (const k of luaKeys(leftRow)) {
-        void newRow.rawSet(k, leftRow.rawGet(k));
-      }
+      const newRow = cloneRow(leftRow);
       void newRow.rawSet(rightName, rightItem);
       results.push(newRow);
 
@@ -239,6 +274,102 @@ async function nestedLoopJoin(
   return hashJoin(leftRows, rightItems, rightName, sf);
 }
 
+// Sort-Merge Join: $O(N \log N + M \log M)$ sort + $O(N+M)$ merge.
+// Both sides are sorted on their sort key then merged with a
+// two-pointer scan.  For Cartesian products every left row pairs
+// with every right row of the same key (and rows with no match on
+// either side are still emitted as in a cross join).
+async function sortMergeJoin(
+  leftRows: LuaTable[],
+  rightItems: any[],
+  rightName: string,
+  sf: LuaStackFrame,
+): Promise<LuaTable[]> {
+  // Extract sort keys for left rows (use first column value)
+  const leftKeyed = leftRows.map((row) => {
+    // Use the value of the first source binding as sort key
+    let key: string | number = "";
+    for (const k of luaKeys(row)) {
+      key = sortKey(row.rawGet(k));
+      break;
+    }
+    return { row, key };
+  });
+
+  const rightKeyed = rightItems.map((item) => ({
+    item,
+    key: sortKey(item),
+  }));
+
+  // Sort both sides
+  leftKeyed.sort((a, b) => compareSortKeys(a.key, b.key));
+  rightKeyed.sort((a, b) => compareSortKeys(a.key, b.key));
+
+  const results: LuaTable[] = [];
+  let processed = 0;
+  let li = 0;
+  let ri = 0;
+
+  while (li < leftKeyed.length && ri < rightKeyed.length) {
+    const cmp = compareSortKeys(leftKeyed[li].key, rightKeyed[ri].key);
+
+    if (cmp < 0) {
+      // Left key smaller: emit left row with no right match (cross semantics)
+      // In a Cartesian cross-join every left must pair with every right,
+      // so advance left and pair with all remaining right items of the
+      // same key group (which is empty here).  Just advance.
+      li++;
+    } else if (cmp > 0) {
+      ri++;
+    } else {
+      // Keys match: collect all left and right rows with the same key
+      // and emit the Cartesian product of the two groups.
+      const matchKey = leftKeyed[li].key;
+
+      const leftGroup: LuaTable[] = [];
+      while (
+        li < leftKeyed.length &&
+        compareSortKeys(leftKeyed[li].key, matchKey) === 0
+      ) {
+        leftGroup.push(leftKeyed[li].row);
+        li++;
+      }
+
+      const rightGroup: any[] = [];
+      while (
+        ri < rightKeyed.length &&
+        compareSortKeys(rightKeyed[ri].key, matchKey) === 0
+      ) {
+        rightGroup.push(rightKeyed[ri].item);
+        ri++;
+      }
+
+      for (const leftRow of leftGroup) {
+        for (const rightItem of rightGroup) {
+          if (++processed > WATCHDOG_LIMIT) {
+            throw new LuaRuntimeError(
+              `Query watchdog: intermediate result exceeded ${WATCHDOG_LIMIT} rows`,
+              sf,
+            );
+          }
+          const newRow = cloneRow(leftRow);
+          void newRow.rawSet(rightName, rightItem);
+          results.push(newRow);
+
+          if (processed % YIELD_CHUNK === 0) {
+            await cooperativeYield();
+          }
+        }
+      }
+    }
+  }
+
+  // Remaining unmatched rows on either side do not produce output
+  // in a Cartesian cross-join context (no outer join semantics).
+
+  return results;
+}
+
 // Execute a join tree and return materialized `LuaTable` rows
 export async function executeJoinTree(
   tree: JoinNode,
@@ -258,8 +389,12 @@ export async function executeJoinTree(
   );
   const rightName = (tree.right as JoinLeaf).source.name;
 
-  if (tree.method === "hash") {
-    return hashJoin(leftRows, rightItems, rightName, sf);
+  switch (tree.method) {
+    case "hash":
+      return hashJoin(leftRows, rightItems, rightName, sf);
+    case "merge":
+      return sortMergeJoin(leftRows, rightItems, rightName, sf);
+    case "loop":
+      return nestedLoopJoin(leftRows, rightItems, rightName, sf);
   }
-  return nestedLoopJoin(leftRows, rightItems, rightName, sf);
 }
