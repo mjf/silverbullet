@@ -131,6 +131,7 @@ function expressionHasFunctionDef(e: LuaExpression): boolean {
           case "From":
           case "Select":
           case "GroupBy":
+          case "PlanOrderBy":
             for (const f of c.fields) {
               switch (f.type) {
                 case "DynamicField":
@@ -164,8 +165,6 @@ function expressionHasFunctionDef(e: LuaExpression): boolean {
                 return true;
               }
             }
-            break;
-          case "PlanOrderBy":
             break;
         }
       }
@@ -251,6 +250,7 @@ function exprReferencesNames(e: LuaExpression, names: Set<string>): boolean {
           case "From":
           case "Select":
           case "GroupBy":
+          case "PlanOrderBy":
             for (const f of c.fields) {
               switch (f.type) {
                 case "DynamicField":
@@ -284,8 +284,6 @@ function exprReferencesNames(e: LuaExpression, names: Set<string>): boolean {
                 return true;
               }
             }
-            break;
-          case "PlanOrderBy":
             break;
         }
       }
@@ -586,6 +584,7 @@ function exprCapturesNames(e: LuaExpression, names: Set<string>): boolean {
           case "From":
           case "Select":
           case "GroupBy":
+          case "PlanOrderBy":
             for (const f of c.fields) {
               switch (f.type) {
                 case "DynamicField":
@@ -617,8 +616,6 @@ function exprCapturesNames(e: LuaExpression, names: Set<string>): boolean {
                 if (functionBodyCapturesNames(u, names)) return true;
               }
             }
-            break;
-          case "PlanOrderBy":
             break;
         }
       }
@@ -1451,16 +1448,14 @@ function parseQueryClause(t: ParseTree, ctx: ASTCtx): LuaQueryClause {
       };
     }
     case "PlanClause": {
-      // children: ckw<"plan">, ckw<"order">, ckw<"by">, Name, (",", Name)*
-      const names: string[] = [];
-      for (const child of t.children!) {
-        if (child.type === "Name") {
-          names.push(child.children![0].text!);
-        }
+      // children: ckw<"plan">, ckw<"order">, ckw<"by">, FieldList
+      const fieldListNode = t.children!.find((c) => c.type === "FieldList");
+      if (!fieldListNode) {
+        throw new Error("PlanClause missing FieldList");
       }
       return {
         type: "PlanOrderBy",
-        names,
+        fields: parseFieldList(fieldListNode, ctx),
         ctx: context(t, ctx),
       };
     }
