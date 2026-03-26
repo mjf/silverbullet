@@ -296,9 +296,11 @@ export type LuaAggregateCallExpression = {
 } & ASTContext;
 
 // Join hint attached to a from-clause source binding
+export type JoinHintKind = "hash" | "loop" | "merge" | "using";
+
 export type LuaJoinHint = {
   type: "JoinHint";
-  kind: "hash" | "loop" | "merge" | "using";
+  kind: JoinHintKind;
   using?: string | LuaFunctionBody;
 } & ASTContext;
 

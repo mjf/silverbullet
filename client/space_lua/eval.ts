@@ -1,8 +1,15 @@
+import {
+  type JoinSource,
+  buildJoinTree,
+  executeJoinTree,
+} from "./join_planner.ts";
 import type {
   ASTCtx,
   LuaBlock,
   LuaExpression,
+  LuaFromField,
   LuaLValue,
+  LuaPlanOrderByClause,
   LuaStatement,
   LuaTableField,
   NumericType,
@@ -752,9 +759,12 @@ function fieldsToGroupByEntries(fields: LuaTableField[]): LuaGroupByEntry[] {
 
 type FromSource =
   | { kind: "single"; objectVariable?: string; expression: LuaExpression }
-  | { kind: "cross"; sources: { name: string; expression: LuaExpression }[] };
+  | {
+      kind: "cross";
+      sources: JoinSource[];
+    };
 
-function fromFieldsToSource(fields: LuaTableField[], ctx: ASTCtx): FromSource {
+function fromFieldsToSource(fields: LuaFromField[], ctx: ASTCtx): FromSource {
   if (fields.length === 1) {
     const f = fields[0];
     if (f.type === "ExpressionField") {
@@ -765,95 +775,20 @@ function fromFieldsToSource(fields: LuaTableField[], ctx: ASTCtx): FromSource {
     }
   }
 
-  const sources: { name: string; expression: LuaExpression }[] = [];
+  const sources: JoinSource[] = [];
   for (const f of fields) {
     if (f.type !== "PropField") {
       throw new LuaRuntimeError("Multi-source 'from' requires named sources", {
         ref: ctx,
       } as any);
     }
-    sources.push({ name: f.key, expression: f.value });
+    sources.push({
+      name: f.key,
+      expression: f.value,
+      hint: f.joinHint,
+    });
   }
   return { kind: "cross", sources };
-}
-
-async function normalizeToArray(
-  collection: LuaValue,
-  sf: LuaStackFrame,
-): Promise<any[]> {
-  if (collection instanceof LuaTable && collection.empty()) {
-    return [];
-  }
-  if (collection instanceof LuaTable) {
-    if (collection.length > 0) {
-      const arr: any[] = [];
-      for (let i = 1; i <= collection.length; i++) {
-        arr.push(collection.rawGet(i));
-      }
-      return arr;
-    }
-    return [collection];
-  }
-  if (Array.isArray(collection)) {
-    return collection;
-  }
-  if (
-    typeof collection === "object" &&
-    collection !== null &&
-    "query" in collection &&
-    typeof (collection as any).query === "function"
-  ) {
-    const allItems = await (collection as any).query(
-      { distinct: false },
-      new LuaEnv(),
-      sf,
-    );
-    return Array.isArray(allItems) ? allItems : [allItems];
-  }
-  const jsVal = luaValueToJS(collection, sf);
-  return Array.isArray(jsVal) ? jsVal : [jsVal];
-}
-
-async function evalCrossJoinSources(
-  sources: { name: string; expression: LuaExpression }[],
-  env: LuaEnv,
-  sf: LuaStackFrame,
-  ctx: ASTCtx,
-): Promise<LuaTable[]> {
-  // Evaluate each source and normalize to arrays
-  const arrays: { name: string; items: any[] }[] = [];
-  for (const src of sources) {
-    const val = await evalExpression(src.expression, env, sf);
-    if (val === null || val === undefined) {
-      throw new LuaRuntimeError(
-        `Cross-join source '${src.name}' is nil`,
-        sf.withCtx(ctx),
-      );
-    }
-    const items = await normalizeToArray(val, sf);
-    arrays.push({ name: src.name, items });
-  }
-
-  // Cartesian product
-  let product: Record<string, any>[] = [{}];
-  for (const { name, items } of arrays) {
-    const newProduct: Record<string, any>[] = [];
-    for (const combo of product) {
-      for (const item of items) {
-        newProduct.push({ ...combo, [name]: item });
-      }
-    }
-    product = newProduct;
-  }
-
-  // Convert each combination to a `LuaTable` row
-  return product.map((combo) => {
-    const row = new LuaTable();
-    for (const key in combo) {
-      void row.rawSet(key, combo[key]);
-    }
-    return row;
-  });
 }
 
 export function evalExpression(
@@ -1108,14 +1043,26 @@ export function evalExpression(
         );
 
         if (fromSource.kind === "cross") {
-          // Materialize Cartesian product, then query
           return (async () => {
-            const rows = await evalCrossJoinSources(
-              fromSource.sources,
-              env,
-              sf,
-              findFromClause.ctx,
-            );
+            // Check for plan order hint
+            const planClause = q.clauses.find(
+              (c) => c.type === "PlanOrderBy",
+            ) as LuaPlanOrderByClause | undefined;
+            const planOrder = planClause?.fields.map((f) => {
+              if (f.type === "ExpressionField" && f.value.type === "Variable") {
+                return f.value.name;
+              }
+              throw new LuaRuntimeError(
+                "'plan order by' fields must be source names",
+                sf.withCtx(planClause!.ctx),
+              );
+            });
+
+            // Build optimized join tree
+            const joinTree = buildJoinTree(fromSource.sources, planOrder);
+
+            // Execute the join tree
+            const rows = await executeJoinTree(joinTree, env, sf);
             const collection: any = toCollection(rows);
 
             // Build up query object
@@ -1172,6 +1119,10 @@ export function evalExpression(
                 }
                 case "Having": {
                   query.having = clause.expression;
+                  break;
+                }
+                case "PlanOrderBy": {
+                  // Already consumed above
                   break;
                 }
               }
