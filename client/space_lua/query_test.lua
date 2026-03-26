@@ -3502,3 +3502,981 @@ do
   assertEquals(#r, 3)
   assertEquals(r[1].name, "Carol")
 end
+
+-- 98. Multi-source from (cross join) — basic
+
+-- 98a. Two-source cross join, basic
+do
+  local colors = {
+    { color = "red" },
+    { color = "blue" },
+  }
+  local sizes = {
+    { size = "S" },
+    { size = "M" },
+    { size = "L" },
+  }
+  local r = query [[
+    from
+      c = colors,
+      s = sizes
+    select {
+      color = c.color,
+      size = s.size,
+    }
+  ]]
+  assertEquals(#r, 6, "98a: row count")
+end
+
+-- 98b. Two-source cross join with where
+do
+  local colors = {
+    { color = "red" },
+    { color = "blue" },
+  }
+  local sizes = {
+    { size = "S" },
+    { size = "M" },
+    { size = "L" },
+  }
+  local r = query [[
+    from
+      c = colors,
+      s = sizes
+    where
+      s.size ~= "L"
+    select {
+      color = c.color,
+      size = s.size,
+    }
+  ]]
+  assertEquals(#r, 4, "98b: row count")
+end
+
+-- 98c. Two-source cross join with order by
+do
+  local xs = {
+    { x = 2 },
+    { x = 1 },
+  }
+  local ys = {
+    { y = "b" },
+    { y = "a" },
+  }
+  local r = query [[
+    from
+      a = xs,
+      b = ys
+    select {
+      x = a.x,
+      y = b.y,
+    }
+    order by
+      a.x, b.y
+  ]]
+  assertEquals(#r, 4, "98c: row count")
+  assertEquals(r[1].x, 1, "98c: r1.x")
+  assertEquals(r[1].y, "a", "98c: r1.y")
+  assertEquals(r[2].x, 1, "98c: r2.x")
+  assertEquals(r[2].y, "b", "98c: r2.y")
+  assertEquals(r[3].x, 2, "98c: r3.x")
+  assertEquals(r[3].y, "a", "98c: r3.y")
+  assertEquals(r[4].x, 2, "98c: r4.x")
+  assertEquals(r[4].y, "b", "98c: r4.y")
+end
+
+-- 98d. Two-source cross join with limit
+do
+  local xs = { { v = 1 }, { v = 2 }, { v = 3 } }
+  local ys = { { v = 10 }, { v = 20 } }
+  local r = query [[
+    from
+      a = xs,
+      b = ys
+    select {
+      s = a.v + b.v,
+    }
+    limit
+      3
+  ]]
+  assertEquals(#r, 3, "98d: row count")
+end
+
+-- 98e. Two-source cross join, select single expression
+do
+  local as = { { n = "x" }, { n = "y" } }
+  local bs = { { n = "1" }, { n = "2" } }
+  local r = query [[
+    from
+      a = as,
+      b = bs
+    select
+      a.n .. b.n
+  ]]
+  assertEquals(#r, 4, "98e: row count")
+end
+
+-- 99. Three-source cross join
+
+-- 99a. Three-source basic
+do
+  local xs = { { x = 1 }, { x = 2 } }
+  local ys = { { y = "a" }, { y = "b" } }
+  local zs = { { z = "p" }, { z = "q" } }
+  local r = query [[
+    from
+      a = xs,
+      b = ys,
+      c = zs
+    select {
+      x = a.x,
+      y = b.y,
+      z = c.z,
+    }
+  ]]
+  assertEquals(#r, 8, "99a: row count")
+end
+
+-- 99b. Three-source with where filter
+do
+  local xs = { { x = 1 }, { x = 2 }, { x = 3 } }
+  local ys = { { y = 10 }, { y = 20 } }
+  local zs = { { z = 100 } }
+  local r = query [[
+    from
+      a = xs,
+      b = ys,
+      c = zs
+    where
+      a.x + b.y > 15
+    select {
+      total = a.x + b.y + c.z,
+    }
+  ]]
+  -- 1+20=21 yes, 2+20=22 yes, 3+20=23 yes -> 3 combos
+  -- totals: 121, 122, 123 all distinct
+  assertEquals(#r, 3, "99b: row count")
+end
+
+-- 99c. Three-source with order by + limit
+do
+  local xs = { { v = 1 }, { v = 2 } }
+  local ys = { { v = 30 }, { v = 40 } }
+  local zs = { { v = 500 }, { v = 600 } }
+  local r = query [[
+    from
+      a = xs,
+      b = ys,
+      c = zs
+    select {
+      s = a.v + b.v + c.v,
+    }
+    order by
+      a.v + b.v + c.v
+    limit
+      3
+  ]]
+  assertEquals(#r, 3, "99c: row count")
+  assertEquals(r[1].s, 531, "99c: first")   -- 1+30+500
+  assertEquals(r[2].s, 532, "99c: second")  -- 2+30+500
+  assertEquals(r[3].s, 541, "99c: third")   -- 1+40+500
+end
+
+-- 100. Four-source cross join
+
+-- 100a. Four-source basic
+do
+  local a = { { v = 1 } }
+  local b = { { v = 2 }, { v = 3 } }
+  local c = { { v = 4 } }
+  local d = { { v = 50 }, { v = 60 } }
+  local r = query [[
+    from
+      w = a,
+      x = b,
+      y = c,
+      z = d
+    select {
+      s = w.v + x.v + y.v + z.v,
+    }
+    order by
+      w.v + x.v + y.v + z.v
+  ]]
+  -- 1*2*1*2 = 4 rows, sums: 57,67,58,68 all distinct
+  assertEquals(#r, 4, "100a: row count")
+  assertEquals(r[1].s, 57, "100a: first")   -- 1+2+4+50
+  assertEquals(r[2].s, 58, "100a: second")  -- 1+3+4+50
+  assertEquals(r[3].s, 67, "100a: third")   -- 1+2+4+60
+  assertEquals(r[4].s, 68, "100a: fourth")  -- 1+3+4+60
+end
+
+-- 101. Join hints: hash, loop, merge
+
+-- 101a. Two-source with `hash` hint
+do
+  local xs = { { x = 1 }, { x = 2 } }
+  local ys = { { y = 10 }, { y = 20 } }
+  local r = query [[
+    from
+      a = xs,
+      b = ys hash
+    select {
+      x = a.x,
+      y = b.y,
+    }
+  ]]
+  assertEquals(#r, 4, "101a: row count")
+end
+
+-- 101b. Two-source with `loop` hint
+do
+  local xs = { { x = 1 }, { x = 2 } }
+  local ys = { { y = 10 }, { y = 20 } }
+  local r = query [[
+    from
+      a = xs,
+      b = ys loop
+    select {
+      x = a.x,
+      y = b.y,
+    }
+  ]]
+  assertEquals(#r, 4, "101b: row count")
+end
+
+-- 101c. Three-source with mixed hints
+do
+  local xs = { { x = 1 }, { x = 2 } }
+  local ys = { { y = "a" } }
+  local zs = { { z = "p" }, { z = "q" } }
+  local r = query [[
+    from
+      a = xs,
+      b = ys hash,
+      c = zs loop
+    select {
+      x = a.x,
+      y = b.y,
+      z = c.z,
+    }
+  ]]
+  assertEquals(#r, 4, "101d: row count")
+end
+
+-- 101d. Hint on first source in multi-source
+do
+  local xs = { { x = 1 } }
+  local ys = { { y = 2 } }
+  local r = query [[
+    from
+      a = xs hash,
+      b = ys
+    select {
+      x = a.x,
+      y = b.y,
+    }
+  ]]
+  assertEquals(#r, 1, "101e: row count")
+end
+
+-- 101e. All three hint types produce same results
+do
+  local xs = { { x = 1 }, { x = 2 } }
+  local ys = { { y = 10 }, { y = 20 } }
+  local rh = query [[
+    from a = xs, b = ys hash
+    select { x = a.x, y = b.y }
+    order by a.x, b.y
+  ]]
+  local rl = query [[
+    from a = xs, b = ys loop
+    select { x = a.x, y = b.y }
+    order by a.x, b.y
+  ]]
+  local rm = query [[
+    from a = xs, b = ys
+    select { x = a.x, y = b.y }
+    order by a.x, b.y
+  ]]
+  assertEquals(#rh, #rl, "101f: hash vs loop count")
+  assertEquals(#rh, #rm, "101f: hash vs merge count")
+  for i = 1, #rh do
+    assertEquals(rh[i].x, rl[i].x, "101f: hash vs loop x at " .. i)
+    assertEquals(rh[i].y, rl[i].y, "101f: hash vs loop y at " .. i)
+    assertEquals(rh[i].x, rm[i].x, "101f: hash vs merge x at " .. i)
+    assertEquals(rh[i].y, rm[i].y, "101f: hash vs merge y at " .. i)
+  end
+end
+
+-- 102. plan order by
+
+-- 102a. Two-source with plan order by
+do
+  local xs = { { x = 1 }, { x = 2 } }
+  local ys = { { y = 10 }, { y = 20 } }
+  local r = query [[
+    from
+      a = xs,
+      b = ys
+    plan order by b, a
+    select {
+      x = a.x,
+      y = b.y,
+    }
+  ]]
+  assertEquals(#r, 4, "102a: row count")
+end
+
+-- 102b. Three-source with plan order by
+do
+  local xs = { { v = 1 } }
+  local ys = { { v = 20 }, { v = 30 } }
+  local zs = { { v = 400 } }
+  local r = query [[
+    from
+      a = xs,
+      b = ys,
+      c = zs
+    plan order by c, a, b
+    select {
+      s = a.v + b.v + c.v,
+    }
+    order by
+      a.v + b.v + c.v
+  ]]
+  assertEquals(#r, 2, "102b: row count")
+  assertEquals(r[1].s, 421, "102b: first")  -- 1+20+400
+  assertEquals(r[2].s, 431, "102b: second") -- 1+30+400
+end
+
+-- 102c. plan order by with join hint
+do
+  local xs = { { x = 1 }, { x = 2 } }
+  local ys = { { y = 10 }, { y = 20 } }
+  local r = query [[
+    from
+      a = xs hash,
+      b = ys loop
+    plan order by b, a
+    select {
+      x = a.x,
+      y = b.y,
+    }
+  ]]
+  assertEquals(#r, 4, "102c: row count")
+end
+
+-- 102d. plan order by with where filter
+do
+  local xs = { { x = 1 }, { x = 2 }, { x = 3 } }
+  local ys = { { y = 10 }, { y = 20 } }
+  local r = query [[
+    from
+      a = xs,
+      b = ys
+    plan order by a, b
+    where
+      a.x > 1
+    select {
+      x = a.x,
+      y = b.y,
+    }
+    order by
+      a.x, b.y
+  ]]
+  assertEquals(#r, 4, "102d: row count")
+  assertEquals(r[1].x, 2, "102d: r1.x")
+  assertEquals(r[1].y, 10, "102d: r1.y")
+end
+
+-- 102e. plan order by partial (only some sources named)
+do
+  local xs = { { v = 1 }, { v = 2 } }
+  local ys = { { v = 100 } }
+  local zs = { { v = 1000 } }
+  local r = query [[
+    from
+      a = xs,
+      b = ys,
+      c = zs
+    plan order by c
+    select {
+      s = a.v + b.v + c.v,
+    }
+    order by
+      a.v + b.v + c.v
+  ]]
+  assertEquals(#r, 2, "102e: row count")
+  assertEquals(r[1].s, 1101, "102e: first")  -- 1+100+1000
+  assertEquals(r[2].s, 1102, "102e: second") -- 2+100+1000
+end
+
+-- 103. Multi-source with group by and aggregates
+
+-- 103a. Cross join + group by + count
+do
+  local depts = {
+    { dept = "eng" },
+    { dept = "sales" },
+  }
+  local employees = {
+    { name = "Alice", dept = "eng" },
+    { name = "Bob",   dept = "eng" },
+    { name = "Carol", dept = "sales" },
+  }
+  local r = query [[
+    from
+      d = depts,
+      e = employees
+    where
+      d.dept == e.dept
+    group by
+      d.dept
+    select {
+      dept = key,
+      n = count(),
+    }
+    order by
+      dept
+  ]]
+  assertEquals(#r, 2, "103a: row count")
+  assertEquals(r[1].dept, "eng", "103a: r1.dept")
+  assertEquals(r[1].n, 2, "103a: r1.n")
+  assertEquals(r[2].dept, "sales", "103a: r2.dept")
+  assertEquals(r[2].n, 1, "103a: r2.n")
+end
+
+-- 103b. Cross join + group by + sum + array_agg
+do
+  local categories = {
+    { cat = "fruit" },
+    { cat = "veg" },
+  }
+  local items = {
+    { name = "apple",  cat = "fruit", price = 3 },
+    { name = "banana", cat = "fruit", price = 2 },
+    { name = "carrot", cat = "veg",   price = 1 },
+    { name = "daikon", cat = "veg",   price = 4 },
+  }
+  local r = query [[
+    from
+      c = categories,
+      i = items
+    where
+      c.cat == i.cat
+    group by
+      c.cat
+    select {
+      cat = key,
+      total = sum(i.price),
+      names = array_agg(i.name order by i.name asc),
+    }
+    order by
+      cat
+  ]]
+  assertEquals(#r, 2, "103b: row count")
+  assertEquals(r[1].cat, "fruit", "103b: r1.cat")
+  assertEquals(r[1].total, 5, "103b: r1.total")
+  assertEquals(r[1].names[1], "apple", "103b: r1.names[1]")
+  assertEquals(r[1].names[2], "banana", "103b: r1.names[2]")
+  assertEquals(r[2].cat, "veg", "103b: r2.cat")
+  assertEquals(r[2].total, 5, "103b: r2.total")
+  assertEquals(r[2].names[1], "carrot", "103b: r2.names[1]")
+  assertEquals(r[2].names[2], "daikon", "103b: r2.names[2]")
+end
+
+-- 103c. Cross join + group by + having
+do
+  local depts = {
+    { dept = "eng" },
+    { dept = "sales" },
+    { dept = "hr" },
+  }
+  local employees = {
+    { name = "Alice", dept = "eng" },
+    { name = "Bob",   dept = "eng" },
+    { name = "Carol", dept = "sales" },
+  }
+  local r = query [[
+    from
+      d = depts,
+      e = employees
+    where
+      d.dept == e.dept
+    group by
+      d.dept
+    having
+      count() >= 2
+    select {
+      dept = key,
+      n = count(),
+    }
+  ]]
+  assertEquals(#r, 1, "103c: row count")
+  assertEquals(r[1].dept, "eng", "103c: dept")
+  assertEquals(r[1].n, 2, "103c: n")
+end
+
+-- 103d. Cross join + group by + min/max/avg
+do
+  local groups = { { g = "A" }, { g = "B" } }
+  local vals = {
+    { g = "A", v = 10 },
+    { g = "A", v = 20 },
+    { g = "A", v = 30 },
+    { g = "B", v = 5 },
+    { g = "B", v = 15 },
+  }
+  local r = query [[
+    from
+      gr = groups,
+      item = vals
+    where
+      gr.g == item.g
+    group by
+      gr.g
+    select {
+      g = key,
+      lo = min(item.v),
+      hi = max(item.v),
+      av = avg(item.v),
+    }
+    order by
+      g
+  ]]
+  assertEquals(#r, 2, "103d: row count")
+  assertEquals(r[1].lo, 10, "103d: A lo")
+  assertEquals(r[1].hi, 30, "103d: A hi")
+  assertEquals(r[1].av, 20, "103d: A avg")
+  assertEquals(r[2].lo, 5, "103d: B lo")
+  assertEquals(r[2].hi, 15, "103d: B hi")
+  assertEquals(r[2].av, 10, "103d: B avg")
+end
+
+-- 104. Edge cases for multi-source from
+
+-- 104a. Empty first source
+do
+  local xs = {}
+  local ys = { { y = 1 }, { y = 2 } }
+  local r = query [[
+    from
+      a = xs,
+      b = ys
+    select {
+      y = b.y,
+    }
+  ]]
+  assertEquals(#r, 0, "104a: row count")
+end
+
+-- 104b. Empty second source
+do
+  local xs = { { x = 1 }, { x = 2 } }
+  local ys = {}
+  local r = query [[
+    from
+      a = xs,
+      b = ys
+    select {
+      x = a.x,
+    }
+  ]]
+  assertEquals(#r, 0, "104b: row count")
+end
+
+-- 104c. Singleton * singleton
+do
+  local xs = { { x = 42 } }
+  local ys = { { y = 99 } }
+  local r = query [[
+    from
+      a = xs,
+      b = ys
+    select {
+      x = a.x,
+      y = b.y,
+    }
+  ]]
+  assertEquals(#r, 1, "104c: row count")
+  assertEquals(r[1].x, 42, "104c: x")
+  assertEquals(r[1].y, 99, "104c: y")
+end
+
+-- 104d. Same source twice (self-join)
+do
+  local xs = { { v = 1 }, { v = 2 }, { v = 3 } }
+  local r = query [[
+    from
+      a = xs,
+      b = xs
+    where
+      a.v < b.v
+    select {
+      av = a.v,
+      bv = b.v,
+    }
+    order by
+      a.v, b.v
+  ]]
+  assertEquals(#r, 3, "104d: row count")
+  assertEquals(r[1].av, 1, "104d: r1.av")
+  assertEquals(r[1].bv, 2, "104d: r1.bv")
+  assertEquals(r[2].av, 1, "104d: r2.av")
+  assertEquals(r[2].bv, 3, "104d: r2.bv")
+  assertEquals(r[3].av, 2, "104d: r3.av")
+  assertEquals(r[3].bv, 3, "104d: r3.bv")
+end
+
+-- 104e. Self-join three-way (triangles)
+do
+  local nums = { { v = 1 }, { v = 2 }, { v = 3 }, { v = 4 } }
+  local r = query [[
+    from
+      a = nums,
+      b = nums,
+      c = nums
+    where
+      a.v < b.v and b.v < c.v
+    select {
+      triple = a.v .. "-" .. b.v .. "-" .. c.v,
+    }
+    order by
+      a.v, b.v, c.v
+  ]]
+  assertEquals(#r, 4, "104e: row count")
+  assertEquals(r[1].triple, "1-2-3", "104e: first")
+  assertEquals(r[2].triple, "1-2-4", "104e: second")
+  assertEquals(r[3].triple, "1-3-4", "104e: third")
+  assertEquals(r[4].triple, "2-3-4", "104e: fourth")
+end
+
+-- 104f. Cross join result used with offset
+do
+  local xs = { { x = 1 }, { x = 2 } }
+  local ys = { { y = "a" }, { y = "b" }, { y = "c" } }
+  local r = query [[
+    from
+      a = xs,
+      b = ys
+    select {
+      x = a.x,
+      y = b.y,
+    }
+    order by
+      a.x, b.y
+    limit
+      3, 2
+  ]]
+  assertEquals(#r, 3, "104f: row count")
+end
+
+-- 104g. Without select, each row has source names as fields
+do
+  local xs = { { x = 1 } }
+  local ys = { { y = 2 } }
+  local r = query [[
+    from
+      a = xs,
+      b = ys
+  ]]
+  assertEquals(#r, 1, "104g: row count")
+  assertEquals(r[1].a.x, 1, "104g: a.x")
+  assertEquals(r[1].b.y, 2, "104g: b.y")
+end
+
+-- 104h. Where that matches nothing
+do
+  local xs = { { v = 1 }, { v = 2 } }
+  local ys = { { v = 3 }, { v = 4 } }
+  local r = query [[
+    from
+      a = xs,
+      b = ys
+    where
+      a.v > 100
+    select {
+      av = a.v,
+    }
+  ]]
+  assertEquals(#r, 0, "104h: row count")
+end
+
+-- 104i. Outer variable accessible in where
+do
+  local threshold = 15
+  local xs = { { v = 10 }, { v = 20 } }
+  local ys = { { v = 1 }, { v = 2 } }
+  local r = query [[
+    from
+      a = xs,
+      b = ys
+    where
+      a.v + b.v > threshold
+    select {
+      s = a.v + b.v,
+    }
+    order by
+      a.v + b.v
+  ]]
+  assertEquals(#r, 2, "104i: row count")
+  assertEquals(r[1].s, 21, "104i: first")
+  assertEquals(r[2].s, 22, "104i: second")
+end
+
+-- 104j. Nested field access
+do
+  local xs = { { info = { label = "x1" } }, { info = { label = "x2" } } }
+  local ys = { { info = { label = "y1" } } }
+  local r = query [[
+    from
+      a = xs,
+      b = ys
+    select {
+      pair = a.info.label .. "-" .. b.info.label,
+    }
+    order by
+      a.info.label
+  ]]
+  assertEquals(#r, 2, "104j: row count")
+  assertEquals(r[1].pair, "x1-y1", "104j: first")
+  assertEquals(r[2].pair, "x2-y1", "104j: second")
+end
+
+-- 105. Multi-source with existing pages dataset
+
+-- 105a. Pages self-join (find pairs sharing same first tag)
+do
+  local r = query [[
+    from
+      p1 = pages,
+      p2 = pages
+    where
+      p1.name < p2.name and p1.tags[1] == p2.tags[1]
+    select {
+      a = p1.name,
+      b = p2.name,
+      tag = p1.tags[1],
+    }
+    order by
+      p1.name, p2.name
+  ]]
+  assertEquals(#r, 4, "105a: row count")
+  assertEquals(r[1].a, "Alice", "105a: first pair a")
+  assertEquals(r[1].b, "Bob", "105a: first pair b")
+end
+
+-- 105b. Pages cross with small dataset, group by
+do
+  local thresholds = {
+    { label = "small", max_size = 5 },
+    { label = "big", max_size = 100 },
+  }
+  local r = query [[
+    from
+      p = pages,
+      t = thresholds
+    where
+      p.size <= t.max_size
+    group by
+      t.label
+    select {
+      label = key,
+      n = count(),
+    }
+    order by
+      label
+  ]]
+  assertEquals(#r, 2, "105b: row count")
+  assertEquals(r[1].label, "big", "105b: r1.label")
+  assertEquals(r[1].n, 7, "105b: r1.n")
+  assertEquals(r[2].label, "small", "105b: r2.label")
+  assertEquals(r[2].n, 4, "105b: r2.n")
+end
+
+-- 106. plan order by + full pipeline
+
+-- 106a. plan order by + where + select + order by + limit
+do
+  local xs = { { x = 1 }, { x = 2 }, { x = 3 } }
+  local ys = { { y = 100 }, { y = 200 }, { y = 300 } }
+  local r = query [[
+    from
+      a = xs,
+      b = ys
+    plan order by b, a
+    where
+      a.x + b.y <= 202
+    select {
+      s = a.x + b.y,
+    }
+    order by
+      a.x + b.y desc
+    limit
+      4
+  ]]
+  assertEquals(#r, 4, "106a: row count")
+  assertEquals(r[1].s, 202, "106a: first")
+  assertEquals(r[2].s, 201, "106a: second")
+  assertEquals(r[3].s, 103, "106a: third")
+  assertEquals(r[4].s, 102, "106a: fourth")
+end
+
+-- 107. Multi-source with order by using comparator
+
+-- 107a. Custom comparator on cross join result
+do
+  local xs = { { v = 1 }, { v = 2 } }
+  local ys = { { v = 100 }, { v = 200 } }
+  local r = query [[
+    from
+      a = xs,
+      b = ys
+    select {
+      s = a.v + b.v,
+    }
+    order by
+      a.v + b.v using function(a, b) return a > b end
+  ]]
+  assertEquals(r[1].s, 202, "107a: first")
+  assertEquals(r[#r].s, 101, "107a: last")
+end
+
+-- 107b. Order by field from each source
+do
+  local xs = { { v = 2 }, { v = 1 } }
+  local ys = { { v = 20 }, { v = 10 } }
+  local r = query [[
+    from
+      a = xs,
+      b = ys
+    select {
+      av = a.v,
+      bv = b.v,
+    }
+    order by
+      a.v, b.v
+  ]]
+  assertEquals(#r, 4, "107b: row count")
+  assertEquals(r[1].av, 1, "107b: r1.av")
+  assertEquals(r[1].bv, 10, "107b: r1.bv")
+  assertEquals(r[2].av, 1, "107b: r2.av")
+  assertEquals(r[2].bv, 20, "107b: r2.bv")
+  assertEquals(r[3].av, 2, "107b: r3.av")
+  assertEquals(r[3].bv, 10, "107b: r3.bv")
+  assertEquals(r[4].av, 2, "107b: r4.av")
+  assertEquals(r[4].bv, 20, "107b: r4.bv")
+end
+
+-- 108. Four-source with full pipeline
+
+do
+  local colors   = { { c = "red" }, { c = "blue" } }
+  local sizes    = { { s = "S" }, { s = "M" }, { s = "L" } }
+  local prices   = { { p = 10 }, { p = 20 } }
+  local discounts = { { d = 0 }, { d = 5 } }
+  local r = query [[
+    from
+      co = colors,
+      si = sizes,
+      pr = prices,
+      di = discounts
+    where
+      pr.p - di.d > 5
+    group by
+      co.c
+    having
+      count() >= 3
+    select {
+      color = key,
+      combos = count(),
+      max_net = max(pr.p - di.d),
+    }
+    order by
+      color
+  ]]
+  assertEquals(#r, 2, "108: row count")
+  assertEquals(r[1].color, "blue", "108: r1.color")
+  assertEquals(r[2].color, "red", "108: r2.color")
+  assertEquals(r[1].combos, 9, "108: r1.combos")
+  assertEquals(r[1].max_net, 20, "108: r1.max_net")
+end
+
+-- 109. Negative / error tests
+
+-- 109a. Nil source in cross join
+do
+  local ok, err = pcall(function()
+    local xs = { { v = 1 } }
+    local r = query [[
+      from
+        a = xs,
+        b = nonexistent
+      select {
+        av = a.v,
+      }
+    ]]
+  end)
+  assertTrue(not ok, "109a: expected error for nil source in cross join")
+end
+
+-- 109b. Multi-source without named bindings should error
+do
+  local ok, err = pcall(function()
+    local xs = { { x = 1 } }
+    local ys = { { y = 2 } }
+    local r = query [[
+      from
+        a = xs,
+        ys
+    ]]
+  end)
+  assertTrue(not ok, "109b: expected error for unnamed source in multi-source from")
+end
+
+-- 110. Duplicate rows in cross join (distinct deduplication by default)
+
+-- 110a. Duplicate select results are deduped (default distinct=true)
+do
+  local xs = { { v = 1 }, { v = 1 } }
+  local ys = { { v = 2 } }
+  local r = query [[
+    from
+      a = xs,
+      b = ys
+    select {
+      av = a.v,
+      bv = b.v,
+    }
+  ]]
+  assertEquals(#r, 1, "110a: deduped to 1")
+  assertEquals(r[1].av, 1, "110a: av")
+end
+
+-- 110b. Non-duplicate rows are all kept
+do
+  local xs = { { v = 1 }, { v = 2 } }
+  local ys = { { v = 10 }, { v = 20 } }
+  local r = query [[
+    from
+      a = xs,
+      b = ys
+    select {
+      av = a.v,
+      bv = b.v,
+    }
+  ]]
+  assertEquals(#r, 4, "110b: all distinct kept")
+end
+
+-- 110c. Without select, raw rows with same content are deduped
+do
+  local xs = { { v = 1 }, { v = 1 } }
+  local ys = { { v = 2 } }
+  local r = query [[
+    from
+      a = xs,
+      b = ys
+  ]]
+  assertEquals(#r, 1, "110c: deduped raw rows")
+end
