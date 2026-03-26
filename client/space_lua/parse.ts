@@ -13,11 +13,13 @@ import type {
   LuaAttName,
   LuaBlock,
   LuaExpression,
+  LuaFromField,
   LuaFunctionBody,
   LuaFunctionCallExpression,
   LuaFunctionCallStatement,
   LuaFunctionName,
   LuaIfStatement,
+  LuaJoinHint,
   LuaLValue,
   LuaOrderBy,
   LuaPrefixExpression,
@@ -36,7 +38,7 @@ const luaStyleTags = styleTags({
   CompareOp: t.operator,
   "true false": t.bool,
   Comment: t.lineComment,
-  "return break goto do end while repeat until function local if then else elseif in for nil or and not query from where limit offset select order by desc asc nulls first last group having filter using":
+  "return break goto do end while repeat until function local if then else elseif in for nil or and not query from where limit offset select order by desc asc nulls first last group having filter using plan hash loop merge":
     t.keyword,
 });
 
@@ -163,6 +165,8 @@ function expressionHasFunctionDef(e: LuaExpression): boolean {
               }
             }
             break;
+          case "PlanOrderBy":
+            break;
         }
       }
       return false;
@@ -280,6 +284,8 @@ function exprReferencesNames(e: LuaExpression, names: Set<string>): boolean {
                 return true;
               }
             }
+            break;
+          case "PlanOrderBy":
             break;
         }
       }
@@ -611,6 +617,8 @@ function exprCapturesNames(e: LuaExpression, names: Set<string>): boolean {
                 if (functionBodyCapturesNames(u, names)) return true;
               }
             }
+            break;
+          case "PlanOrderBy":
             break;
         }
       }
@@ -1306,12 +1314,25 @@ function parseExpression(t: ParseTree, ctx: ASTCtx): LuaExpression {
       };
     case "nil":
       return { type: "Nil", ctx: context(t, ctx) };
-    case "Query":
+    case "Query": {
+      const clauses = t
+        .children!.slice(2, -1)
+        .map((c) => parseQueryClause(c, ctx));
+      const hasPlanOrderBy = clauses.some((c) => c.type === "PlanOrderBy");
+      if (hasPlanOrderBy) {
+        const fromClause = clauses.find((c) => c.type === "From");
+        if (!fromClause || fromClause.fields.length < 2) {
+          throw new Error(
+            "'plan order by' only valid for multi-source 'from' clause",
+          );
+        }
+      }
       return {
         type: "Query",
-        clauses: t.children!.slice(2, -1).map((c) => parseQueryClause(c, ctx)),
+        clauses,
         ctx: context(t, ctx),
       };
+    }
     case "FilteredCall": {
       const call = parseFunctionCall(t.children![0], ctx);
       const filterExpr = parseExpression(t.children![4], ctx);
@@ -1349,14 +1370,14 @@ function parseQueryClause(t: ParseTree, ctx: ASTCtx): LuaQueryClause {
   t = t.children![0];
   switch (t.type) {
     case "FromClause": {
-      // children: ckw<"from">, FieldList
-      const fieldListNode = t.children!.find((c) => c.type === "FieldList");
+      // children: ckw<"from">, FromFieldList
+      const fieldListNode = t.children!.find((c) => c.type === "FromFieldList");
       if (!fieldListNode) {
-        throw new Error("FromClause missing FieldList");
+        throw new Error("FromClause missing FromFieldList");
       }
       return {
         type: "From",
-        fields: parseFieldList(fieldListNode, ctx),
+        fields: parseFromFieldList(fieldListNode, ctx),
         ctx: context(t, ctx),
       };
     }
@@ -1429,10 +1450,97 @@ function parseQueryClause(t: ParseTree, ctx: ASTCtx): LuaQueryClause {
         ctx: context(t, ctx),
       };
     }
+    case "PlanClause": {
+      // children: ckw<"plan">, ckw<"order">, ckw<"by">, Name, (",", Name)*
+      const names: string[] = [];
+      for (const child of t.children!) {
+        if (child.type === "Name") {
+          names.push(child.children![0].text!);
+        }
+      }
+      return {
+        type: "PlanOrderBy",
+        names,
+        ctx: context(t, ctx),
+      };
+    }
     default:
       console.error(t);
       throw new Error(`Unknown query clause type: ${t.type}`);
   }
+}
+
+// Parse a `UsingClause` node (shared by `OrderBy` and `JoinHint`)
+function parseUsingClause(t: ParseTree, ctx: ASTCtx): string | LuaFunctionBody {
+  if (t.type !== "UsingClause") {
+    throw new Error(`Expected UsingClause, got ${t.type}`);
+  }
+  // children: kw<"using">, (Name | kw<"function">, FuncBody)
+  const kids = t.children!;
+  const next = kids[1];
+  if (next.type === "function") {
+    return parseFunctionBody(kids[2], ctx);
+  }
+  // Name
+  return next.children![0].text!;
+}
+
+// Parse a `JoinHint` node
+function parseJoinHint(t: ParseTree, ctx: ASTCtx): LuaJoinHint {
+  if (t.type !== "JoinHint") {
+    throw new Error(`Expected JoinHint, got ${t.type}`);
+  }
+  const child = t.children![0];
+  if (child.type === "UsingClause") {
+    return {
+      type: "JoinHint",
+      kind: "using",
+      using: parseUsingClause(child, ctx),
+      ctx: context(t, ctx),
+    };
+  }
+  // ckw: "hash" | "loop" | "merge"
+  const text = child.children?.[0]?.text ?? child.text!;
+  return {
+    type: "JoinHint",
+    kind: text as "hash" | "loop" | "merge",
+    ctx: context(t, ctx),
+  };
+}
+
+// Parse `FromFieldList` (like `parseFieldList` but extracts `JoinHint`,
+// validate that `JoinHint` is present on multi-source `from` only)
+function parseFromFieldList(t: ParseTree, ctx: ASTCtx): LuaFromField[] {
+  if (t.type !== "FromFieldList") {
+    throw new Error(`Expected FromFieldList, got ${t.type}`);
+  }
+  const fields: LuaFromField[] = t
+    .children!.filter(
+      (c) =>
+        c.type === "FieldExp" ||
+        c.type === "FieldProp" ||
+        c.type === "FieldDynamic",
+    )
+    .map((c) => {
+      const base = parseTableField(c, ctx);
+      const hintNode = c.children?.find((ch) => ch.type === "JoinHint");
+      if (hintNode) {
+        return { ...base, joinHint: parseJoinHint(hintNode, ctx) };
+      }
+      return base;
+    });
+
+  if (fields.length < 2) {
+    for (const f of fields) {
+      if (f.joinHint) {
+        throw new Error(
+          "Join hint is only valid for multi-source 'from' clauses",
+        );
+      }
+    }
+  }
+
+  return fields;
 }
 
 // Parse a single OrderBy node (shared by query OrderByClause and AggOrderBy)
@@ -1447,15 +1555,8 @@ function parseOrderByNode(child: ParseTree, ctx: ASTCtx): LuaOrderBy {
     else if (typ === "asc") direction = "asc";
     else if (typ === "first") nulls = "first";
     else if (typ === "last") nulls = "last";
-    else if (typ === "using") {
-      const next = kids[i + 1];
-      if (next.type === "function") {
-        usingVal = parseFunctionBody(kids[i + 2], ctx);
-        i += 2;
-      } else {
-        usingVal = next.children![0].text!;
-        i++;
-      }
+    else if (typ === "UsingClause") {
+      usingVal = parseUsingClause(kids[i], ctx);
     }
   }
   const ob: LuaOrderBy = {

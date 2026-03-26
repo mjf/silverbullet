@@ -332,7 +332,7 @@ export type LuaFromClause = {
 
 export type LuaPlanOrderByClause = {
   type: "PlanOrderBy";
-  fields: LuaTableField[];
+  names: string[];
 } & ASTContext;
 
 export type LuaWhereClause = {
