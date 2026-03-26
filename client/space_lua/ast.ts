@@ -295,6 +295,18 @@ export type LuaAggregateCallExpression = {
   orderBy: LuaOrderBy[];
 } & ASTContext;
 
+// Join hint attached to a from-clause source binding
+export type LuaJoinHint = {
+  type: "JoinHint";
+  kind: "hash" | "loop" | "merge" | "using";
+  using?: string | LuaFunctionBody;
+} & ASTContext;
+
+// From-clause field: a table field extended with an optional join hint
+export type LuaFromField = LuaTableField & {
+  joinHint?: LuaJoinHint;
+};
+
 // Query stuff
 export type LuaQueryExpression = {
   type: "Query";
@@ -309,11 +321,17 @@ export type LuaQueryClause =
   | LuaOrderByClause
   | LuaSelectClause
   | LuaGroupByClause
-  | LuaHavingClause;
+  | LuaHavingClause
+  | LuaPlanOrderByClause;
 
 // Field list used by `from`, `select` and `group by` clauses
 export type LuaFromClause = {
   type: "From";
+  fields: LuaFromField[];
+} & ASTContext;
+
+export type LuaPlanOrderByClause = {
+  type: "PlanOrderBy";
   fields: LuaTableField[];
 } & ASTContext;
 

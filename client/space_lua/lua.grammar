@@ -100,21 +100,36 @@ QueryClause {
   LimitClause |
   OffsetClause |
   GroupByClause |
-  HavingClause
+  HavingClause |
+  PlanOrderByClause
 }
 
-FromClause { ckw<"from"> FieldList }
+FromClause { ckw<"from"> FromFieldList }
+FromFieldList { fromField ("," fromField)* }
+fromField[@isGroup=Field] {
+  FieldDynamic { "[" exp "]" "=" exp JoinHint? } |
+  FieldProp { Name "=" exp JoinHint? } |
+  FieldExp { exp JoinHint? }
+}
+
+PlanOrderByClause { ckw<"plan"> ckw<"order"> ckw<"by"> FieldList }
+
 WhereClause { ckw<"where"> exp }
 LimitClause { ckw<"limit"> exp ("," exp)? }
 OffsetClause { ckw<"offset"> exp }
 OrderByClause { ckw<"order">  ckw<"by"> list<OrderBy> }
-OrderBy { exp (ckw<"desc"> | ckw<"asc"> | kw<"using"> (Name | kw<"function"> FuncBody))? (ckw<"nulls"> (ckw<"first"> | ckw<"last">))? }
+OrderBy { exp (ckw<"desc"> | ckw<"asc"> | UsingClause)? (ckw<"nulls"> (ckw<"first"> | ckw<"last">))? }
 SelectClause { ckw<"select"> FieldList }
 GroupByClause { ckw<"group"> ckw<"by"> FieldList }
 HavingClause { ckw<"having"> exp }
 
 AggOrderBy { ckw<"order"> ckw<"by"> list<OrderBy> }
 
+UsingClause { kw<"using"> (Name | kw<"function"> FuncBody) }
+
+JoinHint {
+  ckw<"hash"> | ckw<"loop"> | ckw<"merge"> | UsingClause
+}
 
 field[@isGroup=Field] {
   FieldDynamic { "[" exp "]" "=" exp } |
