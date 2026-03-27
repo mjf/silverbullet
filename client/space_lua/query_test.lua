@@ -4480,3 +4480,743 @@ do
   ]]
   assertEquals(#r, 1, "110c: deduped raw rows")
 end
+
+-- 111. loop using join predicate
+
+-- 111a. loop using with inline function
+do
+  local xs = {
+    { id = 1, name = "Alice" },
+    { id = 2, name = "Bob" },
+    { id = 3, name = "Carol" },
+  }
+  local ys = {
+    { fk = 2, val = "X" },
+    { fk = 1, val = "Y" },
+    { fk = 3, val = "Z" },
+    { fk = 1, val = "W" },
+  }
+
+  local joined = query [[
+    from
+      a = xs,
+      b = ys loop using function(a, b)
+        return a.id == b.fk
+      end
+    select {
+      a_name = a.name,
+      b_val  = b.val,
+    }
+    order by
+      a.name, b.val
+  ]]
+
+  assertEquals(#joined, 4, "111a: row count")
+  assertEquals(joined[1].a_name, "Alice")
+  assertEquals(joined[1].b_val, "W")
+  assertEquals(joined[2].a_name, "Alice")
+  assertEquals(joined[2].b_val, "Y")
+  assertEquals(joined[3].a_name, "Bob")
+  assertEquals(joined[3].b_val, "X")
+  assertEquals(joined[4].a_name, "Carol")
+  assertEquals(joined[4].b_val, "Z")
+end
+
+-- 111b. loop using with named function
+do
+  local xs = {
+    { id = 1, name = "Alice" },
+    { id = 2, name = "Bob" },
+  }
+  local ys = {
+    { fk = 2, val = "X" },
+    { fk = 1, val = "Y" },
+    { fk = 2, val = "Z" },
+  }
+
+  local function matchById(a, b)
+    return a.id == b.fk
+  end
+
+  local joined = query [[
+    from
+      a = xs,
+      b = ys loop using matchById
+    select {
+      a_name = a.name,
+      b_val  = b.val,
+    }
+    order by
+      a.name, b.val
+  ]]
+
+  assertEquals(#joined, 3, "111b: row count")
+  assertEquals(joined[1].a_name, "Alice")
+  assertEquals(joined[1].b_val, "Y")
+  assertEquals(joined[2].a_name, "Bob")
+  assertEquals(joined[2].b_val, "X")
+  assertEquals(joined[3].a_name, "Bob")
+  assertEquals(joined[3].b_val, "Z")
+end
+
+-- 111c. loop using with no matches returns empty
+do
+  local xs = {
+    { id = 1 },
+    { id = 2 },
+  }
+  local ys = {
+    { fk = 99 },
+    { fk = 100 },
+  }
+
+  local joined = query [[
+    from
+      a = xs,
+      b = ys loop using function(a, b)
+        return a.id == b.fk
+      end
+    select {
+      x = a.id,
+      y = b.fk,
+    }
+  ]]
+
+  assertEquals(#joined, 0, "111c: row count")
+end
+
+-- 111d. loop using with all matches (same as cross join)
+do
+  local xs = {
+    { v = 1 },
+    { v = 2 },
+  }
+  local ys = {
+    { v = 10 },
+    { v = 20 },
+  }
+
+  local joined = query [[
+    from
+      a = xs,
+      b = ys loop using function(a, b)
+        return true
+      end
+    select {
+      s = a.v + b.v,
+    }
+    order by
+      a.v + b.v
+  ]]
+
+  assertEquals(#joined, 4, "111d: row count")
+  assertEquals(joined[1].s, 11, "111d: first")
+  assertEquals(joined[2].s, 12, "111d: second")
+  assertEquals(joined[3].s, 21, "111d: third")
+  assertEquals(joined[4].s, 22, "111d: fourth")
+end
+
+-- 111e. loop using with where clause (post-join filter)
+do
+  local xs = {
+    { id = 1, name = "Alice" },
+    { id = 2, name = "Bob" },
+    { id = 3, name = "Carol" },
+  }
+  local ys = {
+    { fk = 1, val = "Y" },
+    { fk = 2, val = "X" },
+    { fk = 1, val = "W" },
+    { fk = 3, val = "Z" },
+  }
+
+  local joined = query [[
+    from
+      a = xs,
+      b = ys loop using function(a, b)
+        return a.id == b.fk
+      end
+    where
+      a.name ~= "Bob"
+    select {
+      a_name = a.name,
+      b_val  = b.val,
+    }
+    order by
+      a.name, b.val
+  ]]
+
+  assertEquals(#joined, 3, "111e: row count")
+  assertEquals(joined[1].a_name, "Alice")
+  assertEquals(joined[1].b_val, "W")
+  assertEquals(joined[2].a_name, "Alice")
+  assertEquals(joined[2].b_val, "Y")
+  assertEquals(joined[3].a_name, "Carol")
+  assertEquals(joined[3].b_val, "Z")
+end
+
+-- 111f. loop using with group by and aggregates
+do
+  local depts = {
+    { dept = "eng" },
+    { dept = "sales" },
+    { dept = "hr" },
+  }
+  local employees = {
+    { name = "Alice", dept = "eng",   sal = 100 },
+    { name = "Bob",   dept = "eng",   sal = 120 },
+    { name = "Carol", dept = "sales", sal = 90 },
+    { name = "Dave",  dept = "sales", sal = 80 },
+    { name = "Eve",   dept = "hr",    sal = 70 },
+  }
+
+  local joined = query [[
+    from
+      d = depts,
+      e = employees loop using function(d, e)
+        return d.dept == e.dept
+      end
+    group by
+      d.dept
+    select {
+      dept  = key,
+      n     = count(),
+      total = sum(e.sal),
+    }
+    order by
+      dept
+  ]]
+
+  assertEquals(#joined, 3, "111f: row count")
+  assertEquals(joined[1].dept, "eng")
+  assertEquals(joined[1].n, 2)
+  assertEquals(joined[1].total, 220)
+  assertEquals(joined[2].dept, "hr")
+  assertEquals(joined[2].n, 1)
+  assertEquals(joined[2].total, 70)
+  assertEquals(joined[3].dept, "sales")
+  assertEquals(joined[3].n, 2)
+  assertEquals(joined[3].total, 170)
+end
+
+-- 111g. loop using with limit and offset
+do
+  local xs = {
+    { id = 1, name = "A" },
+    { id = 2, name = "B" },
+    { id = 3, name = "C" },
+  }
+  local ys = {
+    { fk = 1, val = "p" },
+    { fk = 2, val = "q" },
+    { fk = 3, val = "r" },
+    { fk = 1, val = "s" },
+  }
+
+  local joined = query [[
+    from
+      a = xs,
+      b = ys loop using function(a, b)
+        return a.id == b.fk
+      end
+    select {
+      a_name = a.name,
+      b_val  = b.val,
+    }
+    order by
+      a.name, b.val
+    limit
+      2, 1
+  ]]
+
+  -- Full sorted result: A/p, A/s, B/q, C/r -> skip 1, take 2
+  assertEquals(#joined, 2, "111g: row count")
+  assertEquals(joined[1].a_name, "A")
+  assertEquals(joined[1].b_val, "s")
+  assertEquals(joined[2].a_name, "B")
+  assertEquals(joined[2].b_val, "q")
+end
+
+-- 111h. loop using with inequality predicate
+do
+  local xs = {
+    { v = 1 },
+    { v = 2 },
+    { v = 3 },
+  }
+  local ys = {
+    { v = 2 },
+    { v = 3 },
+    { v = 4 },
+  }
+
+  local joined = query [[
+    from
+      a = xs,
+      b = ys loop using function(a, b)
+        return a.v < b.v
+      end
+    select {
+      av = a.v,
+      bv = b.v,
+    }
+    order by
+      a.v, b.v
+  ]]
+
+  -- 1<2,1<3,1<4, 2<3,2<4, 3<4 -> 6 pairs
+  assertEquals(#joined, 6, "111h: row count")
+  assertEquals(joined[1].av, 1)
+  assertEquals(joined[1].bv, 2)
+  assertEquals(joined[6].av, 3)
+  assertEquals(joined[6].bv, 4)
+end
+
+-- 111i. loop using on empty source
+do
+  local xs = {}
+  local ys = {
+    { fk = 1, val = "Y" },
+  }
+
+  local joined = query [[
+    from
+      a = xs,
+      b = ys loop using function(a, b)
+        return true
+      end
+    select {
+      bv = b.val,
+    }
+  ]]
+
+  assertEquals(#joined, 0, "111i: row count")
+end
+
+-- 111j. loop using produces same results as plain loop + where
+do
+  local xs = {
+    { id = 1, name = "A" },
+    { id = 2, name = "B" },
+  }
+  local ys = {
+    { fk = 1, val = "p" },
+    { fk = 2, val = "q" },
+    { fk = 1, val = "r" },
+  }
+
+  local r_using = query [[
+    from
+      a = xs,
+      b = ys loop using function(a, b)
+        return a.id == b.fk
+      end
+    select {
+      n = a.name,
+      v = b.val,
+    }
+    order by
+      a.name, b.val
+  ]]
+
+  local r_where = query [[
+    from
+      a = xs,
+      b = ys loop
+    where
+      a.id == b.fk
+    select {
+      n = a.name,
+      v = b.val,
+    }
+    order by
+      a.name, b.val
+  ]]
+
+  assertEquals(#r_using, #r_where, "111j: same count")
+  for i = 1, #r_using do
+    assertEquals(r_using[i].n, r_where[i].n, "111j: name at " .. i)
+    assertEquals(r_using[i].v, r_where[i].v, "111j: val at " .. i)
+  end
+end
+
+-- 112. select distinct / select all
+
+-- 112a. select distinct removes duplicate rows (explicit)
+do
+  local data = {
+    { cat = "a", val = 1 },
+    { cat = "a", val = 1 },
+    { cat = "b", val = 2 },
+    { cat = "a", val = 1 },
+  }
+
+  local r = query [[
+    from
+      p = data
+    select distinct {
+      cat = p.cat,
+      val = p.val,
+    }
+    order by
+      p.cat, p.val
+  ]]
+
+  assertEquals(#r, 2, "112a: row count")
+  assertEquals(r[1].cat, "a")
+  assertEquals(r[1].val, 1)
+  assertEquals(r[2].cat, "b")
+  assertEquals(r[2].val, 2)
+end
+
+-- 112b. select all keeps duplicate rows
+do
+  local data = {
+    { cat = "a", val = 1 },
+    { cat = "a", val = 1 },
+    { cat = "b", val = 2 },
+    { cat = "a", val = 1 },
+  }
+
+  local r = query [[
+    from
+      p = data
+    select all {
+      cat = p.cat,
+      val = p.val,
+    }
+    order by
+      p.cat, p.val
+  ]]
+
+  assertEquals(#r, 4, "112b: row count")
+  assertEquals(r[1].cat, "a")
+  assertEquals(r[2].cat, "a")
+  assertEquals(r[3].cat, "a")
+  assertEquals(r[4].cat, "b")
+end
+
+-- 112c. default select (no qualifier) deduplicates
+do
+  local data = {
+    { v = 10 },
+    { v = 10 },
+    { v = 20 },
+  }
+
+  local r = query [[
+    from
+      p = data
+    select {
+      v = p.v,
+    }
+  ]]
+
+  assertEquals(#r, 2, "112c: default distinct row count")
+  -- Note: if default changes to all, update this to assertEquals(#r, 3)
+end
+
+-- 112d. select distinct on single scalar expression
+do
+  local data = {
+    { v = "x" },
+    { v = "y" },
+    { v = "x" },
+    { v = "z" },
+    { v = "y" },
+  }
+
+  local r = query [[
+    from
+      p = data
+    select distinct
+      p.v
+    order by
+      p.v
+  ]]
+
+  assertEquals(#r, 3, "112d: row count")
+  assertEquals(r[1], "x")
+  assertEquals(r[2], "y")
+  assertEquals(r[3], "z")
+end
+
+-- 112e. select all on single scalar expression
+do
+  local data = {
+    { v = "x" },
+    { v = "y" },
+    { v = "x" },
+    { v = "z" },
+    { v = "y" },
+  }
+
+  local r = query [[
+    from
+      p = data
+    select all
+      p.v
+    order by
+      p.v
+  ]]
+
+  assertEquals(#r, 5, "112e: row count")
+  assertEquals(r[1], "x")
+  assertEquals(r[2], "x")
+  assertEquals(r[3], "y")
+  assertEquals(r[4], "y")
+  assertEquals(r[5], "z")
+end
+
+-- 112f. select distinct with cross join
+do
+  local xs = {
+    { v = 1 },
+    { v = 1 },
+  }
+  local ys = {
+    { v = 10 },
+  }
+
+  local r = query [[
+    from
+      a = xs,
+      b = ys
+    select distinct {
+      av = a.v,
+      bv = b.v,
+    }
+  ]]
+
+  assertEquals(#r, 1, "112f: deduped cross join")
+  assertEquals(r[1].av, 1)
+  assertEquals(r[1].bv, 10)
+end
+
+-- 112g. select all with cross join keeps duplicates
+do
+  local xs = {
+    { v = 1 },
+    { v = 1 },
+  }
+  local ys = {
+    { v = 10 },
+  }
+
+  local r = query [[
+    from
+      a = xs,
+      b = ys
+    select all {
+      av = a.v,
+      bv = b.v,
+    }
+  ]]
+
+  assertEquals(#r, 2, "112g: all cross join keeps dupes")
+  assertEquals(r[1].av, 1)
+  assertEquals(r[2].av, 1)
+end
+
+-- 112h. select distinct with group by (group results are already unique)
+do
+  local data = {
+    { cat = "a", val = 1 },
+    { cat = "a", val = 2 },
+    { cat = "b", val = 3 },
+  }
+
+  local r = query [[
+    from
+      p = data
+    group by
+      p.cat
+    select distinct {
+      cat = key,
+      n   = count(),
+    }
+    order by
+      cat
+  ]]
+
+  assertEquals(#r, 2, "112h: row count")
+  assertEquals(r[1].cat, "a")
+  assertEquals(r[1].n, 2)
+  assertEquals(r[2].cat, "b")
+  assertEquals(r[2].n, 1)
+end
+
+-- 112i. select all with where + order by + limit
+do
+  local data = {
+    { name = "A", tag = "x" },
+    { name = "B", tag = "x" },
+    { name = "C", tag = "y" },
+    { name = "D", tag = "x" },
+  }
+
+  local r = query [[
+    from
+      p = data
+    where
+      p.tag == "x"
+    select all {
+      tag = p.tag,
+    }
+    order by
+      p.name
+    limit
+      2
+  ]]
+
+  -- All 3 matching rows have tag="x", select all keeps all, limit 2
+  assertEquals(#r, 2, "112i: row count")
+  assertEquals(r[1].tag, "x")
+  assertEquals(r[2].tag, "x")
+end
+
+-- 112j. select distinct vs select all side by side
+do
+  local data = {
+    { v = 1 },
+    { v = 2 },
+    { v = 1 },
+    { v = 3 },
+    { v = 2 },
+    { v = 1 },
+  }
+
+  local rd = query [[
+    from
+      p = data
+    select distinct
+      p.v
+    order by
+      p.v
+  ]]
+
+  local ra = query [[
+    from
+      p = data
+    select all
+      p.v
+    order by
+      p.v
+  ]]
+
+  assertEquals(#rd, 3, "112j: distinct count")
+  assertEquals(rd[1], 1)
+  assertEquals(rd[2], 2)
+  assertEquals(rd[3], 3)
+
+  assertEquals(#ra, 6, "112j: all count")
+  assertEquals(ra[1], 1)
+  assertEquals(ra[2], 1)
+  assertEquals(ra[3], 1)
+  assertEquals(ra[4], 2)
+  assertEquals(ra[5], 2)
+  assertEquals(ra[6], 3)
+end
+
+-- 112k. select distinct on unbound access
+do
+  local data = {
+    { tag = "x", val = 1 },
+    { tag = "x", val = 1 },
+    { tag = "y", val = 2 },
+  }
+
+  local r = query [[
+    from
+      data
+    select distinct {
+      tag = tag,
+      val = val,
+    }
+    order by
+      tag
+  ]]
+
+  assertEquals(#r, 2, "112k: row count")
+  assertEquals(r[1].tag, "x")
+  assertEquals(r[2].tag, "y")
+end
+
+-- 112l. select all on unbound access
+do
+  local data = {
+    { tag = "x", val = 1 },
+    { tag = "x", val = 1 },
+    { tag = "y", val = 2 },
+  }
+
+  local r = query [[
+    from
+      data
+    select all {
+      tag = tag,
+      val = val,
+    }
+    order by
+      tag
+  ]]
+
+  assertEquals(#r, 3, "112l: row count")
+  assertEquals(r[1].tag, "x")
+  assertEquals(r[2].tag, "x")
+  assertEquals(r[3].tag, "y")
+end
+
+-- 112m. select all with loop using (duplicates from predicate join kept)
+do
+  local xs = {
+    { id = 1, name = "A" },
+    { id = 1, name = "A" },
+  }
+  local ys = {
+    { fk = 1, val = "p" },
+  }
+
+  local r = query [[
+    from
+      a = xs,
+      b = ys loop using function(a, b)
+        return a.id == b.fk
+      end
+    select all {
+      n = a.name,
+      v = b.val,
+    }
+  ]]
+
+  assertEquals(#r, 2, "112m: all keeps predicate join dupes")
+  assertEquals(r[1].n, "A")
+  assertEquals(r[2].n, "A")
+end
+
+-- 112n. select distinct with loop using (duplicates from predicate join removed)
+do
+  local xs = {
+    { id = 1, name = "A" },
+    { id = 1, name = "A" },
+  }
+  local ys = {
+    { fk = 1, val = "p" },
+  }
+
+  local r = query [[
+    from
+      a = xs,
+      b = ys loop using function(a, b)
+        return a.id == b.fk
+      end
+    select distinct {
+      n = a.name,
+      v = b.val,
+    }
+  ]]
+
+  assertEquals(#r, 1, "112n: distinct removes predicate join dupes")
+  assertEquals(r[1].n, "A")
+  assertEquals(r[1].v, "p")
+end
