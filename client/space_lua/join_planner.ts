@@ -4,14 +4,19 @@
  * Transforms a multi-source `from` clause into an optimized join tree,
  * then executes it using hash join, nested loop, or sort-merge operators.
  */
-import type { LuaExpression, LuaJoinHint } from "./ast.ts";
+import type { LuaExpression, LuaFunctionBody, LuaJoinHint } from "./ast.ts";
 import type { CollectionStats } from "./query_collection.ts";
 import {
   type LuaEnv,
+  LuaFunction,
   type LuaStackFrame,
+  type LuaValue,
+  luaCall,
   luaKeys,
   LuaRuntimeError,
   LuaTable,
+  luaTruthy,
+  singleResult,
 } from "./runtime.ts";
 import { evalExpression } from "./eval.ts";
 
@@ -42,20 +47,19 @@ export type JoinInner = {
   method: "hash" | "loop" | "merge";
 };
 
-// Estimates the output cardinality after filtering a source (uses
-// default 10% selectivity heuristic).
+// Estimated output cardinality (default 10 % selectivity heuristic)
 function estimatedRows(s: JoinSource): number {
   const rc = s.stats?.rowCount ?? 100;
   return Math.max(1, Math.floor(rc * 0.1));
 }
 
-// Join selectivity: $1/max(NDV_R, NDV_S)$ for the most common join column,
-// or $1/max(rowCount)$ as fallback.
+// Join selectivity:
+// * $1/\max(\text{NDV}_R, \text{NDV}_S)$ for the first shared column, or
+// * $1/\max(\text{rowCount}_R, \text{rowCount}_S)$ as fallback.
 function joinSelectivity(a: JoinSource, b: JoinSource): number {
   const aNdv = a.stats?.ndv;
   const bNdv = b.stats?.ndv;
   if (aNdv && bNdv) {
-    // Find shared columns
     for (const [col, ndvA] of aNdv) {
       const ndvB = bNdv.get(col);
       if (ndvB !== undefined) {
@@ -68,6 +72,7 @@ function joinSelectivity(a: JoinSource, b: JoinSource): number {
   return 1 / Math.max(ra, rb, 1);
 }
 
+// Build join tree
 export function buildJoinTree(
   sources: JoinSource[],
   planOrder?: string[],
@@ -88,10 +93,9 @@ export function buildJoinTree(
         byName.delete(n);
       }
     }
-    // Append any remaining
     for (const s of byName.values()) ordered.push(s);
   } else {
-    // Start with smallest estimated rows (greedy)
+    // Greedy: start with smallest, pick cheapest next
     const remaining = [...sources];
     remaining.sort((a, b) => estimatedRows(a) - estimatedRows(b));
     ordered = [remaining.shift()!];
@@ -112,46 +116,66 @@ export function buildJoinTree(
       ordered.push(remaining.splice(bestIdx, 1)[0]);
     }
   }
-  // Build tree
+
+  // Hints are only valid on the right side of a join (i.e. sources at
+  // index >= 1 in the ordered list).  If reordering moved a hinted
+  // source to position 0, strip the hint (it cannot be honoured as
+  // the driving table).
+  if (ordered[0].hint) {
+    ordered[0] = { ...ordered[0], hint: undefined };
+  }
+
+  // Build left-deep tree, tracking accumulated row estimate for the
+  // cost-based physical-operator selection.
   let tree: JoinNode = { kind: "leaf", source: ordered[0] };
+  let accRows = estimatedRows(ordered[0]);
+
   for (let i = 1; i < ordered.length; i++) {
     const right = ordered[i];
-    const method = selectPhysicalOperator(ordered[i - 1], right);
+    const method = selectPhysicalOperator(accRows, right);
     tree = {
       kind: "join",
       left: tree,
       right: { kind: "leaf", source: right },
       method,
     };
+    // Cartesian product
+    accRows = accRows * estimatedRows(right);
   }
   return tree;
 }
 
+// Physical operator selection
 function selectPhysicalOperator(
-  left: JoinSource,
+  leftRowCount: number,
   right: JoinSource,
 ): "hash" | "loop" | "merge" {
   if (right.hint) {
     const k = right.hint.kind;
-
-    if (k === "hash") return "hash";
+    if (k === "merge") {
+      throw new Error("Merge join requires an equi-join predicate");
+    }
+    if (k === "hash") {
+      if (right.hint.using) {
+        throw new Error("'using' clause is only valid with 'loop' join hint");
+      }
+      return "hash";
+    }
     if (k === "loop") return "loop";
-    if (k === "merge") return "merge";
   }
 
-  // Hash if either side > 50 rows
-  const lr = left.stats?.rowCount ?? 100;
+  // Default: hash if either side is large
   const rr = right.stats?.rowCount ?? 100;
-  if (lr > 50 || rr > 50) return "hash";
-
+  if (leftRowCount > 50 || rr > 50) return "hash";
   return "loop";
 }
 
+// Cooperative yield
 async function cooperativeYield(): Promise<void> {
-  // Yield to the event loop to prevent UI freezing
   return new Promise((resolve) => setTimeout(resolve, 0));
 }
 
+// Materialize a source expression into an array
 async function materializeSource(
   source: JoinSource,
   env: LuaEnv,
@@ -165,7 +189,6 @@ async function materializeSource(
     );
   }
 
-  // Normalize to array
   if (Array.isArray(val)) return val;
   if (val instanceof LuaTable) {
     if (val.length > 0) {
@@ -173,6 +196,7 @@ async function materializeSource(
       for (let i = 1; i <= val.length; i++) arr.push(val.rawGet(i));
       return arr;
     }
+    if (val.empty()) return [];
     return [val];
   }
   if (
@@ -186,13 +210,12 @@ async function materializeSource(
   return [val];
 }
 
-function rowToTable(name: string, item: any, existing?: LuaTable): LuaTable {
-  const row = existing ?? new LuaTable();
+function rowToTable(name: string, item: any): LuaTable {
+  const row = new LuaTable();
   void row.rawSet(name, item);
   return row;
 }
 
-// Clone a LuaTable row (shallow copy of all keys)
 function cloneRow(src: LuaTable): LuaTable {
   const dst = new LuaTable();
   for (const k of luaKeys(src)) {
@@ -201,16 +224,11 @@ function cloneRow(src: LuaTable): LuaTable {
   return dst;
 }
 
-// Generic sort-key extraction: returns a primitive suitable for
-// comparison via `<` / `===`.  For LuaTables we use a stable
-// stringified form so the merge comparator works correctly.
 function sortKey(item: any): string | number {
   if (item === null || item === undefined) return "";
   if (typeof item === "string") return item;
   if (typeof item === "number") return item;
   if (typeof item === "boolean") return item ? 1 : 0;
-  // LuaTable or object: JSON-stringify keys in sorted order for
-  // deterministic comparison.
   if (item instanceof LuaTable) {
     const parts: string[] = [];
     for (const k of luaKeys(item)) {
@@ -223,7 +241,6 @@ function sortKey(item: any): string | number {
   return String(item);
 }
 
-// Compare two sort keys: returns <0, 0, or >0
 function compareSortKeys(a: string | number, b: string | number): number {
   if (typeof a === "number" && typeof b === "number") return a - b;
   const sa = String(a);
@@ -231,8 +248,8 @@ function compareSortKeys(a: string | number, b: string | number): number {
   return sa < sb ? -1 : sa > sb ? 1 : 0;
 }
 
-// Hash join $O(N+M)$
-async function hashJoin(
+// Cross join (used by both `hash` and plain `loop`)
+async function crossJoin(
   leftRows: LuaTable[],
   rightItems: any[],
   rightName: string,
@@ -249,7 +266,6 @@ async function hashJoin(
           sf,
         );
       }
-      // Clone left row and add right
       const newRow = cloneRow(leftRow);
       void newRow.rawSet(rightName, rightItem);
       results.push(newRow);
@@ -262,32 +278,52 @@ async function hashJoin(
   return results;
 }
 
-// Nested Loop Join: $O(N*M)$ (used for small tables)
-async function nestedLoopJoin(
+// Predicate loop join: `f(L, R) -> Boolean`
+async function predicateLoopJoin(
   leftRows: LuaTable[],
   rightItems: any[],
   rightName: string,
+  leftRow2item: (row: LuaTable) => LuaValue,
+  predicate: LuaValue,
   sf: LuaStackFrame,
 ): Promise<LuaTable[]> {
-  // Same as hash join for Cartesian (real benefit is when we have
-  // a predicate to push down (future optimization)
-  return hashJoin(leftRows, rightItems, rightName, sf);
+  const results: LuaTable[] = [];
+  let processed = 0;
+
+  for (const leftRow of leftRows) {
+    const leftItem = leftRow2item(leftRow);
+    for (const rightItem of rightItems) {
+      const res = singleResult(
+        await luaCall(predicate, [leftItem, rightItem], sf.astCtx ?? {}, sf),
+      );
+      if (!luaTruthy(res)) continue;
+
+      if (++processed > WATCHDOG_LIMIT) {
+        throw new LuaRuntimeError(
+          `Query watchdog: intermediate result exceeded ${WATCHDOG_LIMIT} rows`,
+          sf,
+        );
+      }
+      const newRow = cloneRow(leftRow);
+      void newRow.rawSet(rightName, rightItem);
+      results.push(newRow);
+
+      if (processed % YIELD_CHUNK === 0) {
+        await cooperativeYield();
+      }
+    }
+  }
+  return results;
 }
 
-// Sort-Merge Join: $O(N \log N + M \log M)$ sort + $O(N+M)$ merge.
-// Both sides are sorted on their sort key then merged with a
-// two-pointer scan.  For Cartesian products every left row pairs
-// with every right row of the same key (and rows with no match on
-// either side are still emitted as in a cross join).
+// Sort-Merge Join
 async function sortMergeJoin(
   leftRows: LuaTable[],
   rightItems: any[],
   rightName: string,
   sf: LuaStackFrame,
 ): Promise<LuaTable[]> {
-  // Extract sort keys for left rows (use first column value)
   const leftKeyed = leftRows.map((row) => {
-    // Use the value of the first source binding as sort key
     let key: string | number = "";
     for (const k of luaKeys(row)) {
       key = sortKey(row.rawGet(k));
@@ -301,7 +337,6 @@ async function sortMergeJoin(
     key: sortKey(item),
   }));
 
-  // Sort both sides
   leftKeyed.sort((a, b) => compareSortKeys(a.key, b.key));
   rightKeyed.sort((a, b) => compareSortKeys(a.key, b.key));
 
@@ -314,16 +349,10 @@ async function sortMergeJoin(
     const cmp = compareSortKeys(leftKeyed[li].key, rightKeyed[ri].key);
 
     if (cmp < 0) {
-      // Left key smaller: emit left row with no right match (cross semantics)
-      // In a Cartesian cross-join every left must pair with every right,
-      // so advance left and pair with all remaining right items of the
-      // same key group (which is empty here).  Just advance.
       li++;
     } else if (cmp > 0) {
       ri++;
     } else {
-      // Keys match: collect all left and right rows with the same key
-      // and emit the Cartesian product of the two groups.
       const matchKey = leftKeyed[li].key;
 
       const leftGroup: LuaTable[] = [];
@@ -364,13 +393,36 @@ async function sortMergeJoin(
     }
   }
 
-  // Remaining unmatched rows on either side do not produce output
-  // in a Cartesian cross-join context (no outer join semantics).
-
   return results;
 }
 
-// Execute a join tree and return materialized `LuaTable` rows
+// Resolve `using` predicate from a join hint
+function resolveUsingPredicate(
+  hint: LuaJoinHint | undefined,
+  env: LuaEnv,
+  sf: LuaStackFrame,
+): LuaValue | null {
+  if (!hint || hint.kind !== "loop" || !hint.using) return null;
+  if (typeof hint.using === "string") {
+    const fn = env.get(hint.using);
+    if (!fn) {
+      throw new LuaRuntimeError(
+        `Join predicate '${hint.using}' is not defined`,
+        sf,
+      );
+    }
+    return fn;
+  }
+  return new LuaFunction(hint.using as LuaFunctionBody, env);
+}
+
+// Collect the name of the left-most leaf source
+function leftMostSourceName(node: JoinNode): string {
+  if (node.kind === "leaf") return node.source.name;
+  return leftMostSourceName(node.left);
+}
+
+// Execute a join tree
 export async function executeJoinTree(
   tree: JoinNode,
   env: LuaEnv,
@@ -382,19 +434,31 @@ export async function executeJoinTree(
   }
 
   const leftRows = await executeJoinTree(tree.left, env, sf);
-  const rightItems = await materializeSource(
-    (tree.right as JoinLeaf).source,
-    env,
-    sf,
-  );
-  const rightName = (tree.right as JoinLeaf).source.name;
+  const rightSource = (tree.right as JoinLeaf).source;
+  const rightItems = await materializeSource(rightSource, env, sf);
+  const rightName = rightSource.name;
+
+  // Loop with `using` predicate
+  if (tree.method === "loop") {
+    const predicate = resolveUsingPredicate(rightSource.hint, env, sf);
+    if (predicate) {
+      const leftName = leftMostSourceName(tree.left);
+      return predicateLoopJoin(
+        leftRows,
+        rightItems,
+        rightName,
+        (row) => row.rawGet(leftName),
+        predicate,
+        sf,
+      );
+    }
+  }
 
   switch (tree.method) {
     case "hash":
-      return hashJoin(leftRows, rightItems, rightName, sf);
+    case "loop":
+      return crossJoin(leftRows, rightItems, rightName, sf);
     case "merge":
       return sortMergeJoin(leftRows, rightItems, rightName, sf);
-    case "loop":
-      return nestedLoopJoin(leftRows, rightItems, rightName, sf);
   }
 }
