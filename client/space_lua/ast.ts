@@ -237,6 +237,7 @@ export type LuaFunctionCallExpression = {
   name?: string;
   args: LuaExpression[];
   orderBy?: LuaOrderBy[];
+  argModifier?: "distinct" | "all";
 } & ASTContext;
 
 export type LuaBinaryExpression = {
@@ -296,11 +297,12 @@ export type LuaAggregateCallExpression = {
 } & ASTContext;
 
 // Join hint attached to a from-clause source binding
-export type JoinHintKind = "hash" | "loop" | "merge" | "using";
+export type JoinHintKind = "hash" | "loop" | "merge";
 
 export type LuaJoinHint = {
   type: "JoinHint";
   kind: JoinHintKind;
+  // Only valid for the loop physical operator
   using?: string | LuaFunctionBody;
 } & ASTContext;
 
@@ -369,6 +371,7 @@ export type LuaOrderBy = {
 export type LuaSelectClause = {
   type: "Select";
   fields: LuaTableField[];
+  distinct?: boolean;
 } & ASTContext;
 
 export type LuaGroupByClause = {

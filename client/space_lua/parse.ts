@@ -38,7 +38,7 @@ const luaStyleTags = styleTags({
   CompareOp: t.operator,
   "true false": t.bool,
   Comment: t.lineComment,
-  "return break goto do end while repeat until function local if then else elseif in for nil or and not query from where limit offset select order by desc asc nulls first last group having filter using plan hash loop merge":
+  "return break goto do end while repeat until function local if then else elseif in for nil or and not query from where limit offset select order by desc asc nulls first last group having filter using plan hash loop merge all distinct":
     t.keyword,
 });
 
@@ -1021,7 +1021,7 @@ function parseFunctionCall(
   ctx: ASTCtx,
 ): LuaFunctionCallExpression {
   if (t.children![1] && t.children![1].type === ":") {
-    const { args, aggOrderBy } = parseFunctionArgsWithOrderBy(
+    const { args, aggOrderBy, argModifier } = parseFunctionArgsWithOrderBy(
       t.children!.slice(3),
       ctx,
     );
@@ -1035,9 +1035,12 @@ function parseFunctionCall(
     if (aggOrderBy) {
       (result as any).orderBy = aggOrderBy;
     }
+    if (argModifier) {
+      result.argModifier = argModifier;
+    }
     return result;
   }
-  const { args, aggOrderBy } = parseFunctionArgsWithOrderBy(
+  const { args, aggOrderBy, argModifier } = parseFunctionArgsWithOrderBy(
     t.children!.slice(1),
     ctx,
   );
@@ -1049,6 +1052,9 @@ function parseFunctionCall(
   };
   if (aggOrderBy) {
     (result as any).orderBy = aggOrderBy;
+  }
+  if (argModifier) {
+    result.argModifier = argModifier;
   }
   return result;
 }
@@ -1417,16 +1423,23 @@ function parseQueryClause(t: ParseTree, ctx: ASTCtx): LuaQueryClause {
       };
     }
     case "SelectClause": {
-      // children: ckw<"select">, FieldList
-      const fieldListNode = t.children!.find((c) => c.type === "FieldList");
+      let distinct: boolean | undefined;
+      let fieldListNode: ParseTree | undefined;
+      for (const c of t.children!) {
+        if (c.type === "distinct") distinct = true;
+        else if (c.type === "all") distinct = false;
+        else if (c.type === "FieldList") fieldListNode = c;
+      }
       if (!fieldListNode) {
         throw new Error("SelectClause missing FieldList");
       }
-      return {
+      const result: LuaQueryClause = {
         type: "Select",
         fields: parseFieldList(fieldListNode, ctx),
         ctx: context(t, ctx),
       };
+      if (distinct !== undefined) (result as any).distinct = distinct;
+      return result;
     }
     case "GroupByClause": {
       // children: ckw<"group">, ckw<"by">, FieldList
@@ -1447,11 +1460,11 @@ function parseQueryClause(t: ParseTree, ctx: ASTCtx): LuaQueryClause {
         ctx: context(t, ctx),
       };
     }
-    case "PlanClause": {
+    case "PlanOrderByClause": {
       // children: ckw<"plan">, ckw<"order">, ckw<"by">, FieldList
       const fieldListNode = t.children!.find((c) => c.type === "FieldList");
       if (!fieldListNode) {
-        throw new Error("PlanClause missing FieldList");
+        throw new Error("PlanOrderByClause missing FieldList");
       }
       return {
         type: "PlanOrderBy",
@@ -1485,22 +1498,29 @@ function parseJoinHint(t: ParseTree, ctx: ASTCtx): LuaJoinHint {
   if (t.type !== "JoinHint") {
     throw new Error(`Expected JoinHint, got ${t.type}`);
   }
-  const child = t.children![0];
-  if (child.type === "UsingClause") {
-    return {
-      type: "JoinHint",
-      kind: "using",
-      using: parseUsingClause(child, ctx),
-      ctx: context(t, ctx),
-    };
+  const kids = t.children!;
+  const kindNode = kids[0];
+  const kind = (kindNode.children?.[0]?.text ?? kindNode.text!) as
+    | "hash"
+    | "loop"
+    | "merge";
+
+  let using: string | LuaFunctionBody | undefined;
+  const usingNode = kids.find((c) => c.type === "UsingClause");
+  if (usingNode) {
+    if (kind !== "loop") {
+      throw new Error(`'using' clause is only valid with 'loop' join hint`);
+    }
+    using = parseUsingClause(usingNode, ctx);
   }
-  // ckw: "hash" | "loop" | "merge"
-  const text = child.children?.[0]?.text ?? child.text!;
-  return {
+
+  const hint: LuaJoinHint = {
     type: "JoinHint",
-    kind: text as "hash" | "loop" | "merge",
+    kind,
     ctx: context(t, ctx),
   };
+  if (using !== undefined) hint.using = using;
+  return hint;
 }
 
 // Parse `FromFieldList` (like `parseFieldList` but extracts `JoinHint`,
@@ -1583,18 +1603,27 @@ function parseAggOrderBy(t: ParseTree, ctx: ASTCtx): LuaOrderBy[] {
 function parseFunctionArgsWithOrderBy(
   ts: ParseTree[],
   ctx: ASTCtx,
-): { args: LuaExpression[]; aggOrderBy?: LuaOrderBy[] } {
+): {
+  args: LuaExpression[];
+  aggOrderBy?: LuaOrderBy[];
+  argModifier?: "distinct" | "all";
+} {
   let aggOrderBy: LuaOrderBy[] | undefined;
+  let argModifier: "distinct" | "all" | undefined;
   const args: LuaExpression[] = [];
   for (const t of ts) {
     if (!t.type || [",", "(", ")"].includes(t.type)) continue;
     if (t.type === "AggOrderBy") {
       aggOrderBy = parseAggOrderBy(t, ctx);
+    } else if (t.type === "distinct") {
+      argModifier = "distinct";
+    } else if (t.type === "all") {
+      argModifier = "all";
     } else {
       args.push(parseExpression(t, ctx));
     }
   }
-  return { args, aggOrderBy };
+  return { args, aggOrderBy, argModifier };
 }
 
 function parseFunctionBody(t: ParseTree, ctx: ASTCtx): LuaFunctionBody {

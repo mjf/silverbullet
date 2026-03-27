@@ -1066,9 +1066,12 @@ export function evalExpression(
             const collection: any = toCollection(rows);
 
             // Build up query object
+            const selectClause = q.clauses.find((c) => c.type === "Select");
+            const selectDistinct = selectClause?.distinct;
+
             const query: LuaCollectionQuery = {
               objectVariable: undefined,
-              distinct: true,
+              distinct: selectDistinct !== false, // default true
             };
 
             // Map clauses to query parameters
@@ -1171,9 +1174,12 @@ export function evalExpression(
             }
 
             // Build up query object
+            const selectClause = q.clauses.find((c) => c.type === "Select");
+            const selectDistinct = selectClause?.distinct;
+
             const query: LuaCollectionQuery = {
               objectVariable,
-              distinct: true,
+              distinct: selectDistinct !== false, // default true
             };
 
             // Map clauses to query parameters
