@@ -17,7 +17,7 @@ import {
   type LuaValue,
 } from "./runtime.ts";
 import { isSqlNull } from "./liq_null.ts";
-import type { LuaExpression } from "./ast.ts";
+import type { LuaExpression, LuaOrderBy } from "./ast.ts";
 import { buildItemEnv } from "./query_env.ts";
 import { asyncMergeSort } from "./util.ts";
 import type { Config } from "../config.ts";
@@ -654,7 +654,7 @@ export async function executeAggregate(
   ) => Promise<LuaValue> | LuaValue,
   config: Config,
   filterExpr?: LuaExpression,
-  orderBy?: import("./ast.ts").LuaOrderBy[],
+  orderBy?: LuaOrderBy[],
 ): Promise<LuaValue> {
   const ctx = buildAggCtx(spec.name, config);
 
