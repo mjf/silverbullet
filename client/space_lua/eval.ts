@@ -1,7 +1,16 @@
 import {
+  type ExplainNode,
+  type ExplainOptions,
+  type ExplainResult,
+  type JoinPlannerConfig,
   type JoinSource,
   buildJoinTree,
+  executeAndInstrument,
   executeJoinTree,
+  explainJoinTree,
+  extractEquiPredicates,
+  formatExplainOutput,
+  wrapPlanWithQueryOps,
 } from "./join_planner.ts";
 import type {
   ASTCtx,
@@ -791,6 +800,77 @@ function fromFieldsToSource(fields: LuaFromField[], ctx: ASTCtx): FromSource {
   return { kind: "cross", sources };
 }
 
+/**
+ * Walk wrapper nodes (Limit, Sort, GroupAggregate) to find the
+ * underlying join/scan plan that executeAndInstrument operates on.
+ */
+function unwrapToJoinPlan(node: ExplainNode): ExplainNode {
+  if (
+    node.nodeType === "Limit" ||
+    node.nodeType === "Sort" ||
+    node.nodeType === "GroupAggregate"
+  ) {
+    return unwrapToJoinPlan(node.children[0]);
+  }
+  return node;
+}
+
+/**
+ * After executeAndInstrument fills actuals on join/scan nodes,
+ * copy them upward to wrapper nodes (Sort, Limit, GroupAggregate).
+ */
+function propagateActuals(node: ExplainNode, opts: ExplainOptions): void {
+  if (node.children.length === 0) return;
+
+  // Recurse first so children have actuals before parent reads them
+  for (const child of node.children) {
+    propagateActuals(child, opts);
+  }
+
+  const child = node.children[0];
+  if (child.actualRows === undefined) return;
+
+  switch (node.nodeType) {
+    case "Sort":
+      node.actualRows = child.actualRows;
+      node.actualLoops = 1;
+      if (opts.timing && child.actualTimeMs !== undefined) {
+        node.actualTimeMs = child.actualTimeMs;
+      }
+      node.memoryRows = child.actualRows; // sort buffer
+      break;
+    case "GroupAggregate":
+      // Actual group count unknown without execution; approximate
+      node.actualRows = node.actualRows ?? child.actualRows;
+      node.actualLoops = 1;
+      if (opts.timing && child.actualTimeMs !== undefined) {
+        node.actualTimeMs = child.actualTimeMs;
+      }
+      break;
+    case "Limit": {
+      const offset = node.offsetCount ?? 0;
+      const limit = node.limitCount ?? child.actualRows!;
+      node.actualRows = Math.min(
+        limit,
+        Math.max(0, child.actualRows! - offset),
+      );
+      node.actualLoops = 1;
+      if (opts.timing && child.actualTimeMs !== undefined) {
+        node.actualTimeMs = child.actualTimeMs;
+      }
+      break;
+    }
+    case "Unique": {
+      node.actualRows = node.actualRows ?? child.actualRows;
+      node.actualLoops = 1;
+      if (opts.timing && child.actualTimeMs !== undefined) {
+        node.actualTimeMs = child.actualTimeMs;
+      }
+      break;
+    }
+  }
+}
+
 export function evalExpression(
   e: LuaExpression,
   env: LuaEnv,
@@ -1058,11 +1138,153 @@ export function evalExpression(
               );
             });
 
+            // Gather stats by pre-evaluating source expressions
+            for (const src of fromSource.sources) {
+              const val = await evalExpression(src.expression, env, sf);
+              if (
+                val &&
+                typeof val === "object" &&
+                "query" in val &&
+                typeof val.query === "function"
+              ) {
+                // DataStoreQueryCollection — get count via empty query
+                const items = await val.query({}, env, sf);
+                src.stats = {
+                  rowCount: items.length,
+                  ndv: new Map(),
+                };
+              } else if (
+                val &&
+                typeof val === "object" &&
+                val.getStats &&
+                typeof val.getStats === "function"
+              ) {
+                src.stats = val.getStats();
+              }
+            }
+
+            // Extract equi-predicates from WHERE for join key pushdown
+            const whereClause = q.clauses.find((c) => c.type === "Where");
+            const sourceNames = new Set(fromSource.sources.map((s) => s.name));
+            const equiPreds = extractEquiPredicates(
+              whereClause?.expression,
+              sourceNames,
+            );
+
             // Build optimized join tree
-            const joinTree = buildJoinTree(fromSource.sources, planOrder);
+            const joinTree = buildJoinTree(
+              fromSource.sources,
+              planOrder,
+              equiPreds,
+            );
+
+            // Planner config from user settings
+            const plannerConfig: JoinPlannerConfig | undefined = globalThis
+              .client?.config
+              ? {
+                  watchdogLimit:
+                    globalThis.client.config.get("joinWatchdogLimit", undefined),
+                  yieldChunk: globalThis.client.config.get("joinYieldChunk", undefined),
+                }
+              : undefined;
+
+            // Check for explain clause
+            const explainClause = q.clauses.find((c) => c.type === "Explain");
+            if (explainClause) {
+              const explainOpts: ExplainOptions = {
+                analyze: explainClause.analyze,
+                costs: explainClause.costs,
+                timing: explainClause.timing,
+              };
+
+              const planT0 = performance.now();
+              let plan = explainJoinTree(joinTree, explainOpts);
+              const planningTimeMs =
+                Math.round((performance.now() - planT0) * 1000) / 1000;
+
+              // Collect query-level ops for plan wrapping
+              const explainQuery: Parameters<typeof wrapPlanWithQueryOps>[1] =
+                {};
+              for (const clause of q.clauses) {
+                switch (clause.type) {
+                  case "Where":
+                    explainQuery.where = clause.expression;
+                    break;
+                  case "OrderBy":
+                    explainQuery.orderBy = clause.orderBy.map((o) => ({
+                      expr: o.expression,
+                      desc: o.direction === "desc",
+                    }));
+                    break;
+                  case "Limit": {
+                    const lv = await evalExpression(clause.limit, env, sf);
+                    explainQuery.limit = Number(lv);
+                    if (clause.offset) {
+                      const ov = await evalExpression(clause.offset, env, sf);
+                      explainQuery.offset = Number(ov);
+                    }
+                    break;
+                  }
+                  case "Offset": {
+                    const ov = await evalExpression(clause.offset, env, sf);
+                    explainQuery.offset = Number(ov);
+                    break;
+                  }
+                  case "GroupBy":
+                    explainQuery.groupBy = clause.fields.map((f) => {
+                      if (f.type === "PropField")
+                        return { expr: f.value, alias: f.key };
+                      return { expr: f.value };
+                    });
+                    break;
+                  case "Having":
+                    explainQuery.having = clause.expression;
+                    break;
+                  case "Select":
+                    if (clause.distinct !== undefined) {
+                      explainQuery.distinct = clause.distinct;
+                    }
+                    break;
+                }
+              }
+
+              plan = wrapPlanWithQueryOps(plan, explainQuery);
+
+              const result: ExplainResult = {
+                plan,
+                planningTimeMs,
+              };
+
+              if (explainOpts.analyze) {
+                const execT0 = performance.now();
+                // Instrument only the join subtree (leaf of the wrapped plan)
+                const joinPlan = unwrapToJoinPlan(plan);
+                await executeAndInstrument(
+                  joinTree,
+                  joinPlan,
+                  env,
+                  sf,
+                  explainOpts,
+                  plannerConfig,
+                );
+
+                // Propagate actuals upward through wrapper nodes
+                propagateActuals(plan, explainOpts);
+
+                result.executionTimeMs =
+                  Math.round((performance.now() - execT0) * 1000) / 1000;
+              }
+
+              return formatExplainOutput(result, explainOpts);
+            }
 
             // Execute the join tree
-            const rows = await executeJoinTree(joinTree, env, sf);
+            const rows = await executeJoinTree(
+              joinTree,
+              env,
+              sf,
+              plannerConfig,
+            );
             const collection: any = toCollection(rows);
 
             // Build up query object
@@ -1125,6 +1347,10 @@ export function evalExpression(
                   break;
                 }
                 case "PlanOrderBy": {
+                  // Already consumed above
+                  break;
+                }
+                case "Explain": {
                   // Already consumed above
                   break;
                 }

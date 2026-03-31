@@ -302,6 +302,7 @@ export type JoinHintKind = "hash" | "loop" | "merge";
 export type LuaJoinHint = {
   type: "JoinHint";
   kind: JoinHintKind;
+  joinType?: "semi" | "anti";
   // Only valid for the loop physical operator
   using?: string | LuaFunctionBody;
 } & ASTContext;
@@ -317,6 +318,13 @@ export type LuaQueryExpression = {
   clauses: LuaQueryClause[];
 } & ASTContext;
 
+export type LuaExplainClause = {
+  type: "Explain";
+  analyze: boolean;
+  costs: boolean;
+  timing: boolean;
+} & ASTContext;
+
 export type LuaQueryClause =
   | LuaFromClause
   | LuaWhereClause
@@ -326,7 +334,8 @@ export type LuaQueryClause =
   | LuaSelectClause
   | LuaGroupByClause
   | LuaHavingClause
-  | LuaPlanOrderByClause;
+  | LuaPlanOrderByClause
+  | LuaExplainClause;
 
 // Field list used by `from`, `select` and `group by` clauses
 export type LuaFromClause = {

@@ -4,6 +4,8 @@ import {
   ArrayQueryCollection,
   type LuaCollectionQuery,
   type LuaQueryCollection,
+  type CollectionStats,
+  type StatsTracker,
 } from "../space_lua/query_collection.ts";
 import {
   jsToLuaValue,
@@ -59,6 +61,7 @@ export class ObjectIndex {
     private config: Config,
     private eventHook: EventHook,
     private mq: DataStoreMQ,
+    private tagStats = new Map<string, StatsTracker>(),
   ) {
     // Clear any entries for deleted files
     this.eventHook.addLocalListener("file:deleted", (path: string) => {
@@ -167,17 +170,17 @@ export class ObjectIndex {
     // Config entries (user-defined overrides and aliases)
     const userAggs: Record<string, any> = this.config.get("aggregates", {});
     for (const [key, spec] of Object.entries(userAggs)) {
-      const aliasTarget = spec instanceof LuaTable
-        ? spec.rawGet("alias")
-        : spec?.alias ?? null;
+      const aliasTarget =
+        spec instanceof LuaTable ? spec.rawGet("alias") : (spec?.alias ?? null);
       if (typeof aliasTarget === "string") {
         const resolved = getAggregateSpec(aliasTarget, this.config);
         entries.push({
           builtin: false,
           name: key,
-          description: spec instanceof LuaTable
-            ? spec.rawGet("description") ?? resolved?.description ?? ""
-            : spec?.description ?? resolved?.description ?? "",
+          description:
+            spec instanceof LuaTable
+              ? (spec.rawGet("description") ?? resolved?.description ?? "")
+              : (spec?.description ?? resolved?.description ?? ""),
           initialize: resolved ? !!resolved.initialize : false,
           iterate: resolved ? !!resolved.iterate : false,
           finish: resolved ? !!resolved.finish : false,
@@ -519,4 +522,22 @@ export class ObjectIndex {
   deleteObject(page: string, tag: string, ref: string): Promise<void> {
     return this.batchDelete(page, [[tag, this.cleanKey(ref, page)]]);
   }
+
+//  private trackObject(tag: string, obj: Record<string, any>): void {
+//    let tracker = this.tagStats.get(tag);
+//    if (!tracker) {
+//      tracker = new StatsTracker();
+//      this.tagStats.set(tag, tracker);
+//    }
+//    tracker.index(obj);
+//  }
+
+  getTagStats(tag: string): CollectionStats | undefined {
+    return this.tagStats.get(tag)?.getStats();
+  }
+
+//  private clearAllStats(): void {
+//    for (const t of this.tagStats.values()) t.clear();
+//    this.tagStats.clear();
+//  }
 }

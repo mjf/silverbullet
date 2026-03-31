@@ -38,7 +38,7 @@ const luaStyleTags = styleTags({
   CompareOp: t.operator,
   "true false": t.bool,
   Comment: t.lineComment,
-  "return break goto do end while repeat until function local if then else elseif in for nil or and not query from where limit offset select order by desc asc nulls first last group having filter using plan hash loop merge all distinct":
+  "return break goto do end while repeat until function local if then else elseif in for nil or and not query from where limit offset select order by desc asc nulls first last group having filter using plan semi anti hash loop merge all distinct explain analyze costs timing":
     t.keyword,
 });
 
@@ -166,6 +166,8 @@ function expressionHasFunctionDef(e: LuaExpression): boolean {
               }
             }
             break;
+	  case "Explain":
+	    break;
         }
       }
       return false;
@@ -285,6 +287,8 @@ function exprReferencesNames(e: LuaExpression, names: Set<string>): boolean {
               }
             }
             break;
+	  case "Explain":
+	    break;
         }
       }
       return false;
@@ -1472,6 +1476,38 @@ function parseQueryClause(t: ParseTree, ctx: ASTCtx): LuaQueryClause {
         ctx: context(t, ctx),
       };
     }
+    case "ExplainClause": {
+      let analyze = false;
+      let costs = false;
+      let timing = false;
+
+      for (const child of t.children!) {
+        const text = child.children?.[0]?.text ?? child.text;
+        if (text === "analyze") analyze = true;
+      }
+
+      const optList = t.children!.find(
+        (c) => c.type === "ExplainOptionList",
+      );
+      if (optList) {
+        for (const child of optList.children!) {
+          if (child.type === "ExplainOption") {
+            const text = child.children?.[0]?.children?.[0]?.text
+              ?? child.children?.[0]?.text;
+            if (text === "costs") costs = true;
+            if (text === "timing") timing = true;
+          }
+        }
+      }
+
+      return {
+        type: "Explain",
+        analyze,
+        costs,
+        timing,
+        ctx: context(t, ctx),
+      };
+    }
     default:
       console.error(t);
       throw new Error(`Unknown query clause type: ${t.type}`);
@@ -1499,19 +1535,31 @@ function parseJoinHint(t: ParseTree, ctx: ASTCtx): LuaJoinHint {
     throw new Error(`Expected JoinHint, got ${t.type}`);
   }
   const kids = t.children!;
-  const kindNode = kids[0];
-  const kind = (kindNode.children?.[0]?.text ?? kindNode.text!) as
-    | "hash"
-    | "loop"
-    | "merge";
 
+  // Grammar: (ckw<"semi"> | ckw<"anti">)? (ckw<"hash"> | ckw<"merge"> | ckw<"loop"> UsingClause?)
+  // When semi/anti is present, it's the first child and the method is second.
+  let joinType: "semi" | "anti" | undefined;
+  let kind: "hash" | "loop" | "merge" | undefined;
   let using: string | LuaFunctionBody | undefined;
-  const usingNode = kids.find((c) => c.type === "UsingClause");
-  if (usingNode) {
-    if (kind !== "loop") {
-      throw new Error(`'using' clause is only valid with 'loop' join hint`);
+
+  for (const kid of kids) {
+    const text = kid.children?.[0]?.text ?? kid.text;
+    if (text === "semi") joinType = "semi";
+    else if (text === "anti") joinType = "anti";
+    else if (text === "hash") kind = "hash";
+    else if (text === "loop") kind = "loop";
+    else if (text === "merge") kind = "merge";
+    else if (kid.type === "UsingClause") {
+      using = parseUsingClause(kid, ctx);
     }
-    using = parseUsingClause(usingNode, ctx);
+  }
+
+  if (!kind) {
+    throw new Error("JoinHint missing method (hash, loop, or merge)");
+  }
+
+  if (using && kind !== "loop") {
+    throw new Error("'using' clause is only valid with 'loop' join hint");
   }
 
   const hint: LuaJoinHint = {
@@ -1519,6 +1567,7 @@ function parseJoinHint(t: ParseTree, ctx: ASTCtx): LuaJoinHint {
     kind,
     ctx: context(t, ctx),
   };
+  if (joinType) hint.joinType = joinType;
   if (using !== undefined) hint.using = using;
   return hint;
 }

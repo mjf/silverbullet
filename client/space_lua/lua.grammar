@@ -102,7 +102,20 @@ QueryClause {
   OffsetClause |
   GroupByClause |
   HavingClause |
-  PlanOrderByClause
+  PlanOrderByClause |
+  ExplainClause
+}
+
+ExplainClause {
+  ckw<"explain"> ckw<"analyze">? ExplainOptionList?
+}
+
+ExplainOptionList {
+  "(" list<ExplainOption> ")"
+}
+
+ExplainOption {
+  ckw<"costs"> | ckw<"timing">
 }
 
 FromClause { ckw<"from"> FromFieldList }
@@ -129,7 +142,8 @@ AggOrderBy { ckw<"order"> ckw<"by"> list<OrderBy> }
 UsingClause { kw<"using"> (Name | kw<"function"> FuncBody) }
 
 JoinHint {
-  ckw<"hash"> | ckw<"merge"> | ckw<"loop"> UsingClause?
+  (ckw<"semi"> | ckw<"anti">)?
+  (ckw<"hash"> | ckw<"merge"> | ckw<"loop"> UsingClause?)
 }
 
 field[@isGroup=Field] {

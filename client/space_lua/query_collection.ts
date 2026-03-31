@@ -45,22 +45,30 @@ import { HyperLogLog } from "./hll.ts";
 export type CollectionStats = {
   rowCount: number;
   ndv: Map<string, number>;
+  nullFraction?: Map<string, number>;
+  avgColumnCount?: number;
 };
 
-// Mutable stats tracker for collections that support indexing
 export class StatsTracker {
   rowCount = 0;
   private hllMap = new Map<string, HyperLogLog>();
+  private nullCounts = new Map<string, number>();
 
   index(item: Record<string, any>): void {
     this.rowCount++;
-    for (const key of Object.keys(item)) {
+    const keys = Object.keys(item);
+    for (const key of keys) {
+      const val = item[key];
+      if (val === null || val === undefined) {
+        this.nullCounts.set(key, (this.nullCounts.get(key) ?? 0) + 1);
+        continue; // Don't feed nulls to HLL
+      }
       let hll = this.hllMap.get(key);
       if (!hll) {
         hll = new HyperLogLog();
         this.hllMap.set(key, hll);
       }
-      hll.add(String(item[key]));
+      hll.add(String(val));
     }
   }
 
@@ -71,15 +79,20 @@ export class StatsTracker {
 
   getStats(): CollectionStats {
     const ndv = new Map<string, number>();
+    const nullFraction = new Map<string, number>();
     for (const [col, hll] of this.hllMap) {
       ndv.set(col, hll.estimate());
     }
-    return { rowCount: this.rowCount, ndv };
+    for (const [col, cnt] of this.nullCounts) {
+      nullFraction.set(col, this.rowCount > 0 ? cnt / this.rowCount : 0);
+    }
+    return { rowCount: this.rowCount, ndv, nullFraction };
   }
 
   clear(): void {
     this.rowCount = 0;
     this.hllMap.clear();
+    this.nullCounts.clear();
   }
 }
 
@@ -231,6 +244,10 @@ export interface LuaQueryCollection {
     sf: LuaStackFrame,
     config?: Config,
   ): Promise<any[]>;
+}
+
+export interface LuaQueryCollectionWithStats extends LuaQueryCollection {
+  getStats?(): CollectionStats | undefined;
 }
 
 /**
