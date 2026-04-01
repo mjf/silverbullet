@@ -55,6 +55,7 @@ import {
   type JoinPlannerConfig,
   type JoinNode,
   type JoinSource,
+  stripUsedJoinPredicates,
   wrapPlanWithQueryOps,
 } from "./join_planner.ts";
 import { getBlockGotoMeta } from "./labels.ts";
@@ -1206,8 +1207,10 @@ export function evalExpression(
 
             // Single-source filter pushdown: extract filters that reference
             // exactly one source and apply them before the join.
-            const { pushed: pushedFilters, residual: residualWhere } =
-              extractSingleSourceFilters(whereClause?.expression, sourceNames);
+            const {
+              pushed: pushedFilters,
+              residual: pushdownResidualWhere,
+            } = extractSingleSourceFilters(whereClause?.expression, sourceNames);
 
             // Build optimized join tree
             const joinTree = buildJoinTree(
@@ -1215,6 +1218,14 @@ export function evalExpression(
               planOrder,
               equiPreds,
               rangePreds,
+            );
+
+            // Remove equi-predicates already consumed by the join tree.
+            // This is required for correct semi/anti semantics, where the
+            // join predicate must not be re-applied as a post-join filter.
+            const residualWhere = stripUsedJoinPredicates(
+              pushdownResidualWhere,
+              joinTree,
             );
 
             // Planner config from user settings
@@ -1231,6 +1242,8 @@ export function evalExpression(
                   ),
                 }
               : undefined;
+
+            const materializedOverrides = new Map<string, any[]>();
 
             // Check for explain clause
             const explainClause = q.clauses.find((c) => c.type === "Explain");
@@ -1310,6 +1323,7 @@ export function evalExpression(
                   sf,
                   explainOpts,
                   plannerConfig,
+		  materializedOverrides,
                 );
 
                 // Propagate actuals upward through wrapper nodes
@@ -1326,66 +1340,61 @@ export function evalExpression(
             // Apply single-source pushed-down filters during materialization
             // by wrapping source expressions with filter evaluation
             if (pushedFilters.length > 0) {
-              const applyFiltersToLeaves = async (
+              const collectFilteredLeaves = async (
                 node: JoinNode,
               ): Promise<void> => {
                 if (node.kind === "leaf") {
                   const srcFilters = pushedFilters.filter(
                     (f) => f.sourceName === node.source.name,
                   );
-                  if (srcFilters.length > 0) {
-                    // Pre-materialize and filter, then replace expression
-                    // with a literal reference to the filtered array
-                    const val = await evalExpression(
-                      node.source.expression,
-                      env,
-                      sf,
-                    );
-                    let items: any[];
-                    if (Array.isArray(val)) {
-                      items = val;
-                    } else if (val instanceof LuaTable) {
-                      items = [];
-                      if (val.length > 0) {
-                        for (let i = 1; i <= val.length; i++)
-                          items.push(val.rawGet(i));
-                      } else if (!val.empty()) {
-                        items = [val];
-                      }
-                    } else if (
-                      val &&
-                      typeof val === "object" &&
-                      "query" in val &&
-                      typeof val.query === "function"
-                    ) {
-                      items = await val.query({}, env, sf);
-                    } else {
-                      items = val ? [val] : [];
-                    }
-                    const filtered = await applyPushedFilters(
-                      items,
-                      node.source.name,
-                      srcFilters,
-                      env,
-                      sf,
-                    );
-                    // Update stats after filtering
-                    node.source.stats = computeStatsFromArray(filtered);
-                    // Replace expression with a variable pointing to filtered array
-                    const filteredVarName = `__filtered_${node.source.name}`;
-                    env.setLocal(filteredVarName, filtered);
-                    node.source.expression = {
-                      type: "Variable",
-                      name: filteredVarName,
-                      ctx: node.source.expression.ctx,
-                    };
+                  if (srcFilters.length === 0) {
+                    return;
                   }
+
+                  const val = await evalExpression(
+                    node.source.expression,
+                    env,
+                    sf,
+                  );
+                  let items: any[];
+                  if (Array.isArray(val)) {
+                    items = val;
+                  } else if (val instanceof LuaTable) {
+                    items = [];
+                    if (val.length > 0) {
+                      for (let i = 1; i <= val.length; i++) {
+                        items.push(val.rawGet(i));
+                      }
+                    } else if (!val.empty()) {
+                      items = [val];
+                    }
+                  } else if (
+                    val &&
+                    typeof val === "object" &&
+                    "query" in val &&
+                    typeof val.query === "function"
+                  ) {
+                    items = await val.query({}, env, sf);
+                  } else {
+                    items = val ? [val] : [];
+                  }
+
+                  const filtered = await applyPushedFilters(
+                    items,
+                    node.source.name,
+                    srcFilters,
+                    env,
+                    sf,
+                  );
+                  node.source.stats = computeStatsFromArray(filtered);
+                  materializedOverrides.set(node.source.name, filtered);
                 } else {
-                  await applyFiltersToLeaves(node.left);
-                  await applyFiltersToLeaves(node.right);
+                  await collectFilteredLeaves(node.left);
+                  await collectFilteredLeaves(node.right);
                 }
               };
-              await applyFiltersToLeaves(joinTree);
+
+              await collectFilteredLeaves(joinTree);
             }
 
             const rows = await executeJoinTree(
@@ -1393,6 +1402,7 @@ export function evalExpression(
               env,
               sf,
               plannerConfig,
+	      materializedOverrides,
             );
 
             const collection: any = toCollection(rows);
@@ -1410,7 +1420,7 @@ export function evalExpression(
             for (const clause of q.clauses) {
               switch (clause.type) {
                 case "Where": {
-                  query.where = residualWhere ?? undefined;
+                  query.where = residualWhere;
                   break;
                 }
                 case "OrderBy": {

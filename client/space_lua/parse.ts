@@ -1534,25 +1534,36 @@ function parseJoinHint(t: ParseTree, ctx: ASTCtx): LuaJoinHint {
   if (t.type !== "JoinHint") {
     throw new Error(`Expected JoinHint, got ${t.type}`);
   }
-  const kids = t.children!;
 
-  // Grammar: (ckw<"semi"> | ckw<"anti">)? (ckw<"hash"> | ckw<"merge"> | ckw<"loop"> UsingClause?)
-  // When semi/anti is present, it's the first child and the method is second.
   let joinType: "semi" | "anti" | undefined;
   let kind: "hash" | "loop" | "merge" | undefined;
   let using: string | LuaFunctionBody | undefined;
 
-  for (const kid of kids) {
-    const text = kid.children?.[0]?.text ?? kid.text;
-    if (text === "semi") joinType = "semi";
-    else if (text === "anti") joinType = "anti";
-    else if (text === "hash") kind = "hash";
-    else if (text === "loop") kind = "loop";
-    else if (text === "merge") kind = "merge";
-    else if (kid.type === "UsingClause") {
-      using = parseUsingClause(kid, ctx);
+  const visit = (node: ParseTree) => {
+    const text = node.children?.[0]?.text ?? node.text;
+
+    if (text === "semi") {
+      joinType = "semi";
+    } else if (text === "anti") {
+      joinType = "anti";
+    } else if (text === "hash") {
+      kind = "hash";
+    } else if (text === "loop") {
+      kind = "loop";
+    } else if (text === "merge") {
+      kind = "merge";
     }
-  }
+
+    if (node.type === "UsingClause") {
+      using = parseUsingClause(node, ctx);
+    }
+
+    for (const child of node.children ?? []) {
+      visit(child);
+    }
+  };
+
+  visit(t);
 
   if (!kind) {
     throw new Error("JoinHint missing method (hash, loop, or merge)");
@@ -1589,7 +1600,29 @@ function parseFromFieldList(t: ParseTree, ctx: ASTCtx): LuaFromField[] {
       const base = parseTableField(c, ctx);
       const hintNode = c.children?.find((ch) => ch.type === "JoinHint");
       if (hintNode) {
-        return { ...base, joinHint: parseJoinHint(hintNode, ctx) };
+        const joinHint = parseJoinHint(hintNode, ctx);
+
+        if (!joinHint.joinType) {
+          const texts: string[] = [];
+          const visit = (node: ParseTree) => {
+            const text = node.children?.[0]?.text ?? node.text;
+            if (typeof text === "string") {
+              texts.push(text);
+            }
+            for (const child of node.children ?? []) {
+              visit(child);
+            }
+          };
+          visit(c);
+
+          if (texts.includes("semi")) {
+            joinHint.joinType = "semi";
+          } else if (texts.includes("anti")) {
+            joinHint.joinType = "anti";
+          }
+        }
+
+        return { ...base, joinHint };
       }
       return base;
     });

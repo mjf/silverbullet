@@ -5,7 +5,7 @@ import {
   type LuaCollectionQuery,
   type LuaQueryCollection,
   type CollectionStats,
-  type StatsTracker,
+  StatsTracker,
 } from "../space_lua/query_collection.ts";
 import {
   jsToLuaValue,
@@ -523,21 +523,21 @@ export class ObjectIndex {
     return this.batchDelete(page, [[tag, this.cleanKey(ref, page)]]);
   }
 
-//  private trackObject(tag: string, obj: Record<string, any>): void {
-//    let tracker = this.tagStats.get(tag);
-//    if (!tracker) {
-//      tracker = new StatsTracker();
-//      this.tagStats.set(tag, tracker);
-//    }
-//    tracker.index(obj);
-//  }
+  private trackObject(tag: string, obj: Record<string, any>): void {
+    let tracker = this.tagStats.get(tag);
+    if (!tracker) {
+      tracker = new StatsTracker();
+      this.tagStats.set(tag, tracker);
+    }
+    tracker.index(obj);
+  }
 
   getTagStats(tag: string): CollectionStats | undefined {
     return this.tagStats.get(tag)?.getStats();
   }
 
-//  private clearAllStats(): void {
-//    for (const t of this.tagStats.values()) t.clear();
-//    this.tagStats.clear();
-//  }
+  private clearAllStats(): void {
+    for (const t of this.tagStats.values()) t.clear();
+    this.tagStats.clear();
+  }
 }
