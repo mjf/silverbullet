@@ -1,17 +1,3 @@
-import {
-  type ExplainNode,
-  type ExplainOptions,
-  type ExplainResult,
-  type JoinPlannerConfig,
-  type JoinSource,
-  buildJoinTree,
-  executeAndInstrument,
-  executeJoinTree,
-  explainJoinTree,
-  extractEquiPredicates,
-  formatExplainOutput,
-  wrapPlanWithQueryOps,
-} from "./join_planner.ts";
 import type {
   ASTCtx,
   LuaBlock,
@@ -24,56 +10,6 @@ import type {
   NumericType,
 } from "./ast.ts";
 import { LuaAttribute } from "./ast.ts";
-import { evalPromiseValues } from "./util.ts";
-import {
-  getMetatable,
-  type ILuaFunction,
-  type ILuaGettable,
-  isILuaFunction,
-  jsToLuaValue,
-  luaCall,
-  luaCloseFromMark,
-  luaEnsureCloseStack,
-  LuaEnv,
-  luaEquals,
-  luaFormatNumber,
-  LuaFunction,
-  luaGet,
-  luaIndexValue,
-  type LuaLValueContainer,
-  luaMarkToBeClosed,
-  LuaMultiRes,
-  LuaRuntimeError,
-  luaSet,
-  type LuaStackFrame,
-  LuaTable,
-  luaTruthy,
-  type LuaType,
-  luaTypeName,
-  luaTypeOf,
-  type LuaValue,
-  luaValueToJS,
-  singleResult,
-} from "./runtime.ts";
-import {
-  type LuaCollectionQuery,
-  type LuaGroupByEntry,
-  toCollection,
-} from "./query_collection.ts";
-import {
-  coerceNumericPair,
-  coerceToNumber,
-  inferNumericType,
-  isNegativeZero,
-  isTaggedFloat,
-  luaStringCoercionError,
-  makeLuaFloat,
-  makeLuaZero,
-  normalizeArithmeticResult,
-  toInteger,
-  untagNumber,
-} from "./numeric.ts";
-import { isPromise, rpAll, rpThen } from "./rp.ts";
 import {
   asAssignment,
   asBinary,
@@ -103,7 +39,76 @@ import {
   asVariable,
   asWhile,
 } from "./ast_narrow.ts";
+import {
+  applyPushedFilters,
+  buildJoinTree,
+  type ExplainNode,
+  type ExplainOptions,
+  type ExplainResult,
+  executeAndInstrument,
+  executeJoinTree,
+  explainJoinTree,
+  extractEquiPredicates,
+  extractRangePredicates,
+  extractSingleSourceFilters,
+  formatExplainOutput,
+  type JoinPlannerConfig,
+  type JoinNode,
+  type JoinSource,
+  wrapPlanWithQueryOps,
+} from "./join_planner.ts";
 import { getBlockGotoMeta } from "./labels.ts";
+import {
+  coerceNumericPair,
+  coerceToNumber,
+  inferNumericType,
+  isNegativeZero,
+  isTaggedFloat,
+  luaStringCoercionError,
+  makeLuaFloat,
+  makeLuaZero,
+  normalizeArithmeticResult,
+  toInteger,
+  untagNumber,
+} from "./numeric.ts";
+import {
+  computeStatsFromArray,
+  type LuaCollectionQuery,
+  type LuaGroupByEntry,
+  toCollection,
+} from "./query_collection.ts";
+import { isPromise, rpAll, rpThen } from "./rp.ts";
+import {
+  getMetatable,
+  type ILuaFunction,
+  type ILuaGettable,
+  isILuaFunction,
+  jsToLuaValue,
+  LuaEnv,
+  LuaFunction,
+  type LuaLValueContainer,
+  LuaMultiRes,
+  LuaRuntimeError,
+  type LuaStackFrame,
+  LuaTable,
+  type LuaType,
+  type LuaValue,
+  luaCall,
+  luaCloseFromMark,
+  luaEnsureCloseStack,
+  luaEquals,
+  luaFormatNumber,
+  luaGet,
+  luaIndexValue,
+  luaMarkToBeClosed,
+  luaSet,
+  luaTruthy,
+  luaTypeName,
+  luaTypeOf,
+  luaValueToJS,
+  singleResult,
+} from "./runtime.ts";
+import { evalPromiseValues } from "./util.ts";
 
 const astNumberKindCache = new WeakMap<LuaExpression, NumericType>();
 
@@ -1138,28 +1143,50 @@ export function evalExpression(
               );
             });
 
-            // Gather stats by pre-evaluating source expressions
+            // Gather stats by pre-evaluating source expressions.
+            // For DataStoreQueryCollection: use countQuery() (O(1) on IndexedDB).
+            // For arrays/LuaTable: compute stats from already-materialized data.
+            // This avoids materializing all rows just for planning.
             for (const src of fromSource.sources) {
               const val = await evalExpression(src.expression, env, sf);
               if (
                 val &&
                 typeof val === "object" &&
+                val.getStats &&
+                typeof val.getStats === "function"
+              ) {
+                // DataStoreQueryCollection.getStats() or ArrayQueryCollection.getStats()
+                const stats = await val.getStats();
+                if (stats) {
+                  src.stats = stats;
+                }
+              } else if (
+                val &&
+                typeof val === "object" &&
                 "query" in val &&
                 typeof val.query === "function"
               ) {
-                // DataStoreQueryCollection — get count via empty query
+                // Fallback: collection without getStats — materialize to count
                 const items = await val.query({}, env, sf);
                 src.stats = {
                   rowCount: items.length,
                   ndv: new Map(),
                 };
-              } else if (
-                val &&
-                typeof val === "object" &&
-                val.getStats &&
-                typeof val.getStats === "function"
-              ) {
-                src.stats = val.getStats();
+              } else if (Array.isArray(val)) {
+                // Inline JS array — exact stats from materialized data
+                src.stats = computeStatsFromArray(val);
+              } else if (val instanceof LuaTable) {
+                // LuaTable — extract length or treat as single row
+                const len = val.length;
+                if (len > 0) {
+                  const arr: any[] = [];
+                  for (let i = 1; i <= len; i++) arr.push(val.rawGet(i));
+                  src.stats = computeStatsFromArray(arr);
+                } else if (!val.empty()) {
+                  src.stats = { rowCount: 1, ndv: new Map() };
+                } else {
+                  src.stats = { rowCount: 0, ndv: new Map() };
+                }
               }
             }
 
@@ -1171,20 +1198,37 @@ export function evalExpression(
               sourceNames,
             );
 
+            // Extract range predicates for selectivity estimation
+            const rangePreds = extractRangePredicates(
+              whereClause?.expression,
+              sourceNames,
+            );
+
+            // Single-source filter pushdown: extract filters that reference
+            // exactly one source and apply them before the join.
+            const { pushed: pushedFilters, residual: residualWhere } =
+              extractSingleSourceFilters(whereClause?.expression, sourceNames);
+
             // Build optimized join tree
             const joinTree = buildJoinTree(
               fromSource.sources,
               planOrder,
               equiPreds,
+              rangePreds,
             );
 
             // Planner config from user settings
             const plannerConfig: JoinPlannerConfig | undefined = globalThis
               .client?.config
               ? {
-                  watchdogLimit:
-                    globalThis.client.config.get("joinWatchdogLimit", undefined),
-                  yieldChunk: globalThis.client.config.get("joinYieldChunk", undefined),
+                  watchdogLimit: globalThis.client.config.get(
+                    "joinWatchdogLimit",
+                    undefined,
+                  ),
+                  yieldChunk: globalThis.client.config.get(
+                    "joinYieldChunk",
+                    undefined,
+                  ),
                 }
               : undefined;
 
@@ -1279,12 +1323,78 @@ export function evalExpression(
             }
 
             // Execute the join tree
+            // Apply single-source pushed-down filters during materialization
+            // by wrapping source expressions with filter evaluation
+            if (pushedFilters.length > 0) {
+              const applyFiltersToLeaves = async (
+                node: JoinNode,
+              ): Promise<void> => {
+                if (node.kind === "leaf") {
+                  const srcFilters = pushedFilters.filter(
+                    (f) => f.sourceName === node.source.name,
+                  );
+                  if (srcFilters.length > 0) {
+                    // Pre-materialize and filter, then replace expression
+                    // with a literal reference to the filtered array
+                    const val = await evalExpression(
+                      node.source.expression,
+                      env,
+                      sf,
+                    );
+                    let items: any[];
+                    if (Array.isArray(val)) {
+                      items = val;
+                    } else if (val instanceof LuaTable) {
+                      items = [];
+                      if (val.length > 0) {
+                        for (let i = 1; i <= val.length; i++)
+                          items.push(val.rawGet(i));
+                      } else if (!val.empty()) {
+                        items = [val];
+                      }
+                    } else if (
+                      val &&
+                      typeof val === "object" &&
+                      "query" in val &&
+                      typeof val.query === "function"
+                    ) {
+                      items = await val.query({}, env, sf);
+                    } else {
+                      items = val ? [val] : [];
+                    }
+                    const filtered = await applyPushedFilters(
+                      items,
+                      node.source.name,
+                      srcFilters,
+                      env,
+                      sf,
+                    );
+                    // Update stats after filtering
+                    node.source.stats = computeStatsFromArray(filtered);
+                    // Replace expression with a variable pointing to filtered array
+                    const filteredVarName = `__filtered_${node.source.name}`;
+                    env.setLocal(filteredVarName, filtered);
+                    node.source.expression = {
+                      type: "Variable",
+                      name: filteredVarName,
+                      ctx: node.source.expression.ctx,
+                    };
+                  }
+                } else {
+                  await applyFiltersToLeaves(node.left);
+                  await applyFiltersToLeaves(node.right);
+                }
+              };
+              await applyFiltersToLeaves(joinTree);
+            }
+
             const rows = await executeJoinTree(
               joinTree,
               env,
               sf,
               plannerConfig,
             );
+
             const collection: any = toCollection(rows);
 
             // Build up query object
@@ -1300,7 +1410,7 @@ export function evalExpression(
             for (const clause of q.clauses) {
               switch (clause.type) {
                 case "Where": {
-                  query.where = clause.expression;
+                  query.where = residualWhere ?? undefined;
                   break;
                 }
                 case "OrderBy": {

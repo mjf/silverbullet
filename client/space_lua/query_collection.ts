@@ -1,3 +1,9 @@
+import type { QueryCollationConfig } from "../../plug-api/types/config.ts";
+import type { KvKey } from "../../plug-api/types/datastore.ts";
+import { Config } from "../config.ts";
+import type { DataStore } from "../data/datastore.ts";
+import type { KvPrimitives } from "../data/kv_primitives.ts";
+import { executeAggregate, getAggregateSpec } from "./aggregates.ts";
 import type {
   LuaAggregateCallExpression,
   LuaBinaryExpression,
@@ -11,35 +17,24 @@ import type {
   LuaPropField,
   LuaUnaryExpression,
 } from "./ast.ts";
-
+import { evalExpression, luaOp } from "./eval.ts";
+import { HyperLogLog } from "./hll.ts";
+import { isSqlNull, LIQ_NULL } from "./liq_null.ts";
 import {
   jsToLuaValue,
-  luaCall,
   LuaEnv,
   LuaFunction,
-  luaGet,
-  luaKeys,
   LuaRuntimeError,
   LuaStackFrame,
   LuaTable,
-  luaTruthy,
   type LuaValue,
+  luaCall,
+  luaGet,
+  luaKeys,
+  luaTruthy,
   singleResult,
 } from "./runtime.ts";
-import { isSqlNull, LIQ_NULL } from "./liq_null.ts";
-import { evalExpression, luaOp } from "./eval.ts";
 import { asyncMergeSort } from "./util.ts";
-import type { DataStore } from "../data/datastore.ts";
-import type { KvPrimitives } from "../data/kv_primitives.ts";
-
-import type { QueryCollationConfig } from "../../plug-api/types/config.ts";
-
-import type { KvKey } from "../../plug-api/types/datastore.ts";
-
-import { executeAggregate, getAggregateSpec } from "./aggregates.ts";
-import { Config } from "../config.ts";
-
-import { HyperLogLog } from "./hll.ts";
 
 // Collection statistics for the cost-based planner
 export type CollectionStats = {
@@ -251,6 +246,48 @@ export interface LuaQueryCollectionWithStats extends LuaQueryCollection {
 }
 
 /**
+ * Compute CollectionStats from a plain JavaScript array.
+ * Used by the join planner for inline array/table sources.
+ */
+export function computeStatsFromArray(items: any[]): CollectionStats {
+  const ndv = new Map<string, number>();
+  const nullFraction = new Map<string, number>();
+  const seen = new Map<string, Set<string>>();
+  const nullCounts = new Map<string, number>();
+  let totalColumns = 0;
+
+  for (const item of items) {
+    if (typeof item === "object" && item !== null) {
+      const keys = item instanceof LuaTable ? luaKeys(item) : Object.keys(item);
+      totalColumns += keys.length;
+      for (const key of keys) {
+        if (typeof key !== "string") continue;
+        const val = item instanceof LuaTable ? item.rawGet(key) : item[key];
+        if (val === null || val === undefined) {
+          nullCounts.set(key, (nullCounts.get(key) ?? 0) + 1);
+          continue;
+        }
+        let s = seen.get(key);
+        if (!s) {
+          s = new Set();
+          seen.set(key, s);
+        }
+        s.add(String(val));
+      }
+    }
+  }
+  for (const [k, s] of seen) {
+    ndv.set(k, s.size);
+  }
+  for (const [k, cnt] of nullCounts) {
+    nullFraction.set(k, items.length > 0 ? cnt / items.length : 0);
+  }
+  const avgColumnCount =
+    items.length > 0 ? Math.round(totalColumns / items.length) : 5;
+  return { rowCount: items.length, ndv, nullFraction, avgColumnCount };
+}
+
+/**
  * Implements a query collection for a regular JavaScript array
  */
 export class ArrayQueryCollection<T> implements LuaQueryCollection {
@@ -266,25 +303,7 @@ export class ArrayQueryCollection<T> implements LuaQueryCollection {
   }
 
   getStats(): CollectionStats {
-    const ndv = new Map<string, number>();
-    // Scan items for distinct values
-    const seen = new Map<string, Set<string>>();
-    for (const item of this.array) {
-      if (typeof item === "object" && item !== null) {
-        for (const key of Object.keys(item as any)) {
-          let s = seen.get(key);
-          if (!s) {
-            s = new Set();
-            seen.set(key, s);
-          }
-          s.add(String((item as any)[key]));
-        }
-      }
-    }
-    for (const [k, s] of seen) {
-      ndv.set(k, s.size);
-    }
-    return { rowCount: this.array.length, ndv };
+    return computeStatsFromArray(this.array);
   }
 }
 
@@ -1156,5 +1175,13 @@ export class DataStoreQueryCollection implements LuaQueryCollection {
       undefined,
       config,
     );
+  }
+
+  /** O(n) count via KV scan — avoids materializing all rows for planning */
+  async getStats(): Promise<CollectionStats> {
+    const rowCount = await this.dataStore.kv.countQuery({
+      prefix: this.prefix,
+    });
+    return { rowCount, ndv: new Map() };
   }
 }
