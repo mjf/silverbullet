@@ -6037,3 +6037,48 @@ do
   assertEquals(r[2].pair, "b:F")
   assertEquals(r[3].pair, "c:T")
 end
+
+-- 136. width-sensitive planning prefers narrower source before wider source
+
+do
+  local base = {}
+  local small = {}
+  local wide = {}
+
+  for i = 1, 50 do
+    base[i] = { id = i }
+
+    small[i] = {
+      id = i,
+      k = i,
+    }
+
+    wide[i] = {
+      id = i,
+      k = i,
+      a1 = "x", a2 = "x", a3 = "x", a4 = "x", a5 = "x",
+      a6 = "x", a7 = "x", a8 = "x", a9 = "x", a10 = "x",
+      a11 = "x", a12 = "x", a13 = "x", a14 = "x", a15 = "x",
+    }
+  end
+
+  local plan = query [[
+    explain
+    from
+      b = base,
+      w = wide,
+      s = small
+    where
+      b.id == w.id and b.id == s.id
+    select {
+      id = b.id
+    }
+  ]]
+
+  local sPos = string.find(plan, "Scan on s")
+  local wPos = string.find(plan, "Scan on w")
+
+  assert(sPos ~= nil)
+  assert(wPos ~= nil)
+  assert(sPos < wPos)
+end

@@ -44,14 +44,29 @@ export type CollectionStats = {
   avgColumnCount?: number;
 };
 
+export interface LuaQueryCollection {
+  query(
+    query: LuaCollectionQuery,
+    env: LuaEnv,
+    sf: LuaStackFrame,
+    config?: Config,
+  ): Promise<any[]>;
+}
+
+export interface LuaQueryCollectionWithStats extends LuaQueryCollection {
+  getStats?(): CollectionStats | Promise<CollectionStats | undefined> | undefined;
+}
+
 export class StatsTracker {
   rowCount = 0;
+  private totalColumnCount = 0;
   private hllMap = new Map<string, HyperLogLog>();
   private nullCounts = new Map<string, number>();
 
   index(item: Record<string, any>): void {
     this.rowCount++;
     const keys = Object.keys(item);
+    this.totalColumnCount += keys.length;
     for (const key of keys) {
       const val = item[key];
       if (val === null || val === undefined) {
@@ -81,11 +96,14 @@ export class StatsTracker {
     for (const [col, cnt] of this.nullCounts) {
       nullFraction.set(col, this.rowCount > 0 ? cnt / this.rowCount : 0);
     }
-    return { rowCount: this.rowCount, ndv, nullFraction };
+    const avgColumnCount =
+      this.rowCount > 0 ? Math.round(this.totalColumnCount / this.rowCount) : 0;
+    return { rowCount: this.rowCount, ndv, nullFraction, avgColumnCount };
   }
 
   clear(): void {
     this.rowCount = 0;
+    this.totalColumnCount = 0;
     this.hllMap.clear();
     this.nullCounts.clear();
   }
@@ -232,19 +250,6 @@ export type LuaCollectionQuery = {
   having?: LuaExpression;
 };
 
-export interface LuaQueryCollection {
-  query(
-    query: LuaCollectionQuery,
-    env: LuaEnv,
-    sf: LuaStackFrame,
-    config?: Config,
-  ): Promise<any[]>;
-}
-
-export interface LuaQueryCollectionWithStats extends LuaQueryCollection {
-  getStats?(): CollectionStats | undefined;
-}
-
 /**
  * Compute CollectionStats from a plain JavaScript array.
  * Used by the join planner for inline array/table sources.
@@ -254,12 +259,12 @@ export function computeStatsFromArray(items: any[]): CollectionStats {
   const nullFraction = new Map<string, number>();
   const seen = new Map<string, Set<string>>();
   const nullCounts = new Map<string, number>();
-  let totalColumns = 0;
+  let totalColumnCount = 0;
 
   for (const item of items) {
     if (typeof item === "object" && item !== null) {
       const keys = item instanceof LuaTable ? luaKeys(item) : Object.keys(item);
-      totalColumns += keys.length;
+      totalColumnCount += keys.length;
       for (const key of keys) {
         if (typeof key !== "string") continue;
         const val = item instanceof LuaTable ? item.rawGet(key) : item[key];
@@ -283,7 +288,7 @@ export function computeStatsFromArray(items: any[]): CollectionStats {
     nullFraction.set(k, items.length > 0 ? cnt / items.length : 0);
   }
   const avgColumnCount =
-    items.length > 0 ? Math.round(totalColumns / items.length) : 5;
+    items.length > 0 ? Math.round(totalColumnCount / items.length) : 0;
   return { rowCount: items.length, ndv, nullFraction, avgColumnCount };
 }
 

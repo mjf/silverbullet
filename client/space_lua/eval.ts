@@ -1167,12 +1167,9 @@ export function evalExpression(
                 "query" in val &&
                 typeof val.query === "function"
               ) {
-                // Fallback: collection without getStats — materialize to count
+                // Fallback: collection without getStats — materialize and compute exact stats
                 const items = await val.query({}, env, sf);
-                src.stats = {
-                  rowCount: items.length,
-                  ndv: new Map(),
-                };
+                src.stats = computeStatsFromArray(items);
               } else if (Array.isArray(val)) {
                 // Inline JS array — exact stats from materialized data
                 src.stats = computeStatsFromArray(val);
@@ -1207,26 +1204,8 @@ export function evalExpression(
 
             // Single-source filter pushdown: extract filters that reference
             // exactly one source and apply them before the join.
-            const {
-              pushed: pushedFilters,
-              residual: pushdownResidualWhere,
-            } = extractSingleSourceFilters(whereClause?.expression, sourceNames);
-
-            // Build optimized join tree
-            const joinTree = buildJoinTree(
-              fromSource.sources,
-              planOrder,
-              equiPreds,
-              rangePreds,
-            );
-
-            // Remove equi-predicates already consumed by the join tree.
-            // This is required for correct semi/anti semantics, where the
-            // join predicate must not be re-applied as a post-join filter.
-            const residualWhere = stripUsedJoinPredicates(
-              pushdownResidualWhere,
-              joinTree,
-            );
+            const { pushed: pushedFilters, residual: pushdownResidualWhere } =
+              extractSingleSourceFilters(whereClause?.expression, sourceNames);
 
             // Planner config from user settings
             const plannerConfig: JoinPlannerConfig | undefined = globalThis
@@ -1240,8 +1219,41 @@ export function evalExpression(
                     "joinYieldChunk",
                     undefined,
                   ),
+                  smallTableThreshold: globalThis.client.config.get(
+                    "joinSmallTableThreshold",
+                    undefined,
+                  ),
+                  mergeJoinThreshold: globalThis.client.config.get(
+                    "joinMergeThreshold",
+                    undefined,
+                  ),
+                  widthWeight: globalThis.client.config.get(
+                    "joinWidthWeight",
+                    undefined,
+                  ),
+                  candidateWidthWeight: globalThis.client.config.get(
+                    "joinCandidateWidthWeight",
+                    undefined,
+                  ),
                 }
               : undefined;
+
+            // Build optimized join tree
+            const joinTree = buildJoinTree(
+              fromSource.sources,
+              planOrder,
+              equiPreds,
+              rangePreds,
+              plannerConfig,
+            );
+
+            // Remove equi-predicates already consumed by the join tree.
+            // This is required for correct semi/anti semantics, where the
+            // join predicate must not be re-applied as a post-join filter.
+            const residualWhere = stripUsedJoinPredicates(
+              pushdownResidualWhere,
+              joinTree,
+            );
 
             const materializedOverrides = new Map<string, any[]>();
 
@@ -1323,7 +1335,7 @@ export function evalExpression(
                   sf,
                   explainOpts,
                   plannerConfig,
-		  materializedOverrides,
+                  materializedOverrides,
                 );
 
                 // Propagate actuals upward through wrapper nodes
@@ -1402,7 +1414,7 @@ export function evalExpression(
               env,
               sf,
               plannerConfig,
-	      materializedOverrides,
+              materializedOverrides,
             );
 
             const collection: any = toCollection(rows);

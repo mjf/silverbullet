@@ -4,6 +4,7 @@ import {
   ArrayQueryCollection,
   type LuaCollectionQuery,
   type LuaQueryCollection,
+  type LuaQueryCollectionWithStats,
   type CollectionStats,
   StatsTracker,
 } from "../space_lua/query_collection.ts";
@@ -26,6 +27,7 @@ import {
 
 const indexKey = "idx";
 const pageKey = "ridx";
+const statsKey = "$indexStats";
 
 const indexVersionKey = ["$indexVersion"];
 
@@ -44,6 +46,18 @@ type TagDefinition = {
     | ObjectValue[]
     | ObjectValue
     | null;
+};
+
+type PersistedPageTagStats = {
+  rowCount: number;
+  totalColumnCount: number;
+};
+
+type PersistedTagStats = {
+  rowCount: number;
+  totalColumnCount: number;
+  ndv?: Record<string, number>;
+  nullFraction?: Record<string, number>;
 };
 
 export class ObjectValidationError extends Error {
@@ -104,10 +118,13 @@ export class ObjectIndex {
     });
   }
 
-  tag(tagName: string): LuaQueryCollection {
+  tag(tagName: string): LuaQueryCollectionWithStats {
     if (!tagName) {
       throw new Error("Tag name is required");
     }
+
+    const self = this;
+
     return {
       query: (
         query: LuaCollectionQuery,
@@ -115,14 +132,14 @@ export class ObjectIndex {
         sf: LuaStackFrame,
         config?: Config,
       ): Promise<any[]> => {
-        return this.ds.luaQuery(
-          ["idx", tagName],
+        return self.ds.luaQuery(
+          [indexKey, tagName],
           query,
           env,
           sf,
           (key, value: any) => {
             const tag = key[1];
-            const mt = this.config.get<LuaTable | undefined>(
+            const mt = self.config.get<LuaTable | undefined>(
               ["tags", tag, "metatable"],
               undefined,
             );
@@ -137,6 +154,19 @@ export class ObjectIndex {
           },
           config,
         );
+      },
+
+      async getStats(): Promise<CollectionStats> {
+        const persisted = await self.getPersistedTagStats(tagName);
+        if (persisted) {
+          return persisted;
+        }
+        return {
+          rowCount: 0,
+          ndv: new Map(),
+          nullFraction: new Map(),
+          avgColumnCount: 0,
+        };
       },
     };
   }
@@ -337,6 +367,184 @@ export class ObjectIndex {
     return this.ds.batchDelete(finalBatch);
   }
 
+  private pageStatsKey(page: string, tag: string): KvKey {
+    return [statsKey, "page", page, tag];
+  }
+
+  private tagStatsKey(tag: string): KvKey {
+    return [statsKey, "tag", tag];
+  }
+
+  private countObjectColumns(obj: Record<string, any>): number {
+    return Object.keys(obj).length;
+  }
+
+  private async getPersistedPageTagStats(
+    page: string,
+    tag: string,
+  ): Promise<PersistedPageTagStats> {
+    return (
+      await this.ds.get<PersistedPageTagStats>(this.pageStatsKey(page, tag))
+    ) ?? { rowCount: 0, totalColumnCount: 0 };
+  }
+
+  private async setPersistedPageTagStats(
+    page: string,
+    tag: string,
+    stats: PersistedPageTagStats,
+  ): Promise<void> {
+    if (stats.rowCount <= 0) {
+      await this.ds.delete(this.pageStatsKey(page, tag));
+      return;
+    }
+    await this.ds.set(this.pageStatsKey(page, tag), stats);
+  }
+
+  private async getPersistedTagStats(
+    tag: string,
+  ): Promise<CollectionStats | undefined> {
+    const stored = await this.ds.get<PersistedTagStats>(this.tagStatsKey(tag));
+
+    if (!stored) {
+      return undefined;
+    }
+
+    const avgColumnCount =
+      stored.rowCount > 0
+        ? Math.round(stored.totalColumnCount / stored.rowCount)
+        : 0;
+
+    return {
+      rowCount: stored.rowCount ?? 0,
+      ndv: new Map(Object.entries(stored.ndv ?? {})),
+      nullFraction: new Map(Object.entries(stored.nullFraction ?? {})),
+      avgColumnCount,
+    };
+  }
+
+  private async getPersistedTagStatsRaw(
+    tag: string,
+  ): Promise<PersistedTagStats | undefined> {
+    return await this.ds.get<PersistedTagStats>(this.tagStatsKey(tag)) ?? undefined;
+  }
+
+  private async setPersistedTagStatsRaw(
+    tag: string,
+    stats: PersistedTagStats,
+  ): Promise<void> {
+    if (stats.rowCount <= 0) {
+      await this.ds.delete(this.tagStatsKey(tag));
+      return;
+    }
+
+    await this.ds.set(this.tagStatsKey(tag), stats);
+  }
+
+  private async adjustPersistedTagTotals(
+    tag: string,
+    rowCountDelta: number,
+    totalColumnCountDelta: number,
+  ): Promise<void> {
+    if (rowCountDelta === 0 && totalColumnCountDelta === 0) return;
+
+    const current = await this.getPersistedTagStatsRaw(tag);
+    const nextRowCount = Math.max(0, (current?.rowCount ?? 0) + rowCountDelta);
+    const nextTotalColumnCount = Math.max(
+      0,
+      (current?.totalColumnCount ?? 0) + totalColumnCountDelta,
+    );
+
+    await this.setPersistedTagStatsRaw(tag, {
+      rowCount: nextRowCount,
+      totalColumnCount: nextTotalColumnCount,
+      ndv: current?.ndv ?? {},
+      nullFraction: current?.nullFraction ?? {},
+    });
+  }
+
+  private computeTagStatsFromKVs<T>(
+    kvs: KV<T>[],
+  ): Map<string, PersistedPageTagStats> {
+    const stats = new Map<string, PersistedPageTagStats>();
+    for (const { key, value } of kvs) {
+      const tag = key[0] as string;
+      const prev = stats.get(tag) ?? { rowCount: 0, totalColumnCount: 0 };
+      const columnCount =
+        value && typeof value === "object"
+          ? this.countObjectColumns(value as Record<string, any>)
+          : 0;
+      stats.set(tag, {
+        rowCount: prev.rowCount + 1,
+        totalColumnCount: prev.totalColumnCount + columnCount,
+      });
+    }
+    return stats;
+  }
+
+  private async applyPageTagStatsDelta(
+    page: string,
+    newStats: Map<string, PersistedPageTagStats>,
+  ): Promise<void> {
+    const oldStats = new Map<string, PersistedPageTagStats>();
+
+    for await (const { key, value } of this.ds.query<PersistedPageTagStats>({
+      prefix: [statsKey, "page", page],
+    })) {
+      const tag = key[3] as string;
+      oldStats.set(tag, value ?? { rowCount: 0, totalColumnCount: 0 });
+    }
+
+    const allTags = new Set<string>([
+      ...oldStats.keys(),
+      ...newStats.keys(),
+    ]);
+
+    for (const tag of allTags) {
+      const oldVal = oldStats.get(tag) ?? { rowCount: 0, totalColumnCount: 0 };
+      const newVal = newStats.get(tag) ?? { rowCount: 0, totalColumnCount: 0 };
+
+      const rowCountDelta = newVal.rowCount - oldVal.rowCount;
+      const totalColumnCountDelta =
+        newVal.totalColumnCount - oldVal.totalColumnCount;
+
+      if (rowCountDelta !== 0 || totalColumnCountDelta !== 0) {
+        await this.adjustPersistedTagTotals(
+          tag,
+          rowCountDelta,
+          totalColumnCountDelta,
+        );
+      }
+
+      await this.setPersistedPageTagStats(page, tag, newVal);
+    }
+  }
+
+  private async removePageTagStats(page: string): Promise<void> {
+    const pageStats: Array<{ tag: string; stats: PersistedPageTagStats }> = [];
+    for await (const {
+      key,
+      value,
+    } of this.ds.query<PersistedPageTagStats>({
+      prefix: [statsKey, "page", page],
+    })) {
+      pageStats.push({
+        tag: key[3] as string,
+        stats: value ?? { rowCount: 0, totalColumnCount: 0 },
+      });
+    }
+
+    for (const { tag, stats } of pageStats) {
+      if (stats.rowCount !== 0 || stats.totalColumnCount !== 0) {
+        await this.adjustPersistedTagTotals(
+          tag,
+          -stats.rowCount,
+          -stats.totalColumnCount,
+        );
+      }
+      await this.ds.delete(this.pageStatsKey(page, tag));
+    }
+  }
+
   /**
    * Clears all keys for a given file
    * @param file
@@ -345,6 +553,8 @@ export class ObjectIndex {
     if (file.endsWith(".md")) {
       file = file.replace(/\.md$/, "");
     }
+    await this.removePageTagStats(file);
+
     // console.log("Clearing index for", file);
     const allKeys: KvKey[] = [];
     for await (const { key } of this.ds.query({
@@ -360,11 +570,15 @@ export class ObjectIndex {
    * Clears the entire index
    */
   public async clearIndex(): Promise<void> {
+    this.clearAllStats();
     const allKeys: KvKey[] = [];
     for await (const { key } of this.ds.query({ prefix: [indexKey] })) {
       allKeys.push(key);
     }
     for await (const { key } of this.ds.query({ prefix: [pageKey] })) {
+      allKeys.push(key);
+    }
+    for await (const { key } of this.ds.query({ prefix: [statsKey] })) {
       allKeys.push(key);
     }
     await this.ds.batchDelete(allKeys);
@@ -379,11 +593,15 @@ export class ObjectIndex {
     objects: ObjectValue<T>[],
   ): Promise<void> {
     const kvs = await this.processObjectsToKVs<T>(page, objects, false);
+    const stats = this.computeTagStatsFromKVs(kvs);
+
     if (kvs.length > 0) {
-      return this.batchSet(page, kvs);
-    } else {
-      return Promise.resolve();
+      await this.batchSet(page, kvs);
+      await this.applyPageTagStatsDelta(page, stats);
+      return;
     }
+
+    await this.applyPageTagStatsDelta(page, stats);
   }
 
   /**
@@ -472,6 +690,9 @@ export class ObjectIndex {
               key: [tag, this.cleanKey(obj.ref, page)],
               value: obj,
             });
+            if (obj && typeof obj === "object") {
+              this.trackObject(tag, obj as Record<string, any>);
+            }
             continue;
           }
 
@@ -496,6 +717,9 @@ export class ObjectIndex {
                 key: [tag, this.cleanKey(newObj.ref, page)],
                 value: newObj,
               });
+              if (newObj && typeof newObj === "object") {
+                this.trackObject(tag, newObj as Record<string, any>);
+              }
               foundAssignedRef = true;
             } else {
               // Some other object
@@ -513,14 +737,33 @@ export class ObjectIndex {
             key: [tag, this.cleanKey(obj.ref, page)],
             value: obj,
           });
+          if (obj && typeof obj === "object") {
+            this.trackObject(tag, obj as Record<string, any>);
+          }
         }
       }
     }
     return kvs;
   }
 
-  deleteObject(page: string, tag: string, ref: string): Promise<void> {
-    return this.batchDelete(page, [[tag, this.cleanKey(ref, page)]]);
+  async deleteObject(page: string, tag: string, ref: string): Promise<void> {
+    await this.batchDelete(page, [[tag, this.cleanKey(ref, page)]]);
+    const oldStats = await this.getPersistedPageTagStats(page, tag);
+    const newStats = {
+      rowCount: Math.max(0, oldStats.rowCount - 1),
+      totalColumnCount: oldStats.totalColumnCount,
+    };
+    if (
+      newStats.rowCount !== oldStats.rowCount ||
+      newStats.totalColumnCount !== oldStats.totalColumnCount
+    ) {
+      await this.adjustPersistedTagTotals(
+        tag,
+        newStats.rowCount - oldStats.rowCount,
+        newStats.totalColumnCount - oldStats.totalColumnCount,
+      );
+      await this.setPersistedPageTagStats(page, tag, newStats);
+    }
   }
 
   private trackObject(tag: string, obj: Record<string, any>): void {

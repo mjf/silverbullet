@@ -22,18 +22,26 @@ import {
 
 // 1. Types and constants
 
+// Config
+
 const DEFAULT_WATCHDOG_LIMIT = 5e5;
 const DEFAULT_YIELD_CHUNK = 5000;
 const DEFAULT_SELECTIVITY = 0.01;
-const SMALL_TABLE_THRESHOLD = 20;
+const DEFAULT_SMALL_TABLE_THRESHOLD = 20;
 const DEFAULT_RANGE_SELECTIVITY = 0.33;
-const MERGE_JOIN_THRESHOLD = 200;
+const DEFAULT_MERGE_JOIN_THRESHOLD = 200;
+const DEFAULT_WIDTH_WEIGHT = 1;
+const DEFAULT_CANDIDATE_WIDTH_WEIGHT = 2;
 
 export type MaterializedSourceOverrides = Map<string, any[]>;
 
 export type JoinPlannerConfig = {
   watchdogLimit?: number;
   yieldChunk?: number;
+  smallTableThreshold?: number;
+  mergeJoinThreshold?: number;
+  widthWeight?: number;
+  candidateWidthWeight?: number;
 };
 
 function getWatchdogLimit(config?: JoinPlannerConfig): number {
@@ -43,6 +51,40 @@ function getWatchdogLimit(config?: JoinPlannerConfig): number {
 function getYieldChunk(config?: JoinPlannerConfig): number {
   return config?.yieldChunk ?? DEFAULT_YIELD_CHUNK;
 }
+
+function finiteNumberOrDefault(
+  value: number | undefined,
+  fallback: number,
+): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+function getSmallTableThreshold(config?: JoinPlannerConfig): number {
+  return finiteNumberOrDefault(
+    config?.smallTableThreshold,
+    DEFAULT_SMALL_TABLE_THRESHOLD,
+  );
+}
+
+function getMergeJoinThreshold(config?: JoinPlannerConfig): number {
+  return finiteNumberOrDefault(
+    config?.mergeJoinThreshold,
+    DEFAULT_MERGE_JOIN_THRESHOLD,
+  );
+}
+
+function getWidthWeight(config?: JoinPlannerConfig): number {
+  return finiteNumberOrDefault(config?.widthWeight, DEFAULT_WIDTH_WEIGHT);
+}
+
+function getCandidateWidthWeight(config?: JoinPlannerConfig): number {
+  return finiteNumberOrDefault(
+    config?.candidateWidthWeight,
+    DEFAULT_CANDIDATE_WIDTH_WEIGHT,
+  );
+}
+
+// Join
 
 export type JoinType = "inner" | "semi" | "anti";
 
@@ -72,6 +114,8 @@ export type JoinInner = {
   estimatedRows?: number;
 };
 
+// Predicate
+
 export type EquiPredicate = {
   leftSource: string;
   leftColumn: string;
@@ -87,6 +131,8 @@ export type RangePredicate = {
   rightColumn: string;
 };
 
+// Stats
+
 export type OpStats = {
   actualRows: number;
   loops: number;
@@ -95,6 +141,8 @@ export type OpStats = {
   endTimeMs: number;
   peakMemoryRows: number;
 };
+
+// Explain
 
 export type ExplainNodeType =
   | "Scan"
@@ -146,6 +194,14 @@ export type ExplainResult = {
 
 function estimatedRows(s: JoinSource): number {
   return s.stats?.rowCount ?? 100;
+}
+
+function estimatedWidth(s: JoinSource): number {
+  return s.stats?.avgColumnCount ?? 5;
+}
+
+function clampWidth(width: number): number {
+  return Math.max(1, width);
 }
 
 function estimateJoinCardinality(
@@ -303,12 +359,19 @@ export function buildJoinTree(
   planOrder?: string[],
   equiPreds?: EquiPredicate[],
   rangePreds?: RangePredicate[],
+  config?: JoinPlannerConfig,
 ): JoinNode {
   if (sources.length === 1) {
     return { kind: "leaf", source: sources[0] };
   }
 
-  const ordered = orderSources(sources, planOrder, equiPreds, rangePreds);
+  const ordered = orderSources(
+    sources,
+    planOrder,
+    equiPreds,
+    rangePreds,
+    config,
+  );
 
   // Strip hint from driving table
   if (ordered[0].hint) {
@@ -319,6 +382,7 @@ export function buildJoinTree(
 
   let tree: JoinNode = { kind: "leaf", source: ordered[0] };
   let accRows = estimatedRows(ordered[0]);
+  let accWidth = estimatedWidth(ordered[0]);
 
   for (let i = 1; i < ordered.length; i++) {
     const right = ordered[i];
@@ -334,7 +398,14 @@ export function buildJoinTree(
       jt,
     );
 
-    const method = selectPhysicalOperator(accRows, right, jt, !!equiPred);
+    const method = selectPhysicalOperator(
+      accRows,
+      right,
+      jt,
+      !!equiPred,
+      accWidth,
+      config,
+    );
 
     const joinRows = estimateJoinCardinality(
       accRows,
@@ -354,6 +425,7 @@ export function buildJoinTree(
       estimatedRows: joinRows,
     };
     accRows = joinRows;
+    accWidth += estimatedWidth(right);
   }
   return tree;
 }
@@ -363,6 +435,7 @@ function orderSources(
   planOrder?: string[],
   equiPreds?: EquiPredicate[],
   rangePreds?: RangePredicate[],
+  config?: JoinPlannerConfig,
 ): JoinSource[] {
   if (planOrder && planOrder.length > 0) {
     const byName = new Map(sources.map((s) => [s.name, s]));
@@ -395,11 +468,13 @@ function orderSources(
   const allSources = sourceByName(sources);
   let joinedNames = new Set<string>([ordered[0].name]);
   let joinedRows = estimatedRows(ordered[0]);
+  let joinedWidth = estimatedWidth(ordered[0]);
 
   while (remaining.length > 0) {
     let bestIdx = 0;
     let bestCost = Infinity;
     let bestOutRows = Infinity;
+    let bestCandidateWidth = Infinity;
 
     for (let i = 0; i < remaining.length; i++) {
       const candidate = remaining[i];
@@ -413,14 +488,27 @@ function orderSources(
         rangePreds,
         joinType,
       );
-      const cost = joinedRows * estimatedRows(candidate);
+      const candidateWidth = clampWidth(estimatedWidth(candidate));
+      const cost =
+        joinedRows *
+        estimatedRows(candidate) *
+        (
+          getWidthWeight(config) * clampWidth(joinedWidth) +
+          getCandidateWidthWeight(config) * candidateWidth
+        );
 
       if (
         cost < bestCost ||
-        (cost === bestCost && outputRows < bestOutRows)
+        (cost === bestCost && outputRows < bestOutRows) ||
+        (
+          cost === bestCost &&
+          outputRows === bestOutRows &&
+          candidateWidth < bestCandidateWidth
+        )
       ) {
         bestCost = cost;
         bestOutRows = outputRows;
+        bestCandidateWidth = candidateWidth;
         bestIdx = i;
       }
     }
@@ -429,6 +517,7 @@ function orderSources(
     ordered.push(chosen);
     joinedNames = new Set([...joinedNames, chosen.name]);
     joinedRows = bestOutRows;
+    joinedWidth += estimatedWidth(chosen);
   }
 
   return ordered;
@@ -441,6 +530,8 @@ function selectPhysicalOperator(
   right: JoinSource,
   joinType: JoinType = "inner",
   hasEquiPred: boolean = false,
+  leftWidth: number = 5,
+  config?: JoinPlannerConfig,
 ): "hash" | "loop" | "merge" {
   if (right.hint) {
     const k = right.hint.kind;
@@ -460,24 +551,45 @@ function selectPhysicalOperator(
   }
 
   const rr = right.stats?.rowCount ?? 100;
-  if (rr <= SMALL_TABLE_THRESHOLD) return "loop";
+  const rw = clampWidth(estimatedWidth(right));
+  const lw = clampWidth(leftWidth);
+  const widthWeight = getWidthWeight(config);
+  const candidateWidthWeight = getCandidateWidthWeight(config);
 
-  const hashCost = rr + leftRowCount;
+  if (rr <= getSmallTableThreshold(config)) return "loop";
+
+  // Width-aware heuristics:
+  // - hash builds/copies the right side, so weight build width
+  // - nested loop copies combined rows, so weight both sides
+  // - merge sorts both sides, so weight both widths
+  const hashCost = rr * candidateWidthWeight * rw + leftRowCount;
   const discount = joinType === "inner" ? 1.0 : 0.5;
-  const nljCost = leftRowCount * rr * discount;
+  const nljCost =
+    leftRowCount *
+    rr *
+    discount *
+    (widthWeight * lw + candidateWidthWeight * rw);
 
-  // Merge join auto-selection: when equi-predicate exists and both sides
-  // are large, sort-merge can beat hash for similar-sized inputs.
-  // Cost model: sort both sides O(n log n + m log m) + linear merge.
   if (
     hasEquiPred &&
-    leftRowCount > MERGE_JOIN_THRESHOLD &&
-    rr > MERGE_JOIN_THRESHOLD
+    leftRowCount > getMergeJoinThreshold(config) &&
+    rr > getMergeJoinThreshold(config)
   ) {
     const leftSort =
-      leftRowCount * Math.ceil(Math.log2(Math.max(2, leftRowCount)));
-    const rightSort = rr * Math.ceil(Math.log2(Math.max(2, rr)));
-    const mergeCost = leftSort + rightSort + leftRowCount + rr;
+      leftRowCount *
+      Math.ceil(Math.log2(Math.max(2, leftRowCount))) *
+      widthWeight *
+      lw;
+    const rightSort =
+      rr *
+      Math.ceil(Math.log2(Math.max(2, rr))) *
+      candidateWidthWeight *
+      rw;
+    const mergeCost =
+      leftSort +
+      rightSort +
+      leftRowCount * widthWeight * lw +
+      rr * candidateWidthWeight * rw;
     if (mergeCost < hashCost && mergeCost < nljCost) {
       return "merge";
     }
@@ -1363,7 +1475,7 @@ export function explainJoinTree(
 ): ExplainNode {
   if (tree.kind === "leaf") {
     const rows = estimatedRows(tree.source);
-    const width = tree.source.stats?.avgColumnCount ?? 5;
+    const width = estimatedWidth(tree.source);
     return {
       nodeType: "Scan",
       source: tree.source.name,
