@@ -12,6 +12,31 @@ import { headersToFileMeta } from "../lib/util.ts";
 
 const defaultFetchTimeout = 30000; // 30 seconds
 
+// WebKit (Safari, WKWebView) strips custom response headers (X-Last-Modified,
+// etc.) when it recognizes a file extension in the URL. Encoding the last dot
+// as %2E prevents this; the server decodes it transparently.
+const isWebKit = typeof navigator !== "undefined" &&
+  /AppleWebKit/.test(navigator.userAgent) &&
+  !/Chrome/.test(navigator.userAgent);
+
+function encodeExtensionDot(url: string): string {
+  // Only encode the file extension dot, not dots in the path prefix (like /.fs).
+  // Manipulate the raw string — Safari's URL.pathname setter rejects %2E.
+  const fsIdx = url.indexOf("/.fs/");
+  if (fsIdx < 0) return url;
+  const afterFs = fsIdx + 5; // position after "/.fs/"
+  const filePart = url.substring(afterFs);
+  const qIdx = filePart.indexOf("?");
+  const path = qIdx >= 0 ? filePart.substring(0, qIdx) : filePart;
+  const rest = qIdx >= 0 ? filePart.substring(qIdx) : "";
+  const lastDot = path.lastIndexOf(".");
+  if (lastDot > path.lastIndexOf("/")) {
+    return url.substring(0, afterFs) +
+      path.substring(0, lastDot) + "%2E" + path.substring(lastDot + 1) + rest;
+  }
+  return url;
+}
+
 export class HttpSpacePrimitives implements SpacePrimitives {
   constructor(
     readonly url: string,
@@ -40,7 +65,12 @@ export class HttpSpacePrimitives implements SpacePrimitives {
     }
 
     try {
-      options.signal = AbortSignal.timeout(fetchTimeout);
+      if (isWebKit) {
+        url = encodeExtensionDot(url);
+      }
+      if (fetchTimeout > 0) {
+        options.signal = AbortSignal.timeout(fetchTimeout);
+      }
       options.redirect = "manual";
       const result = await fetch(url, options);
       if (result.status >= 500 && result.status < 600) {
@@ -101,6 +131,12 @@ export class HttpSpacePrimitives implements SpacePrimitives {
       }
       return result;
     } catch (e: any) {
+      // AbortSignal.timeout() throws a DOMException with name "TimeoutError".
+      // This is NOT an offline condition — the network may be fine, just slow.
+      if (e.name === "TimeoutError") {
+        console.warn("Request timed out for", url);
+        throw new Error(`Request timed out after ${fetchTimeout}ms`);
+      }
       // Errors when there is no internet connection:
       //
       // * Firefox: NetworkError when attempting to fetch resource (with SW and without)
@@ -190,6 +226,7 @@ export class HttpSpacePrimitives implements SpacePrimitives {
         // Casting to any due to TypeScript fetch type limitations
         body: data as any,
       },
+      0, // No timeout for uploads — transfer time depends on file size and connection speed
     );
     return headersToFileMeta(path, res.headers)!;
   }
