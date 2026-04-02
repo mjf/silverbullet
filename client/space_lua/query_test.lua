@@ -6143,8 +6143,8 @@ do
   ]]
 
   assertTrue(
-    string.find(plan, "GroupAggregate", 1, true) ~= nil,
-    "136: expected GroupAggregate in plan, got: " .. tostring(plan)
+    string.find(plan, "Group Aggregate", 1, true) ~= nil,
+    "136: expected Group Aggregate in plan, got: " .. tostring(plan)
   )
   assertTrue(
     string.find(plan, "rows=10", 1, true) ~= nil,
@@ -6179,7 +6179,7 @@ do
   ]]
 
   assertTrue(
-    string.find(plan, "GroupAggregate", 1, true) ~= nil,
+    string.find(plan, "Group Aggregate", 1, true) ~= nil,
     "137: expected GroupAggregate in plan, got: " .. tostring(plan)
   )
   -- 30 input rows -> fallback heuristic 15
@@ -6218,7 +6218,7 @@ do
   ]]
 
   assertTrue(
-    string.find(plan, "GroupAggregate", 1, true) ~= nil,
+    string.find(plan, "Group Aggregate", 1, true) ~= nil,
     "138: expected GroupAggregate in plan, got: " .. tostring(plan)
   )
   -- NDV(a)=10, NDV(b)=3, product=30, capped by input rows=30

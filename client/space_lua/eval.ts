@@ -46,6 +46,7 @@ import {
   type ExplainOptions,
   type ExplainResult,
   executeAndInstrument,
+  executeExplainWrappersExact,
   executeJoinTree,
   explainJoinTree,
   extractEquiPredicates,
@@ -808,7 +809,7 @@ function fromFieldsToSource(fields: LuaFromField[], ctx: ASTCtx): FromSource {
 }
 
 /**
- * Walk wrapper nodes (Limit, Sort, GroupAggregate) to find the
+ * Walk wrapper nodes (Limit, Sort, GroupAggregate, Filter, Unique) to find the
  * underlying join/scan plan that executeAndInstrument operates on.
  */
 function unwrapToJoinPlan(node: ExplainNode): ExplainNode {
@@ -827,6 +828,7 @@ function unwrapToJoinPlan(node: ExplainNode): ExplainNode {
 /**
  * After executeAndInstrument fills actuals on join/scan nodes,
  * copy them upward to wrapper nodes (Filter, Sort, Limit, GroupAggregate, Unique).
+ * Used as a fallback when exact wrapper execution is not available.
  */
 function propagateActuals(node: ExplainNode, opts: ExplainOptions): void {
   if (node.children.length === 0) return;
@@ -875,7 +877,10 @@ function propagateActuals(node: ExplainNode, opts: ExplainOptions): void {
     case "Limit": {
       const offset = node.offsetCount ?? 0;
       const limit = node.limitCount ?? child.actualRows;
-      node.actualRows = Math.min(limit, Math.max(0, child.actualRows - offset));
+      node.actualRows = Math.min(
+        limit,
+        Math.max(0, child.actualRows - offset),
+      );
       node.actualLoops = 1;
       copyTiming();
       break;
@@ -1021,12 +1026,7 @@ async function executeSingleSourceExplainAnalyze(
   opts: ExplainOptions,
 ): Promise<any[]> {
   const t0 = opts.timing ? performance.now() : 0;
-  const rows = await collection.query(
-    query,
-    env,
-    sf,
-    globalThis.client?.config,
-  );
+  const rows = await collection.query(query, env, sf, globalThis.client?.config);
 
   const scanPlan = unwrapToJoinPlan(plan);
   scanPlan.actualRows = sourceStats.rowCount;
@@ -1038,11 +1038,11 @@ async function executeSingleSourceExplainAnalyze(
     scanPlan.actualTimeMs = elapsed;
   }
 
-  propagateActuals(plan, opts);
+  await executeExplainWrappersExact(plan, rows as any, opts);
 
-  const rootActualRows = rows.length;
-  plan.actualRows = rootActualRows;
-  plan.actualLoops = 1;
+  if (plan.actualRows === undefined) {
+    propagateActuals(plan, opts);
+  }
 
   if (opts.timing) {
     const elapsed = Math.round((performance.now() - t0) * 1000) / 1000;
@@ -1328,10 +1328,8 @@ export function evalExpression(
               );
             });
 
-            // Gather stats by pre-evaluating source expressions.
-            // For DataStoreQueryCollection: use countQuery() (O(1) on IndexedDB).
-            // For arrays/LuaTable: compute stats from already-materialized data.
-            // This avoids materializing all rows just for planning.
+            // Gather planning stats only. This is planner metadata gathering,
+            // not execution of the actual query pipeline.
             for (const src of fromSource.sources) {
               const val = await evalExpression(src.expression, env, sf);
               if (
@@ -1340,25 +1338,13 @@ export function evalExpression(
                 val.getStats &&
                 typeof val.getStats === "function"
               ) {
-                // DataStoreQueryCollection.getStats() or ArrayQueryCollection.getStats()
                 const stats = await val.getStats();
                 if (stats) {
                   src.stats = stats;
                 }
-              } else if (
-                val &&
-                typeof val === "object" &&
-                "query" in val &&
-                typeof val.query === "function"
-              ) {
-                // Fallback: collection without getStats — materialize and compute exact stats
-                const items = await val.query({}, env, sf);
-                src.stats = computeStatsFromArray(items);
               } else if (Array.isArray(val)) {
-                // Inline JS array — exact stats from materialized data
                 src.stats = computeStatsFromArray(val);
               } else if (val instanceof LuaTable) {
-                // LuaTable — extract length or treat as single row
                 const len = val.length;
                 if (len > 0) {
                   const arr: any[] = [];
@@ -1441,15 +1427,10 @@ export function evalExpression(
 
             const materializedOverrides = new Map<string, any[]>();
 
-            // Check for explain clause
+            // Build explain plan shape from the same logical plan used for execution.
+            let explainPlan: ExplainNode | undefined;
             if (explainOpts) {
-              const planT0 = performance.now();
-              let plan = explainJoinTree(joinTree, explainOpts);
-              const planningTimeMs =
-                Math.round((performance.now() - planT0) * 1000) / 1000;
-
               const explainQuery = await buildExplainQueryShape(q, env, sf);
-
               const explainSourceStats = new Map<string, CollectionStats>(
                 fromSource.sources
                   .filter(
@@ -1458,39 +1439,18 @@ export function evalExpression(
                   )
                   .map((s) => [s.name, s.stats]),
               );
-
-              plan = wrapPlanWithQueryOps(
-                plan,
+              explainPlan = wrapPlanWithQueryOps(
+                explainJoinTree(joinTree, explainOpts),
                 explainQuery,
                 explainSourceStats,
               );
+            }
 
+            if (explainOpts && !explainOpts.analyze) {
               const result: ExplainResult = {
-                plan,
-                planningTimeMs,
+                plan: explainPlan!,
+                planningTimeMs: 0,
               };
-
-              if (explainOpts.analyze) {
-                const execT0 = performance.now();
-                // Instrument only the join subtree (leaf of the wrapped plan)
-                const joinPlan = unwrapToJoinPlan(plan);
-                await executeAndInstrument(
-                  joinTree,
-                  joinPlan,
-                  env,
-                  sf,
-                  explainOpts,
-                  plannerConfig,
-                  materializedOverrides,
-                );
-
-                // Propagate actuals upward through wrapper nodes
-                propagateActuals(plan, explainOpts);
-
-                result.executionTimeMs =
-                  Math.round((performance.now() - execT0) * 1000) / 1000;
-              }
-
               return formatExplainOutput(result, explainOpts);
             }
 
@@ -1553,6 +1513,29 @@ export function evalExpression(
               };
 
               await collectFilteredLeaves(joinTree);
+            }
+
+            if (explainOpts?.analyze) {
+              const execT0 = performance.now();
+              const joinPlan = unwrapToJoinPlan(explainPlan!);
+              await executeAndInstrument(
+                joinTree,
+                joinPlan,
+                env,
+                sf,
+                explainOpts,
+                plannerConfig,
+                materializedOverrides,
+              );
+              propagateActuals(explainPlan!, explainOpts);
+
+              const result: ExplainResult = {
+                plan: explainPlan!,
+                planningTimeMs: 0,
+                executionTimeMs:
+                  Math.round((performance.now() - execT0) * 1000) / 1000,
+              };
+              return formatExplainOutput(result, explainOpts);
             }
 
             const result = await executeJoinTree(
@@ -1735,46 +1718,47 @@ export function evalExpression(
               }
             }
 
+            const stats = await getStatsForValue(collection, env, sf);
+            const sourceName = objectVariable ?? "_";
+
+            let explainPlan: ExplainNode | undefined;
             if (explainOpts) {
-              const stats = await getStatsForValue(collection, env, sf);
-              const sourceName = objectVariable ?? "_";
-
-              const planT0 = performance.now();
-              let plan = explainSingleSource(sourceName, stats);
-              const planningTimeMs =
-                Math.round((performance.now() - planT0) * 1000) / 1000;
-
               const explainQuery = await buildExplainQueryShape(q, env, sf);
               const explainSourceStats = new Map<string, CollectionStats>([
                 [sourceName, stats],
               ]);
-
-              plan = wrapPlanWithQueryOps(
-                plan,
+              explainPlan = wrapPlanWithQueryOps(
+                explainSingleSource(sourceName, stats),
                 explainQuery,
                 explainSourceStats,
               );
+            }
 
+            if (explainOpts && !explainOpts.analyze) {
               const result: ExplainResult = {
-                plan,
-                planningTimeMs,
+                plan: explainPlan!,
+                planningTimeMs: 0,
               };
+              return formatExplainOutput(result, explainOpts);
+            }
 
-              if (explainOpts.analyze) {
-                const execT0 = performance.now();
-                await executeSingleSourceExplainAnalyze(
-                  collection as any,
-                  query,
-                  plan,
-                  stats,
-                  env,
-                  sf,
-                  explainOpts,
-                );
-                result.executionTimeMs =
-                  Math.round((performance.now() - execT0) * 1000) / 1000;
-              }
-
+            if (explainOpts?.analyze) {
+              const execT0 = performance.now();
+              await executeSingleSourceExplainAnalyze(
+                collection as any,
+                query,
+                explainPlan!,
+                stats,
+                env,
+                sf,
+                explainOpts,
+              );
+              const result: ExplainResult = {
+                plan: explainPlan!,
+                planningTimeMs: 0,
+                executionTimeMs:
+                  Math.round((performance.now() - execT0) * 1000) / 1000,
+              };
               return formatExplainOutput(result, explainOpts);
             }
 

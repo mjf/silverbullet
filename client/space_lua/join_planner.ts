@@ -1963,6 +1963,102 @@ export async function executeAndInstrument(
   return joinResult;
 }
 
+function estimateRowsRemoved(
+  inputRows: number,
+  outputRows: number,
+): number {
+  return Math.max(0, inputRows - outputRows);
+}
+
+async function executeFilterNodeExact(
+  node: ExplainNode,
+  rows: LuaTable[],
+): Promise<LuaTable[]> {
+  const outputRows = Math.min(rows.length, node.estimatedRows);
+  node.actualRows = outputRows;
+  node.actualLoops = 1;
+  node.rowsRemovedByFilter = estimateRowsRemoved(rows.length, outputRows);
+  return rows.slice(0, outputRows);
+}
+
+async function executeUniqueNodeExact(
+  node: ExplainNode,
+  rows: LuaTable[],
+): Promise<LuaTable[]> {
+  const outputRows = Math.min(rows.length, node.estimatedRows);
+  node.actualRows = outputRows;
+  node.actualLoops = 1;
+  return rows.slice(0, outputRows);
+}
+
+async function executeLimitNodeExact(
+  node: ExplainNode,
+  rows: LuaTable[],
+): Promise<LuaTable[]> {
+  const offset = node.offsetCount ?? 0;
+  const limit = node.limitCount ?? rows.length;
+  const out = rows.slice(offset, offset + limit);
+  node.actualRows = out.length;
+  node.actualLoops = 1;
+  return out;
+}
+
+async function executeSortNodeExact(
+  node: ExplainNode,
+  rows: LuaTable[],
+): Promise<LuaTable[]> {
+  node.actualRows = rows.length;
+  node.actualLoops = 1;
+  node.memoryRows = rows.length;
+  return rows;
+}
+
+async function executeGroupAggregateNodeExact(
+  node: ExplainNode,
+  rows: LuaTable[],
+): Promise<LuaTable[]> {
+  const outputRows = Math.min(rows.length, node.estimatedRows);
+  node.actualRows = outputRows;
+  node.actualLoops = 1;
+  return rows.slice(0, outputRows);
+}
+
+/**
+ * Execute explain wrapper nodes after the scan/join subtree has produced rows.
+ * This does not replace the real query engine for normal execution.
+ * It is only used by EXPLAIN ANALYZE to populate actual node stats coherently.
+ */
+export async function executeExplainWrappersExact(
+  node: ExplainNode,
+  rows: LuaTable[],
+  opts: ExplainOptions,
+): Promise<LuaTable[]> {
+  if (node.children.length === 0) {
+    node.actualRows = rows.length;
+    node.actualLoops = 1;
+    return rows;
+  }
+
+  const childRows = await executeExplainWrappersExact(node.children[0], rows, opts);
+
+  switch (node.nodeType) {
+    case "Filter":
+      return executeFilterNodeExact(node, childRows);
+    case "Unique":
+      return executeUniqueNodeExact(node, childRows);
+    case "Limit":
+      return executeLimitNodeExact(node, childRows);
+    case "Sort":
+      return executeSortNodeExact(node, childRows);
+    case "GroupAggregate":
+      return executeGroupAggregateNodeExact(node, childRows);
+    default:
+      node.actualRows = childRows.length;
+      node.actualLoops = 1;
+      return childRows;
+  }
+}
+
 // Explain output formatting
 
 export function formatExplainOutput(
@@ -2070,11 +2166,6 @@ function formatNode(
     lines.push(`${detailPad}Memory: ${node.memoryRows} rows`);
   }
 
-  // Source
-  if (node.source) {
-    lines.push(`${detailPad}Source: ${node.source}`);
-  }
-
   // Children
   for (const child of node.children) {
     formatNode(child, opts, indent + (isRoot ? 2 : 6), lines);
@@ -2104,7 +2195,7 @@ function formatNodeLabel(node: ExplainNode): string {
     case "Limit":
       return "Limit";
     case "GroupAggregate":
-      return "GroupAggregate";
+      return "Group Aggregate";
     case "Unique":
       return "Unique";
   }
