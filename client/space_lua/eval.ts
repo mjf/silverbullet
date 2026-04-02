@@ -1587,6 +1587,9 @@ export function evalExpression(
                   )
                   .map((s) => [s.name, s.stats]),
               );
+              const joinRootNdv = joinTree.kind === "join"
+                ? joinTree.estimatedNdv
+                : undefined;
               explainPlan = wrapPlanWithQueryOps(
                 explainJoinTree(
                   joinTree,
@@ -1595,6 +1598,7 @@ export function evalExpression(
                 ),
                 explainQuery,
                 explainSourceStats,
+                joinRootNdv,
               );
             }
 
