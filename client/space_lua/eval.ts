@@ -49,6 +49,7 @@ import {
   executeExplainWrappersExact,
   executeJoinTree,
   explainJoinTree,
+  exprToString,
   extractEquiPredicates,
   extractRangePredicates,
   extractSingleSourceFilters,
@@ -1433,6 +1434,23 @@ export function evalExpression(
             const { pushed: pushedFilters, residual: pushdownResidualWhere } =
               extractSingleSourceFilters(whereClause?.expression, sourceNames);
 
+            const pushedFilterExprBySource = new Map<string, string>();
+            for (const src of fromSource.sources) {
+              const srcFilters = pushedFilters.filter(
+                (f) => f.sourceName === src.name,
+              );
+              if (srcFilters.length === 0) continue;
+
+              const combined =
+                srcFilters.length === 1
+                  ? exprToString(srcFilters[0].expression)
+                  : srcFilters
+                      .map((f) => `(${exprToString(f.expression)})`)
+                      .join(" and ");
+
+              pushedFilterExprBySource.set(src.name, combined);
+            }
+
             const materializedOverrides = new Map<string, any[]>();
 
             // Materialize and filter single-source pushdown inputs before join
@@ -1570,7 +1588,11 @@ export function evalExpression(
                   .map((s) => [s.name, s.stats]),
               );
               explainPlan = wrapPlanWithQueryOps(
-                explainJoinTree(joinTree, explainOpts),
+                explainJoinTree(
+                  joinTree,
+                  explainOpts,
+                  pushedFilterExprBySource,
+                ),
                 explainQuery,
                 explainSourceStats,
               );
@@ -1584,7 +1606,7 @@ export function evalExpression(
               return formatExplainOutput(result, explainOpts);
             }
 
-	    // ------
+            // ------
             if (explainOpts?.analyze) {
               const execT0 = performance.now();
               const joinPlan = unwrapToJoinPlan(explainPlan!);

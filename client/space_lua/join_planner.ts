@@ -1604,6 +1604,7 @@ function collectUsedEquiPredsFromJoinTree(node: JoinNode): EquiPredicate[] {
 export function explainJoinTree(
   tree: JoinNode,
   _opts: ExplainOptions,
+  pushedFilterExprBySource?: Map<string, string>,
 ): ExplainNode {
   if (tree.kind === "leaf") {
     const rows = estimatedRows(tree.source);
@@ -1618,12 +1619,13 @@ export function explainJoinTree(
       estimatedCost: rows,
       estimatedRows: rows,
       estimatedWidth: width,
+      filterExpr: pushedFilterExprBySource?.get(tree.source.name),
       children: [],
     };
   }
 
-  const leftPlan = explainJoinTree(tree.left, _opts);
-  const rightPlan = explainJoinTree(tree.right, _opts);
+  const leftPlan = explainJoinTree(tree.left, _opts, pushedFilterExprBySource);
+  const rightPlan = explainJoinTree(tree.right, _opts, pushedFilterExprBySource);
   const jt = tree.joinType ?? "inner";
 
   const nodeType: ExplainNodeType =
