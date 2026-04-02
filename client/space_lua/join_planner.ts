@@ -1336,14 +1336,16 @@ export function extractSingleSourceFilters(
 
   for (const conjunct of conjuncts) {
     const refs = collectReferencedSources(conjunct, sourceNames);
-    const explicit = isExplicitlySingleSourceExpr(conjunct, sourceNames);
 
-    if (refs.size === 1 && explicit) {
+    if (refs.size === 1) {
       const [sourceName] = refs;
-      pushed.push({ sourceName, expression: conjunct });
-    } else {
-      remaining.push(conjunct);
+      if (isExplicitlyScopedToSource(conjunct, sourceNames, sourceName)) {
+        pushed.push({ sourceName, expression: conjunct });
+        continue;
+      }
     }
+
+    remaining.push(conjunct);
   }
 
   const residual =
@@ -1358,6 +1360,120 @@ export function extractSingleSourceFilters(
       : undefined;
 
   return { pushed, residual };
+}
+
+/**
+ * Returns true iff every source-dependent access in `expr` is explicitly rooted
+ * at `targetSource`, and no other source name from the FROM-clause is used.
+ *
+ * This is stricter than merely checking that accesses are "explicitly rooted":
+ * an expression like `p.name == t.page` is explicit, but it is not scoped to a
+ * single source and therefore must never be pushed down.
+ */
+function isExplicitlyScopedToSource(
+  expr: LuaExpression,
+  sourceNames: Set<string>,
+  targetSource: string,
+): boolean {
+  switch (expr.type) {
+    case "Nil":
+    case "Boolean":
+    case "Number":
+    case "String":
+      return true;
+
+    case "Variable":
+      // Allow only the target source variable itself. Bare field names do not
+      // count as explicitly scoped and any other source variable is forbidden.
+      return expr.name === targetSource;
+
+    case "PropertyAccess":
+      if (expr.object.type === "Variable" && sourceNames.has(expr.object.name)) {
+        return expr.object.name === targetSource;
+      }
+      return isExplicitlyScopedToSource(expr.object, sourceNames, targetSource);
+
+    case "TableAccess":
+      return (
+        isExplicitlyScopedToSource(expr.object, sourceNames, targetSource) &&
+        isExplicitlyScopedToSource(expr.key, sourceNames, targetSource)
+      );
+
+    case "Binary":
+      return (
+        isExplicitlyScopedToSource(expr.left, sourceNames, targetSource) &&
+        isExplicitlyScopedToSource(expr.right, sourceNames, targetSource)
+      );
+
+    case "Unary":
+      return isExplicitlyScopedToSource(
+        expr.argument,
+        sourceNames,
+        targetSource,
+      );
+
+    case "Parenthesized":
+      return isExplicitlyScopedToSource(
+        expr.expression,
+        sourceNames,
+        targetSource,
+      );
+
+    case "FunctionCall":
+      return (
+        isExplicitlyScopedToSource(expr.prefix, sourceNames, targetSource) &&
+        expr.args.every((arg) =>
+          isExplicitlyScopedToSource(arg, sourceNames, targetSource)
+        ) &&
+        (!expr.orderBy ||
+          expr.orderBy.every((ob) =>
+            isExplicitlyScopedToSource(ob.expression, sourceNames, targetSource)
+          ))
+      );
+
+    case "FilteredCall":
+      return (
+        isExplicitlyScopedToSource(expr.call, sourceNames, targetSource) &&
+        isExplicitlyScopedToSource(expr.filter, sourceNames, targetSource)
+      );
+
+    case "AggregateCall":
+      return (
+        isExplicitlyScopedToSource(expr.call, sourceNames, targetSource) &&
+        expr.orderBy.every((ob) =>
+          isExplicitlyScopedToSource(ob.expression, sourceNames, targetSource)
+        )
+      );
+
+    case "TableConstructor":
+      return expr.fields.every((field) => {
+        switch (field.type) {
+          case "DynamicField":
+            return (
+              isExplicitlyScopedToSource(
+                field.key,
+                sourceNames,
+                targetSource,
+              ) &&
+              isExplicitlyScopedToSource(
+                field.value,
+                sourceNames,
+                targetSource,
+              )
+            );
+          case "PropField":
+          case "ExpressionField":
+            return isExplicitlyScopedToSource(
+              field.value,
+              sourceNames,
+              targetSource,
+            );
+        }
+      });
+
+    default:
+      return false;
+  }
 }
 
 /**
@@ -1426,51 +1542,6 @@ function walkExprForSources(
     // Literals and nil reference no sources
     default:
       break;
-  }
-}
-
-function isExplicitlySingleSourceExpr(
-  expr: LuaExpression,
-  sourceNames: Set<string>,
-): boolean {
-  switch (expr.type) {
-    case "Nil":
-    case "Boolean":
-    case "Number":
-    case "String":
-      return true;
-    case "Variable":
-      // Bare source variable itself is allowed, but bare field names are not.
-      return sourceNames.has(expr.name);
-    case "PropertyAccess":
-      if (
-        expr.object.type === "Variable" &&
-        sourceNames.has(expr.object.name)
-      ) {
-        return true;
-      }
-      return isExplicitlySingleSourceExpr(expr.object, sourceNames);
-    case "TableAccess":
-      return (
-        isExplicitlySingleSourceExpr(expr.object, sourceNames) &&
-        isExplicitlySingleSourceExpr(expr.key, sourceNames)
-      );
-    case "Binary":
-      return (
-        isExplicitlySingleSourceExpr(expr.left, sourceNames) &&
-        isExplicitlySingleSourceExpr(expr.right, sourceNames)
-      );
-    case "Unary":
-      return isExplicitlySingleSourceExpr(expr.argument, sourceNames);
-    case "Parenthesized":
-      return isExplicitlySingleSourceExpr(expr.expression, sourceNames);
-    case "FunctionCall":
-      return (
-        isExplicitlySingleSourceExpr(expr.prefix, sourceNames) &&
-        expr.args.every((arg) => isExplicitlySingleSourceExpr(arg, sourceNames))
-      );
-    default:
-      return false;
   }
 }
 

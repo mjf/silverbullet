@@ -54,7 +54,6 @@ import {
   extractSingleSourceFilters,
   formatExplainOutput,
   type JoinPlannerConfig,
-  type JoinNode,
   type JoinSource,
   stripUsedJoinPredicates,
   validatePostJoinSourceReferences,
@@ -944,6 +943,21 @@ async function buildExplainQueryShape(
   return explainQuery;
 }
 
+async function buildExplainQueryShapeWithOverrides(
+  q: ReturnType<typeof asQueryExpr>,
+  env: LuaEnv,
+  sf: LuaStackFrame,
+  overrides: {
+    where?: LuaExpression;
+  } = {},
+): Promise<Parameters<typeof wrapPlanWithQueryOps>[1]> {
+  const explainQuery = await buildExplainQueryShape(q, env, sf);
+  if ("where" in overrides) {
+    explainQuery.where = overrides.where;
+  }
+  return explainQuery;
+}
+
 async function getStatsForValue(
   val: LuaValue,
   env: LuaEnv,
@@ -1054,6 +1068,45 @@ async function executeSingleSourceExplainAnalyze(
   }
 
   return rows;
+}
+
+async function materializeValueAsItems(
+  val: LuaValue,
+  env: LuaEnv,
+  sf: LuaStackFrame,
+): Promise<any[]> {
+  if (val === null || val === undefined) {
+    return [];
+  }
+
+  if (Array.isArray(val)) {
+    return val;
+  }
+
+  if (val instanceof LuaTable) {
+    if (val.length > 0) {
+      const arr: any[] = [];
+      for (let i = 1; i <= val.length; i++) {
+        arr.push(val.rawGet(i));
+      }
+      return arr;
+    }
+    if (val.empty()) {
+      return [];
+    }
+    return [val];
+  }
+
+  if (
+    val &&
+    typeof val === "object" &&
+    "query" in val &&
+    typeof (val as any).query === "function"
+  ) {
+    return (val as any).query({}, env, sf);
+  }
+
+  return [val];
 }
 
 export function evalExpression(
@@ -1380,6 +1433,32 @@ export function evalExpression(
             const { pushed: pushedFilters, residual: pushdownResidualWhere } =
               extractSingleSourceFilters(whereClause?.expression, sourceNames);
 
+            const materializedOverrides = new Map<string, any[]>();
+
+            // Materialize and filter single-source pushdown inputs before join
+            // planning so both stats and execution use the filtered sources.
+            for (const src of fromSource.sources) {
+              const srcFilters = pushedFilters.filter(
+                (f) => f.sourceName === src.name,
+              );
+              if (srcFilters.length === 0) {
+                continue;
+              }
+
+              const val = await evalExpression(src.expression, env, sf);
+              const items = await materializeValueAsItems(val, env, sf);
+              const filtered = await applyPushedFilters(
+                items,
+                src.name,
+                srcFilters,
+                env,
+                sf,
+              );
+
+              src.stats = computeStatsFromArray(filtered);
+              materializedOverrides.set(src.name, filtered);
+            }
+
             // Planner config from user settings
             const plannerConfig: JoinPlannerConfig | undefined = globalThis
               .client?.config
@@ -1471,12 +1550,17 @@ export function evalExpression(
               sf,
             );
 
-            const materializedOverrides = new Map<string, any[]>();
-
             // Build explain plan shape from the same logical plan used for execution.
             let explainPlan: ExplainNode | undefined;
             if (explainOpts) {
-              const explainQuery = await buildExplainQueryShape(q, env, sf);
+              const explainQuery = await buildExplainQueryShapeWithOverrides(
+                q,
+                env,
+                sf,
+                {
+                  where: residualWhere,
+                },
+              );
               const explainSourceStats = new Map<string, CollectionStats>(
                 fromSource.sources
                   .filter(
@@ -1500,67 +1584,7 @@ export function evalExpression(
               return formatExplainOutput(result, explainOpts);
             }
 
-            // Execute the join tree
-            // Apply single-source pushed-down filters during materialization
-            // by wrapping source expressions with filter evaluation
-            if (pushedFilters.length > 0) {
-              const collectFilteredLeaves = async (
-                node: JoinNode,
-              ): Promise<void> => {
-                if (node.kind === "leaf") {
-                  const srcFilters = pushedFilters.filter(
-                    (f) => f.sourceName === node.source.name,
-                  );
-                  if (srcFilters.length === 0) {
-                    return;
-                  }
-
-                  const val = await evalExpression(
-                    node.source.expression,
-                    env,
-                    sf,
-                  );
-                  let items: any[];
-                  if (Array.isArray(val)) {
-                    items = val;
-                  } else if (val instanceof LuaTable) {
-                    items = [];
-                    if (val.length > 0) {
-                      for (let i = 1; i <= val.length; i++) {
-                        items.push(val.rawGet(i));
-                      }
-                    } else if (!val.empty()) {
-                      items = [val];
-                    }
-                  } else if (
-                    val &&
-                    typeof val === "object" &&
-                    "query" in val &&
-                    typeof val.query === "function"
-                  ) {
-                    items = await val.query({}, env, sf);
-                  } else {
-                    items = val ? [val] : [];
-                  }
-
-                  const filtered = await applyPushedFilters(
-                    items,
-                    node.source.name,
-                    srcFilters,
-                    env,
-                    sf,
-                  );
-                  node.source.stats = computeStatsFromArray(filtered);
-                  materializedOverrides.set(node.source.name, filtered);
-                } else {
-                  await collectFilteredLeaves(node.left);
-                  await collectFilteredLeaves(node.right);
-                }
-              };
-
-              await collectFilteredLeaves(joinTree);
-            }
-
+	    // ------
             if (explainOpts?.analyze) {
               const execT0 = performance.now();
               const joinPlan = unwrapToJoinPlan(explainPlan!);
