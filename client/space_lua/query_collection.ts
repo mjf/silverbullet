@@ -40,7 +40,6 @@ import { asyncMergeSort } from "./util.ts";
 export type CollectionStats = {
   rowCount: number;
   ndv: Map<string, number>;
-  nullFraction?: Map<string, number>;
   avgColumnCount?: number;
 };
 
@@ -61,7 +60,6 @@ export class StatsTracker {
   rowCount = 0;
   private totalColumnCount = 0;
   private hllMap = new Map<string, HyperLogLog>();
-  private nullCounts = new Map<string, number>();
 
   index(item: Record<string, any>): void {
     this.rowCount++;
@@ -70,7 +68,6 @@ export class StatsTracker {
     for (const key of keys) {
       const val = item[key];
       if (val === null || val === undefined) {
-        this.nullCounts.set(key, (this.nullCounts.get(key) ?? 0) + 1);
         continue; // Don't feed nulls to HLL
       }
       let hll = this.hllMap.get(key);
@@ -89,23 +86,18 @@ export class StatsTracker {
 
   getStats(): CollectionStats {
     const ndv = new Map<string, number>();
-    const nullFraction = new Map<string, number>();
     for (const [col, hll] of this.hllMap) {
       ndv.set(col, hll.estimate());
     }
-    for (const [col, cnt] of this.nullCounts) {
-      nullFraction.set(col, this.rowCount > 0 ? cnt / this.rowCount : 0);
-    }
     const avgColumnCount =
       this.rowCount > 0 ? Math.round(this.totalColumnCount / this.rowCount) : 0;
-    return { rowCount: this.rowCount, ndv, nullFraction, avgColumnCount };
+    return { rowCount: this.rowCount, ndv, avgColumnCount };
   }
 
   clear(): void {
     this.rowCount = 0;
     this.totalColumnCount = 0;
     this.hllMap.clear();
-    this.nullCounts.clear();
   }
 }
 
@@ -256,9 +248,7 @@ export type LuaCollectionQuery = {
  */
 export function computeStatsFromArray(items: any[]): CollectionStats {
   const ndv = new Map<string, number>();
-  const nullFraction = new Map<string, number>();
   const seen = new Map<string, Set<string>>();
-  const nullCounts = new Map<string, number>();
   let totalColumnCount = 0;
 
   for (const item of items) {
@@ -269,7 +259,6 @@ export function computeStatsFromArray(items: any[]): CollectionStats {
         if (typeof key !== "string") continue;
         const val = item instanceof LuaTable ? item.rawGet(key) : item[key];
         if (val === null || val === undefined) {
-          nullCounts.set(key, (nullCounts.get(key) ?? 0) + 1);
           continue;
         }
         let s = seen.get(key);
@@ -284,12 +273,9 @@ export function computeStatsFromArray(items: any[]): CollectionStats {
   for (const [k, s] of seen) {
     ndv.set(k, s.size);
   }
-  for (const [k, cnt] of nullCounts) {
-    nullFraction.set(k, items.length > 0 ? cnt / items.length : 0);
-  }
   const avgColumnCount =
     items.length > 0 ? Math.round(totalColumnCount / items.length) : 0;
-  return { rowCount: items.length, ndv, nullFraction, avgColumnCount };
+  return { rowCount: items.length, ndv, avgColumnCount };
 }
 
 /**

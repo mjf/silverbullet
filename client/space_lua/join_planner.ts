@@ -236,13 +236,7 @@ function joinSelectivity(
     const leftNdv = left.stats?.ndv?.get(equiPred.leftColumn);
     const rightNdv = right.stats?.ndv?.get(equiPred.rightColumn);
     if (leftNdv !== undefined && rightNdv !== undefined) {
-      let sel = 1 / Math.max(leftNdv, rightNdv, 1);
-      const leftNullFrac =
-        left.stats?.nullFraction?.get(equiPred.leftColumn) ?? 0;
-      const rightNullFrac =
-        right.stats?.nullFraction?.get(equiPred.rightColumn) ?? 0;
-      sel *= (1 - leftNullFrac) * (1 - rightNullFrac);
-      return sel;
+      return 1 / Math.max(leftNdv, rightNdv, 1);
     }
   }
 

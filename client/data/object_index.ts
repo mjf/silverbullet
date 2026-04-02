@@ -57,7 +57,6 @@ type PersistedTagStats = {
   rowCount: number;
   totalColumnCount: number;
   ndv?: Record<string, number>;
-  nullFraction?: Record<string, number>;
 };
 
 export class ObjectValidationError extends Error {
@@ -164,7 +163,6 @@ export class ObjectIndex {
         return {
           rowCount: 0,
           ndv: new Map(),
-          nullFraction: new Map(),
           avgColumnCount: 0,
         };
       },
@@ -417,7 +415,6 @@ export class ObjectIndex {
     return {
       rowCount: stored.rowCount ?? 0,
       ndv: new Map(Object.entries(stored.ndv ?? {})),
-      nullFraction: new Map(Object.entries(stored.nullFraction ?? {})),
       avgColumnCount,
     };
   }
@@ -458,7 +455,6 @@ export class ObjectIndex {
       rowCount: nextRowCount,
       totalColumnCount: nextTotalColumnCount,
       ndv: current?.ndv ?? {},
-      nullFraction: current?.nullFraction ?? {},
     });
   }
 
