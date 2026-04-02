@@ -1237,6 +1237,29 @@ function parseSourceColumn(
   return { source, column: expr.property };
 }
 
+type SourceColumnRef = {
+  source: string;
+  column: string;
+};
+
+function parseGroupKeySourceColumn(
+  expr: LuaExpression,
+): SourceColumnRef | null {
+  if (expr.type === "PropertyAccess" && expr.object.type === "Variable") {
+    return {
+      source: expr.object.name,
+      column: expr.property,
+    };
+  }
+  if (expr.type === "Variable") {
+    return {
+      source: "",
+      column: expr.name,
+    };
+  }
+  return null;
+}
+
 // 9. Single-source filter pushdown
 
 /**
@@ -1565,6 +1588,7 @@ export function wrapPlanWithQueryOps(
     having?: LuaExpression;
     distinct?: boolean;
   },
+  sourceStats?: Map<string, CollectionStats>,
 ): ExplainNode {
   let root = plan;
 
@@ -1578,11 +1602,19 @@ export function wrapPlanWithQueryOps(
 
   if (query.groupBy && query.groupBy.length > 0) {
     const keys = query.groupBy.map((g) => g.alias ?? exprToString(g.expr));
+    const ndvGroupRows = estimateGroupRowsFromNdv(
+      root.estimatedRows,
+      query.groupBy,
+      sourceStats,
+    );
+    const estimatedGroupRows =
+      ndvGroupRows ?? Math.max(1, Math.round(root.estimatedRows * 0.5));
+
     root = {
       nodeType: "GroupAggregate",
       startupCost: root.estimatedCost,
       estimatedCost: root.estimatedCost + root.estimatedRows,
-      estimatedRows: Math.max(1, Math.round(root.estimatedRows * 0.5)),
+      estimatedRows: estimatedGroupRows,
       estimatedWidth: root.estimatedWidth,
       sortKeys: keys,
       children: [root],
@@ -1738,6 +1770,41 @@ function stripEquiPreds(
   }
   if (exprMatchesEquiPred(expr, preds)) return undefined;
   return expr;
+}
+
+function estimateGroupRowsFromNdv(
+  inputRows: number,
+  groupBy: { expr: LuaExpression; alias?: string }[],
+  sourceStats?: Map<string, CollectionStats>,
+): number | undefined {
+  if (!sourceStats || groupBy.length === 0) return undefined;
+
+  let combinedNdv = 1;
+  let foundAny = false;
+
+  for (const g of groupBy) {
+    const ref = parseGroupKeySourceColumn(g.expr);
+    if (!ref) {
+      return undefined;
+    }
+
+    if (!ref.source) {
+      return undefined;
+    }
+
+    const stats = sourceStats.get(ref.source);
+    const ndv = stats?.ndv?.get(ref.column);
+    if (ndv === undefined) {
+      return undefined;
+    }
+
+    foundAny = true;
+    combinedNdv *= Math.max(1, ndv);
+  }
+
+  if (!foundAny) return undefined;
+
+  return Math.max(1, Math.min(inputRows, Math.round(combinedNdv)));
 }
 
 // Explain analyze execution

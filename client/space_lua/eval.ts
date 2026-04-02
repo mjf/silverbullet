@@ -74,6 +74,7 @@ import {
 } from "./numeric.ts";
 import {
   computeStatsFromArray,
+  type CollectionStats,
   type LuaCollectionQuery,
   type LuaGroupByEntry,
   toCollection,
@@ -1317,7 +1318,16 @@ export function evalExpression(
                 }
               }
 
-              plan = wrapPlanWithQueryOps(plan, explainQuery);
+              const explainSourceStats = new Map<string, CollectionStats>(
+                fromSource.sources
+                  .filter(
+                    (s): s is JoinSource & { stats: CollectionStats } =>
+                      s.stats !== undefined,
+                  )
+                  .map((s) => [s.name, s.stats]),
+              );
+
+              plan = wrapPlanWithQueryOps(plan, explainQuery, explainSourceStats);
 
               const result: ExplainResult = {
                 plan,
