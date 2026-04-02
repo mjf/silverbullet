@@ -815,7 +815,8 @@ function unwrapToJoinPlan(node: ExplainNode): ExplainNode {
   if (
     node.nodeType === "Limit" ||
     node.nodeType === "Sort" ||
-    node.nodeType === "GroupAggregate"
+    node.nodeType === "GroupAggregate" ||
+    node.nodeType === "Unique"
   ) {
     return unwrapToJoinPlan(node.children[0]);
   }
@@ -876,6 +877,155 @@ function propagateActuals(node: ExplainNode, opts: ExplainOptions): void {
       break;
     }
   }
+}
+
+async function buildExplainQueryShape(
+  q: ReturnType<typeof asQueryExpr>,
+  env: LuaEnv,
+  sf: LuaStackFrame,
+): Promise<Parameters<typeof wrapPlanWithQueryOps>[1]> {
+  const explainQuery: Parameters<typeof wrapPlanWithQueryOps>[1] = {};
+
+  for (const clause of q.clauses) {
+    switch (clause.type) {
+      case "Where":
+        explainQuery.where = clause.expression;
+        break;
+      case "OrderBy":
+        explainQuery.orderBy = clause.orderBy.map((o) => ({
+          expr: o.expression,
+          desc: o.direction === "desc",
+        }));
+        break;
+      case "Limit": {
+        const lv = await evalExpression(clause.limit, env, sf);
+        explainQuery.limit = Number(lv);
+        if (clause.offset) {
+          const ov = await evalExpression(clause.offset, env, sf);
+          explainQuery.offset = Number(ov);
+        }
+        break;
+      }
+      case "Offset": {
+        const ov = await evalExpression(clause.offset, env, sf);
+        explainQuery.offset = Number(ov);
+        break;
+      }
+      case "GroupBy":
+        explainQuery.groupBy = clause.fields.map((f) => {
+          if (f.type === "PropField") {
+            return { expr: f.value, alias: f.key };
+          }
+          return { expr: f.value };
+        });
+        break;
+      case "Having":
+        explainQuery.having = clause.expression;
+        break;
+      case "Select":
+        if (clause.distinct !== undefined) {
+          explainQuery.distinct = clause.distinct;
+        }
+        break;
+    }
+  }
+
+  return explainQuery;
+}
+
+async function getStatsForValue(
+  val: LuaValue,
+  env: LuaEnv,
+  sf: LuaStackFrame,
+): Promise<CollectionStats> {
+  if (
+    val &&
+    typeof val === "object" &&
+    "getStats" in val &&
+    typeof (val as any).getStats === "function"
+  ) {
+    const stats = await (val as any).getStats();
+    if (stats) {
+      return stats;
+    }
+  }
+
+  if (
+    val &&
+    typeof val === "object" &&
+    "query" in val &&
+    typeof (val as any).query === "function"
+  ) {
+    const items = await (val as any).query({}, env, sf);
+    return computeStatsFromArray(items);
+  }
+
+  if (Array.isArray(val)) {
+    return computeStatsFromArray(val);
+  }
+
+  if (val instanceof LuaTable) {
+    if (val.length > 0) {
+      const arr: any[] = [];
+      for (let i = 1; i <= val.length; i++) {
+        arr.push(val.rawGet(i));
+      }
+      return computeStatsFromArray(arr);
+    }
+    if (val.empty()) {
+      return computeStatsFromArray([]);
+    }
+    return computeStatsFromArray([val]);
+  }
+
+  if (val === null || val === undefined) {
+    return computeStatsFromArray([]);
+  }
+
+  return computeStatsFromArray([val]);
+}
+
+function explainSingleSource(
+  sourceName: string,
+  stats?: CollectionStats,
+): ExplainNode {
+  const rows = stats?.rowCount ?? 100;
+  const width = stats?.avgColumnCount ?? 5;
+
+  return {
+    nodeType: "Scan",
+    source: sourceName,
+    startupCost: 0,
+    estimatedCost: rows,
+    estimatedRows: rows,
+    estimatedWidth: width,
+    children: [],
+  };
+}
+
+async function executeSingleSourceExplainAnalyze(
+  collection: any,
+  query: LuaCollectionQuery,
+  plan: ExplainNode,
+  env: LuaEnv,
+  sf: LuaStackFrame,
+  opts: ExplainOptions,
+): Promise<any[]> {
+  const t0 = opts.timing ? performance.now() : 0;
+  const rows = await collection.query(query, env, sf, globalThis.client?.config);
+
+  plan.actualRows = rows.length;
+  plan.actualLoops = 1;
+
+  if (opts.timing) {
+    const elapsed = Math.round((performance.now() - t0) * 1000) / 1000;
+    plan.actualStartupTimeMs = elapsed;
+    plan.actualTimeMs = elapsed;
+  }
+
+  propagateActuals(plan, opts);
+
+  return rows;
 }
 
 export function evalExpression(
@@ -1128,6 +1278,14 @@ export function evalExpression(
           findFromClause.fields,
           findFromClause.ctx,
         );
+        const explainClause = q.clauses.find((c) => c.type === "Explain");
+        const explainOpts: ExplainOptions | undefined = explainClause
+          ? {
+              analyze: explainClause.analyze,
+              costs: explainClause.costs,
+              timing: explainClause.timing,
+            }
+          : undefined;
 
         if (fromSource.kind === "cross") {
           return (async () => {
@@ -1182,9 +1340,9 @@ export function evalExpression(
                   for (let i = 1; i <= len; i++) arr.push(val.rawGet(i));
                   src.stats = computeStatsFromArray(arr);
                 } else if (!val.empty()) {
-                  src.stats = { rowCount: 1, ndv: new Map() };
+                  src.stats = computeStatsFromArray([val]);
                 } else {
-                  src.stats = { rowCount: 0, ndv: new Map() };
+                  src.stats = computeStatsFromArray([]);
                 }
               }
             }
@@ -1259,64 +1417,13 @@ export function evalExpression(
             const materializedOverrides = new Map<string, any[]>();
 
             // Check for explain clause
-            const explainClause = q.clauses.find((c) => c.type === "Explain");
-            if (explainClause) {
-              const explainOpts: ExplainOptions = {
-                analyze: explainClause.analyze,
-                costs: explainClause.costs,
-                timing: explainClause.timing,
-              };
-
+            if (explainOpts) {
               const planT0 = performance.now();
               let plan = explainJoinTree(joinTree, explainOpts);
               const planningTimeMs =
                 Math.round((performance.now() - planT0) * 1000) / 1000;
 
-              // Collect query-level ops for plan wrapping
-              const explainQuery: Parameters<typeof wrapPlanWithQueryOps>[1] =
-                {};
-              for (const clause of q.clauses) {
-                switch (clause.type) {
-                  case "Where":
-                    explainQuery.where = clause.expression;
-                    break;
-                  case "OrderBy":
-                    explainQuery.orderBy = clause.orderBy.map((o) => ({
-                      expr: o.expression,
-                      desc: o.direction === "desc",
-                    }));
-                    break;
-                  case "Limit": {
-                    const lv = await evalExpression(clause.limit, env, sf);
-                    explainQuery.limit = Number(lv);
-                    if (clause.offset) {
-                      const ov = await evalExpression(clause.offset, env, sf);
-                      explainQuery.offset = Number(ov);
-                    }
-                    break;
-                  }
-                  case "Offset": {
-                    const ov = await evalExpression(clause.offset, env, sf);
-                    explainQuery.offset = Number(ov);
-                    break;
-                  }
-                  case "GroupBy":
-                    explainQuery.groupBy = clause.fields.map((f) => {
-                      if (f.type === "PropField")
-                        return { expr: f.value, alias: f.key };
-                      return { expr: f.value };
-                    });
-                    break;
-                  case "Having":
-                    explainQuery.having = clause.expression;
-                    break;
-                  case "Select":
-                    if (clause.distinct !== undefined) {
-                      explainQuery.distinct = clause.distinct;
-                    }
-                    break;
-                }
-              }
+              const explainQuery = await buildExplainQueryShape(q, env, sf);
 
               const explainSourceStats = new Map<string, CollectionStats>(
                 fromSource.sources
@@ -1419,7 +1526,7 @@ export function evalExpression(
               await collectFilteredLeaves(joinTree);
             }
 
-            const rows = await executeJoinTree(
+            const result = await executeJoinTree(
               joinTree,
               env,
               sf,
@@ -1427,7 +1534,7 @@ export function evalExpression(
               materializedOverrides,
             );
 
-            const collection: any = toCollection(rows);
+            const joinedCollection = toCollection(result);
 
             // Build up query object
             const selectClause = q.clauses.find((c) => c.type === "Select");
@@ -1438,11 +1545,15 @@ export function evalExpression(
               distinct: selectDistinct !== false, // default true
             };
 
-            // Map clauses to query parameters
+            // Map clauses to query parameters. The join predicates already embedded
+            // into the join tree must not be re-applied here, but any residual WHERE
+            // must still be evaluated on the joined rows before grouping/aggregation.
             for (const clause of q.clauses) {
               switch (clause.type) {
                 case "Where": {
-                  query.where = residualWhere;
+                  if (residualWhere) {
+                    query.where = residualWhere;
+                  }
                   break;
                 }
                 case "OrderBy": {
@@ -1488,18 +1599,10 @@ export function evalExpression(
                   query.having = clause.expression;
                   break;
                 }
-                case "PlanOrderBy": {
-                  // Already consumed above
-                  break;
-                }
-                case "Explain": {
-                  // Already consumed above
-                  break;
-                }
               }
             }
 
-            return (collection as any)
+            return joinedCollection
               .query(query, env, sf, globalThis.client?.config)
               .then(jsToLuaValue);
           })();
@@ -1601,6 +1704,44 @@ export function evalExpression(
                   break;
                 }
               }
+            }
+
+            if (explainOpts) {
+              const stats = await getStatsForValue(collection, env, sf);
+              const sourceName = objectVariable ?? "_";
+
+              const planT0 = performance.now();
+              let plan = explainSingleSource(sourceName, stats);
+              const planningTimeMs =
+                Math.round((performance.now() - planT0) * 1000) / 1000;
+
+              const explainQuery = await buildExplainQueryShape(q, env, sf);
+              const explainSourceStats = new Map<string, CollectionStats>([
+                [sourceName, stats],
+              ]);
+
+              plan = wrapPlanWithQueryOps(plan, explainQuery, explainSourceStats);
+
+              const result: ExplainResult = {
+                plan,
+                planningTimeMs,
+              };
+
+              if (explainOpts.analyze) {
+                const execT0 = performance.now();
+                await executeSingleSourceExplainAnalyze(
+                  collection as any,
+                  query,
+                  plan,
+                  env,
+                  sf,
+                  explainOpts,
+                );
+                result.executionTimeMs =
+                  Math.round((performance.now() - execT0) * 1000) / 1000;
+              }
+
+              return formatExplainOutput(result, explainOpts);
             }
 
             // Always use the possibly-wrapped collection

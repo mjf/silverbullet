@@ -905,6 +905,51 @@ async function hashInnerJoin(
   return results;
 }
 
+async function nestedLoopEquiJoin(
+  leftRows: LuaTable[],
+  rightItems: any[],
+  rightName: string,
+  equiPred: EquiPredicate,
+  sf: LuaStackFrame,
+  config?: JoinPlannerConfig,
+): Promise<LuaTable[]> {
+  const limit = getWatchdogLimit(config);
+  const chunk = getYieldChunk(config);
+  const results: LuaTable[] = [];
+  let processed = 0;
+
+  for (const lRow of leftRows) {
+    const leftObj = lRow.rawGet(equiPred.leftSource);
+    const leftVal = extractField(leftObj, equiPred.leftColumn);
+    const leftKey = hashJoinKey(leftVal);
+    if (leftKey === null) continue;
+
+    for (const rightItem of rightItems) {
+      const rightVal = extractField(rightItem, equiPred.rightColumn);
+      const rightKey = hashJoinKey(rightVal);
+      if (rightKey === null) continue;
+      if (leftKey !== rightKey) continue;
+
+      if (++processed > limit) {
+        throw new LuaRuntimeError(
+          `Query watchdog: intermediate result exceeded ${limit} rows`,
+          sf,
+        );
+      }
+
+      const newRow = cloneRow(lRow);
+      void newRow.rawSet(rightName, rightItem);
+      results.push(newRow);
+
+      if (processed % chunk === 0) {
+        await cooperativeYield();
+      }
+    }
+  }
+
+  return results;
+}
+
 async function predicateLoopJoin(
   leftRows: LuaTable[],
   rightItems: any[],
@@ -1115,19 +1160,34 @@ async function dispatchJoin(
           config,
         );
       }
-      return crossJoin(leftRows, rightItems, rightName, sf, config);
-    case "loop":
-      return crossJoin(leftRows, rightItems, rightName, sf, config);
+      break;
     case "merge":
-      return sortMergeJoin(
-        leftRows,
-        rightItems,
-        rightName,
-        sf,
-        config,
-        equiPred,
-      );
+      if (equiPred) {
+        return sortMergeJoin(
+          leftRows,
+          rightItems,
+          rightName,
+          sf,
+          config,
+          equiPred,
+        );
+      }
+      break;
+    case "loop":
+      if (equiPred) {
+        return nestedLoopEquiJoin(
+          leftRows,
+          rightItems,
+          rightName,
+          equiPred,
+          sf,
+          config,
+        );
+      }
+      break;
   }
+
+  return crossJoin(leftRows, rightItems, rightName, sf, config);
 }
 
 // 7. Join tree execution
