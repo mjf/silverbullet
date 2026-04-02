@@ -146,6 +146,7 @@ export type OpStats = {
 
 export type ExplainNodeType =
   | "Scan"
+  | "Filter"
   | "HashJoin"
   | "NestedLoop"
   | "MergeJoin"
@@ -1656,7 +1657,15 @@ export function wrapPlanWithQueryOps(
     const usedPreds = collectUsedEquiPreds(root);
     const residual = stripEquiPreds(query.where, usedPreds);
     if (residual) {
-      root.filterExpr = exprToString(residual);
+      root = {
+        nodeType: "Filter",
+        startupCost: root.startupCost,
+        estimatedCost: root.estimatedCost,
+        estimatedRows: Math.max(1, Math.round(root.estimatedRows * 0.5)),
+        estimatedWidth: root.estimatedWidth,
+        filterExpr: exprToString(residual),
+        children: [root],
+      };
     }
   }
 
@@ -1682,7 +1691,15 @@ export function wrapPlanWithQueryOps(
   }
 
   if (query.having) {
-    root.filterExpr = exprToString(query.having);
+    root = {
+      nodeType: "Filter",
+      startupCost: root.startupCost,
+      estimatedCost: root.estimatedCost,
+      estimatedRows: Math.max(1, Math.round(root.estimatedRows * 0.5)),
+      estimatedWidth: root.estimatedWidth,
+      filterExpr: exprToString(query.having),
+      children: [root],
+    };
   }
 
   if (query.distinct) {
@@ -2068,6 +2085,8 @@ function formatNodeLabel(node: ExplainNode): string {
   switch (node.nodeType) {
     case "Scan":
       return `Scan on ${node.source}`;
+    case "Filter":
+      return "Filter";
     case "HashJoin":
       return node.joinType && node.joinType !== "inner"
         ? `Hash ${node.joinType.charAt(0).toUpperCase() + node.joinType.slice(1)} Join`

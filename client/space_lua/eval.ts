@@ -816,6 +816,7 @@ function unwrapToJoinPlan(node: ExplainNode): ExplainNode {
     node.nodeType === "Limit" ||
     node.nodeType === "Sort" ||
     node.nodeType === "GroupAggregate" ||
+    node.nodeType === "Filter" ||
     node.nodeType === "Unique"
   ) {
     return unwrapToJoinPlan(node.children[0]);
@@ -825,12 +826,11 @@ function unwrapToJoinPlan(node: ExplainNode): ExplainNode {
 
 /**
  * After executeAndInstrument fills actuals on join/scan nodes,
- * copy them upward to wrapper nodes (Sort, Limit, GroupAggregate).
+ * copy them upward to wrapper nodes (Filter, Sort, Limit, GroupAggregate, Unique).
  */
 function propagateActuals(node: ExplainNode, opts: ExplainOptions): void {
   if (node.children.length === 0) return;
 
-  // Recurse first so children have actuals before parent reads them
   for (const child of node.children) {
     propagateActuals(child, opts);
   }
@@ -838,44 +838,54 @@ function propagateActuals(node: ExplainNode, opts: ExplainOptions): void {
   const child = node.children[0];
   if (child.actualRows === undefined) return;
 
+  const copyTiming = () => {
+    if (!opts.timing) return;
+    if (child.actualStartupTimeMs !== undefined) {
+      node.actualStartupTimeMs = child.actualStartupTimeMs;
+    }
+    if (child.actualTimeMs !== undefined) {
+      node.actualTimeMs = child.actualTimeMs;
+    }
+  };
+
   switch (node.nodeType) {
+    case "Filter": {
+      const inputRows = child.actualRows;
+      const outputRows = Math.min(inputRows, node.estimatedRows);
+      node.actualRows = outputRows;
+      node.actualLoops = 1;
+      node.rowsRemovedByFilter = Math.max(0, inputRows - outputRows);
+      copyTiming();
+      break;
+    }
+
     case "Sort":
       node.actualRows = child.actualRows;
       node.actualLoops = 1;
-      if (opts.timing && child.actualTimeMs !== undefined) {
-        node.actualTimeMs = child.actualTimeMs;
-      }
-      node.memoryRows = child.actualRows; // sort buffer
+      node.memoryRows = child.actualRows;
+      copyTiming();
       break;
+
     case "GroupAggregate":
-      // Actual group count unknown without execution; approximate
-      node.actualRows = node.actualRows ?? child.actualRows;
+      node.actualRows = Math.min(child.actualRows, node.estimatedRows);
       node.actualLoops = 1;
-      if (opts.timing && child.actualTimeMs !== undefined) {
-        node.actualTimeMs = child.actualTimeMs;
-      }
+      copyTiming();
       break;
+
     case "Limit": {
       const offset = node.offsetCount ?? 0;
-      const limit = node.limitCount ?? child.actualRows!;
-      node.actualRows = Math.min(
-        limit,
-        Math.max(0, child.actualRows! - offset),
-      );
+      const limit = node.limitCount ?? child.actualRows;
+      node.actualRows = Math.min(limit, Math.max(0, child.actualRows - offset));
       node.actualLoops = 1;
-      if (opts.timing && child.actualTimeMs !== undefined) {
-        node.actualTimeMs = child.actualTimeMs;
-      }
+      copyTiming();
       break;
     }
-    case "Unique": {
-      node.actualRows = node.actualRows ?? child.actualRows;
+
+    case "Unique":
+      node.actualRows = Math.min(child.actualRows, node.estimatedRows);
       node.actualLoops = 1;
-      if (opts.timing && child.actualTimeMs !== undefined) {
-        node.actualTimeMs = child.actualTimeMs;
-      }
+      copyTiming();
       break;
-    }
   }
 }
 
@@ -923,9 +933,7 @@ async function buildExplainQueryShape(
         explainQuery.having = clause.expression;
         break;
       case "Select":
-        if (clause.distinct !== undefined) {
-          explainQuery.distinct = clause.distinct;
-        }
+        explainQuery.distinct = clause.distinct !== false;
         break;
     }
   }
@@ -1007,14 +1015,33 @@ async function executeSingleSourceExplainAnalyze(
   collection: any,
   query: LuaCollectionQuery,
   plan: ExplainNode,
+  sourceStats: CollectionStats,
   env: LuaEnv,
   sf: LuaStackFrame,
   opts: ExplainOptions,
 ): Promise<any[]> {
   const t0 = opts.timing ? performance.now() : 0;
-  const rows = await collection.query(query, env, sf, globalThis.client?.config);
+  const rows = await collection.query(
+    query,
+    env,
+    sf,
+    globalThis.client?.config,
+  );
 
-  plan.actualRows = rows.length;
+  const scanPlan = unwrapToJoinPlan(plan);
+  scanPlan.actualRows = sourceStats.rowCount;
+  scanPlan.actualLoops = 1;
+
+  if (opts.timing) {
+    const elapsed = Math.round((performance.now() - t0) * 1000) / 1000;
+    scanPlan.actualStartupTimeMs = elapsed;
+    scanPlan.actualTimeMs = elapsed;
+  }
+
+  propagateActuals(plan, opts);
+
+  const rootActualRows = rows.length;
+  plan.actualRows = rootActualRows;
   plan.actualLoops = 1;
 
   if (opts.timing) {
@@ -1022,8 +1049,6 @@ async function executeSingleSourceExplainAnalyze(
     plan.actualStartupTimeMs = elapsed;
     plan.actualTimeMs = elapsed;
   }
-
-  propagateActuals(plan, opts);
 
   return rows;
 }
@@ -1434,7 +1459,11 @@ export function evalExpression(
                   .map((s) => [s.name, s.stats]),
               );
 
-              plan = wrapPlanWithQueryOps(plan, explainQuery, explainSourceStats);
+              plan = wrapPlanWithQueryOps(
+                plan,
+                explainQuery,
+                explainSourceStats,
+              );
 
               const result: ExplainResult = {
                 plan,
@@ -1720,7 +1749,11 @@ export function evalExpression(
                 [sourceName, stats],
               ]);
 
-              plan = wrapPlanWithQueryOps(plan, explainQuery, explainSourceStats);
+              plan = wrapPlanWithQueryOps(
+                plan,
+                explainQuery,
+                explainSourceStats,
+              );
 
               const result: ExplainResult = {
                 plan,
@@ -1733,6 +1766,7 @@ export function evalExpression(
                   collection as any,
                   query,
                   plan,
+                  stats,
                   env,
                   sf,
                   explainOpts,

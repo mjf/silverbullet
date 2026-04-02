@@ -6227,3 +6227,241 @@ do
     "138: expected capped rows=30 in plan, got: " .. tostring(plan)
   )
 end
+
+-- 140. Multi-source inner equi join applies join predicate
+
+do
+  local depts = {
+    { dept = "eng" },
+    { dept = "sales" },
+  }
+  local employees = {
+    { name = "Alice", dept = "eng" },
+    { name = "Bob",   dept = "eng" },
+    { name = "Carol", dept = "sales" },
+  }
+  local r = query [[
+    from
+      d = depts,
+      e = employees
+    where
+      d.dept == e.dept
+    select all {
+      dept = d.dept,
+      name = e.name,
+    }
+    order by
+      dept, name
+  ]]
+
+  assertEquals(#r, 3)
+  assertEquals(r[1].dept, "eng")
+  assertEquals(r[1].name, "Alice")
+  assertEquals(r[2].dept, "eng")
+  assertEquals(r[2].name, "Bob")
+  assertEquals(r[3].dept, "sales")
+  assertEquals(r[3].name, "Carol")
+end
+
+-- 141. Multi-source group by + count uses filtered join rows
+
+do
+  local depts = {
+    { dept = "eng" },
+    { dept = "sales" },
+  }
+  local employees = {
+    { name = "Alice", dept = "eng" },
+    { name = "Bob",   dept = "eng" },
+    { name = "Carol", dept = "sales" },
+  }
+  local r = query [[
+    from
+      d = depts,
+      e = employees
+    where
+      d.dept == e.dept
+    group by
+      d.dept
+    select {
+      dept = key,
+      n = count(),
+    }
+    order by
+      dept
+  ]]
+
+  assertEquals(#r, 2)
+  assertEquals(r[1].dept, "eng")
+  assertEquals(r[1].n, 2)
+  assertEquals(r[2].dept, "sales")
+  assertEquals(r[2].n, 1)
+end
+
+-- 142. Multi-source group by + sum uses filtered join rows
+
+do
+  local categories = {
+    { cat = "fruit" },
+    { cat = "veg" },
+  }
+  local items = {
+    { name = "apple",  cat = "fruit", price = 3 },
+    { name = "pear",   cat = "fruit", price = 2 },
+    { name = "carrot", cat = "veg",   price = 1 },
+    { name = "beet",   cat = "veg",   price = 4 },
+  }
+  local r = query [[
+    from
+      c = categories,
+      i = items
+    where
+      c.cat == i.cat
+    group by
+      c.cat
+    select {
+      cat = key,
+      total = sum(i.price),
+    }
+    order by
+      cat
+  ]]
+
+  assertEquals(#r, 2)
+  assertEquals(r[1].cat, "fruit")
+  assertEquals(r[1].total, 5)
+  assertEquals(r[2].cat, "veg")
+  assertEquals(r[2].total, 5)
+end
+
+-- 143. Semi join with equi predicate keeps matching left rows only
+
+do
+  local xs = {
+    { id = 1, name = "a" },
+    { id = 2, name = "b" },
+    { id = 3, name = "c" },
+  }
+  local ys = {
+    { fk = 2 },
+    { fk = 3 },
+  }
+
+  local r = query [[
+    from
+      x = xs,
+      y = ys semi hash
+    where
+      x.id == y.fk
+    select {
+      name = x.name,
+    }
+    order by
+      x.name
+  ]]
+
+  assertEquals(#r, 2)
+  assertEquals(r[1].name, "b")
+  assertEquals(r[2].name, "c")
+end
+
+-- 144. Anti join with equi predicate keeps non-matching left rows only
+
+do
+  local xs = {
+    { id = 1, name = "a" },
+    { id = 2, name = "b" },
+    { id = 3, name = "c" },
+  }
+  local ys = {
+    { fk = 2 },
+    { fk = 3 },
+  }
+
+  local r = query [[
+    from
+      x = xs,
+      y = ys anti hash
+    where
+      x.id == y.fk
+    select {
+      name = x.name,
+    }
+  ]]
+
+  assertEquals(#r, 1)
+  assertEquals(r[1].name, "a")
+end
+
+-- 103. Single-source explain works
+
+do
+  local plan = query [[
+    explain
+    from
+      p = pages
+    select {
+      name = p.name,
+    }
+  ]]
+
+  plan = tostring(plan)
+
+  assertTrue(
+    string.find(plan, "Scan on p", 1, true) ~= nil,
+    "103: expected single-source explain scan, got: " .. tostring(plan)
+  )
+end
+
+-- 145. Explain works for from {}
+
+do
+  local plan = query [[
+    explain (costs)
+    from
+      {}
+    select
+      _
+  ]]
+
+  plan = tostring(plan)
+
+  assertTrue(
+    string.find(plan, "Scan on _", 1, true) ~= nil,
+    "104: expected scan on _, got: " .. tostring(plan)
+  )
+  assertTrue(
+    string.find(plan, "rows=", 1, true) ~= nil,
+    "104: expected row estimate, got: " .. tostring(plan)
+  )
+end
+
+-- 146. Distinct explain analyze works
+
+do
+  local plan = query [[
+    explain analyze (costs, timing)
+    from
+      p = pages
+    where
+      p.tags[1] ~= nil
+    select {
+      tag = p.tags[1],
+    }
+  ]]
+
+  plan = tostring(plan)
+
+  assertTrue(
+    string.find(plan, "Unique", 1, true) ~= nil,
+    "105: expected Unique node, got: " .. tostring(plan)
+  )
+  assertTrue(
+    string.find(plan, "actual", 1, true) ~= nil,
+    "105: expected analyze actuals, got: " .. tostring(plan)
+  )
+  assertTrue(
+    string.find(plan, "Execution Time:", 1, true) ~= nil,
+    "105: expected execution time, got: " .. tostring(plan)
+  )
+end
