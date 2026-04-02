@@ -112,6 +112,7 @@ export type JoinInner = {
   equiPred?: EquiPredicate;
   estimatedSelectivity?: number;
   estimatedRows?: number;
+  estimatedNdv?: Map<string, Map<string, number>>;
 };
 
 // Predicate
@@ -267,6 +268,94 @@ function estimateRangeSelectivity(
   return sel;
 }
 
+/**
+ * Extract per-source NDV maps from a join node.
+ * For a leaf, returns the source's stats NDV keyed by source name.
+ * For a join node, returns the accumulated estimatedNdv if available.
+ */
+function getNodeNdv(node: JoinNode): Map<string, Map<string, number>> {
+  if (node.kind === "leaf") {
+    return new Map([[node.source.name, node.source.stats?.ndv ?? new Map()]]);
+  }
+  return node.estimatedNdv ?? new Map();
+}
+
+/**
+ * Propagate NDV through a join, producing a merged NDV map that spans
+ * all sources in the resulting join subtree.
+ *
+ * `leftNdv` is the accumulated per-source NDV from the left subtree.
+ * `rightLeafNdv` is the single right leaf source's column→NDV map
+ * (flattened, since the right side of a left-deep tree is always a leaf).
+ *
+ * Rules per join type:
+ * - inner: merge left + right NDV; cap all values by joinedRows;
+ *          for equi-pred columns, restrict to min(leftNdv, rightNdv, joinedRows).
+ * - semi:  keep only left NDV (right side is invisible after join);
+ *          for equi-pred left column, restrict to min(leftNdv, rightNdv, joinedRows).
+ * - anti:  keep only left NDV; cap all by joinedRows.
+ */
+function propagateJoinNdv(
+  leftNdv: Map<string, Map<string, number>>,
+  rightLeafNdv: Map<string, number>,
+  rightSourceName: string,
+  joinType: JoinType,
+  equiPred: EquiPredicate | undefined,
+  joinedRows: number,
+): Map<string, Map<string, number>> {
+  const result = new Map<string, Map<string, number>>();
+
+  // Copy left NDV entries, capping each value by joinedRows
+  for (const [src, colMap] of leftNdv) {
+    const capped = new Map<string, number>();
+    for (const [col, ndv] of colMap) {
+      capped.set(col, Math.min(ndv, joinedRows));
+    }
+    result.set(src, capped);
+  }
+
+  // For inner joins, also include right source NDV
+  if (joinType === "inner") {
+    const rightCapped = new Map<string, number>();
+    for (const [col, ndv] of rightLeafNdv) {
+      rightCapped.set(col, Math.min(ndv, joinedRows));
+    }
+    result.set(rightSourceName, rightCapped);
+  }
+
+  // For equi-pred columns, restrict to min(leftNdv, rightNdv, joinedRows)
+  if (equiPred) {
+    const leftSrcMap = leftNdv.get(equiPred.leftSource);
+    const leftColNdv = leftSrcMap?.get(equiPred.leftColumn);
+    const rightColNdv = rightLeafNdv.get(equiPred.rightColumn);
+
+    if (leftColNdv !== undefined || rightColNdv !== undefined) {
+      const minNdv = Math.min(
+        leftColNdv ?? Infinity,
+        rightColNdv ?? Infinity,
+        joinedRows,
+      );
+
+      // Update left equi-pred column
+      const resultLeftSrcMap = result.get(equiPred.leftSource);
+      if (resultLeftSrcMap && leftColNdv !== undefined) {
+        resultLeftSrcMap.set(equiPred.leftColumn, minNdv);
+      }
+
+      // Update right equi-pred column (only for inner joins);
+      // use rightSourceName which matches the key in result.
+      if (joinType === "inner" && rightColNdv !== undefined) {
+        const resultRightSrcMap = result.get(rightSourceName);
+        if (resultRightSrcMap) {
+          resultRightSrcMap.set(equiPred.rightColumn, minNdv);
+        }
+      }
+    }
+  }
+
+  return result;
+}
+
 function collectSourceNames(node: JoinNode): Set<string> {
   const names = new Set<string>();
   const walk = (n: JoinNode) => {
@@ -376,6 +465,7 @@ export function buildJoinTree(
   let tree: JoinNode = { kind: "leaf", source: ordered[0] };
   let accRows = estimatedRows(ordered[0]);
   let accWidth = estimatedWidth(ordered[0]);
+  let accNdv = getNodeNdv(tree);
 
   for (let i = 1; i < ordered.length; i++) {
     const right = ordered[i];
@@ -407,6 +497,15 @@ export function buildJoinTree(
       selectivity,
     );
 
+    const joinNdv = propagateJoinNdv(
+      accNdv,
+      right.stats?.ndv ?? new Map(),
+      right.name,
+      jt,
+      equiPred,
+      joinRows,
+    );
+
     tree = {
       kind: "join",
       left: tree,
@@ -416,9 +515,11 @@ export function buildJoinTree(
       equiPred,
       estimatedSelectivity: selectivity,
       estimatedRows: joinRows,
+      estimatedNdv: joinNdv,
     };
     accRows = joinRows;
     accWidth += estimatedWidth(right);
+    accNdv = joinNdv;
   }
   return tree;
 }
@@ -1706,6 +1807,7 @@ export function wrapPlanWithQueryOps(
     distinct?: boolean;
   },
   sourceStats?: Map<string, CollectionStats>,
+  accumulatedNdv?: Map<string, Map<string, number>>,
 ): ExplainNode {
   let root = plan;
 
@@ -1731,6 +1833,7 @@ export function wrapPlanWithQueryOps(
       root.estimatedRows,
       query.groupBy,
       sourceStats,
+      accumulatedNdv,
     );
     const estimatedGroupRows =
       ndvGroupRows ?? Math.max(1, Math.round(root.estimatedRows * 0.5));
@@ -2090,8 +2193,11 @@ function estimateGroupRowsFromNdv(
   inputRows: number,
   groupBy: { expr: LuaExpression; alias?: string }[],
   sourceStats?: Map<string, CollectionStats>,
+  accumulatedNdv?: Map<string, Map<string, number>>,
 ): number | undefined {
-  if (!sourceStats || groupBy.length === 0) return undefined;
+  if ((!sourceStats && !accumulatedNdv) || groupBy.length === 0) {
+    return undefined;
+  }
 
   let combinedNdv = 1;
   let foundAny = false;
@@ -2106,8 +2212,10 @@ function estimateGroupRowsFromNdv(
       return undefined;
     }
 
-    const stats = sourceStats.get(ref.source);
-    const ndv = stats?.ndv?.get(ref.column);
+    // Prefer post-join accumulated NDV over raw leaf source stats
+    const accNdv = accumulatedNdv?.get(ref.source)?.get(ref.column);
+    const leafNdv = sourceStats?.get(ref.source)?.ndv?.get(ref.column);
+    const ndv = accNdv ?? leafNdv;
     if (ndv === undefined) {
       return undefined;
     }
