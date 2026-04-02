@@ -284,6 +284,10 @@ function getNodeNdv(node: JoinNode): Map<string, Map<string, number>> {
  * Propagate NDV through a join, producing a merged NDV map that spans
  * all sources in the resulting join subtree.
  *
+ * `leftNdv` is the accumulated per-source NDV from the left subtree.
+ * `rightLeafNdv` is the single right leaf source's column→NDV map
+ * (flattened, since the right side of a left-deep tree is always a leaf).
+ *
  * Rules per join type:
  * - inner: merge left + right NDV; cap all values by joinedRows;
  *          for equi-pred columns, restrict to min(leftNdv, rightNdv, joinedRows).
@@ -293,7 +297,7 @@ function getNodeNdv(node: JoinNode): Map<string, Map<string, number>> {
  */
 function propagateJoinNdv(
   leftNdv: Map<string, Map<string, number>>,
-  rightNdv: Map<string, number>,
+  rightLeafNdv: Map<string, number>,
   rightSourceName: string,
   joinType: JoinType,
   equiPred: EquiPredicate | undefined,
@@ -313,7 +317,7 @@ function propagateJoinNdv(
   // For inner joins, also include right source NDV
   if (joinType === "inner") {
     const rightCapped = new Map<string, number>();
-    for (const [col, ndv] of rightNdv) {
+    for (const [col, ndv] of rightLeafNdv) {
       rightCapped.set(col, Math.min(ndv, joinedRows));
     }
     result.set(rightSourceName, rightCapped);
@@ -321,10 +325,9 @@ function propagateJoinNdv(
 
   // For equi-pred columns, restrict to min(leftNdv, rightNdv, joinedRows)
   if (equiPred) {
-    const leftColNdv = leftNdv.get(equiPred.leftSource)?.get(
-      equiPred.leftColumn,
-    );
-    const rightColNdv = rightNdv.get(equiPred.rightColumn);
+    const leftSrcMap = leftNdv.get(equiPred.leftSource);
+    const leftColNdv = leftSrcMap?.get(equiPred.leftColumn);
+    const rightColNdv = rightLeafNdv.get(equiPred.rightColumn);
 
     if (leftColNdv !== undefined || rightColNdv !== undefined) {
       const minNdv = Math.min(
@@ -334,16 +337,17 @@ function propagateJoinNdv(
       );
 
       // Update left equi-pred column
-      const leftSrcMap = result.get(equiPred.leftSource);
-      if (leftSrcMap && leftColNdv !== undefined) {
-        leftSrcMap.set(equiPred.leftColumn, minNdv);
+      const resultLeftSrcMap = result.get(equiPred.leftSource);
+      if (resultLeftSrcMap && leftColNdv !== undefined) {
+        resultLeftSrcMap.set(equiPred.leftColumn, minNdv);
       }
 
-      // Update right equi-pred column (only for inner joins)
+      // Update right equi-pred column (only for inner joins);
+      // use rightSourceName which matches the key in result.
       if (joinType === "inner" && rightColNdv !== undefined) {
-        const rightSrcMap = result.get(equiPred.rightSource);
-        if (rightSrcMap) {
-          rightSrcMap.set(equiPred.rightColumn, minNdv);
+        const resultRightSrcMap = result.get(rightSourceName);
+        if (resultRightSrcMap) {
+          resultRightSrcMap.set(equiPred.rightColumn, minNdv);
         }
       }
     }
