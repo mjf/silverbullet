@@ -57,6 +57,7 @@ import {
   type JoinNode,
   type JoinSource,
   stripUsedJoinPredicates,
+  validatePostJoinSourceReferences,
   wrapPlanWithQueryOps,
 } from "./join_planner.ts";
 import { getBlockGotoMeta } from "./labels.ts";
@@ -877,10 +878,7 @@ function propagateActuals(node: ExplainNode, opts: ExplainOptions): void {
     case "Limit": {
       const offset = node.offsetCount ?? 0;
       const limit = node.limitCount ?? child.actualRows;
-      node.actualRows = Math.min(
-        limit,
-        Math.max(0, child.actualRows - offset),
-      );
+      node.actualRows = Math.min(limit, Math.max(0, child.actualRows - offset));
       node.actualLoops = 1;
       copyTiming();
       break;
@@ -1026,7 +1024,12 @@ async function executeSingleSourceExplainAnalyze(
   opts: ExplainOptions,
 ): Promise<any[]> {
   const t0 = opts.timing ? performance.now() : 0;
-  const rows = await collection.query(query, env, sf, globalThis.client?.config);
+  const rows = await collection.query(
+    query,
+    env,
+    sf,
+    globalThis.client?.config,
+  );
 
   const scanPlan = unwrapToJoinPlan(plan);
   scanPlan.actualRows = sourceStats.rowCount;
@@ -1423,6 +1426,49 @@ export function evalExpression(
             const residualWhere = stripUsedJoinPredicates(
               pushdownResidualWhere,
               joinTree,
+            );
+
+            // Validate that right-side sources of SEMI/ANTI joins are not
+            // referenced from post-join query clauses. They may participate
+            // in the join predicate itself, but are not available afterward.
+            const selectClauseForValidation = q.clauses.find(
+              (c) => c.type === "Select",
+            );
+            const orderByClauseForValidation = q.clauses.find(
+              (c) => c.type === "OrderBy",
+            );
+            const groupByClauseForValidation = q.clauses.find(
+              (c) => c.type === "GroupBy",
+            );
+            const havingClauseForValidation = q.clauses.find(
+              (c) => c.type === "Having",
+            );
+
+            validatePostJoinSourceReferences(
+              joinTree,
+              {
+                where: residualWhere,
+                groupBy:
+                  groupByClauseForValidation?.fields.map((f) => {
+                    if (f.type === "PropField") {
+                      return { expr: f.value, alias: f.key };
+                    }
+                    return { expr: f.value };
+                  }) ?? undefined,
+                having: havingClauseForValidation?.expression,
+                select: selectClauseForValidation
+                  ? fieldsToExpression(
+                      selectClauseForValidation.fields,
+                      selectClauseForValidation.ctx,
+                    )
+                  : undefined,
+                orderBy:
+                  orderByClauseForValidation?.orderBy.map((o) => ({
+                    expr: o.expression,
+                    desc: o.direction === "desc",
+                  })) ?? undefined,
+              },
+              sf,
             );
 
             const materializedOverrides = new Map<string, any[]>();

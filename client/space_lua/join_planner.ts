@@ -280,9 +280,7 @@ function collectSourceNames(node: JoinNode): Set<string> {
   return names;
 }
 
-function sourceByName(
-  sources: JoinSource[],
-): Map<string, JoinSource> {
+function sourceByName(sources: JoinSource[]): Map<string, JoinSource> {
   return new Map(sources.map((s) => [s.name, s]));
 }
 
@@ -487,19 +485,15 @@ function orderSources(
       const cost =
         joinedRows *
         estimatedRows(candidate) *
-        (
-          getWidthWeight(config) * clampWidth(joinedWidth) +
-          getCandidateWidthWeight(config) * candidateWidth
-        );
+        (getWidthWeight(config) * clampWidth(joinedWidth) +
+          getCandidateWidthWeight(config) * candidateWidth);
 
       if (
         cost < bestCost ||
         (cost === bestCost && outputRows < bestOutRows) ||
-        (
-          cost === bestCost &&
+        (cost === bestCost &&
           outputRows === bestOutRows &&
-          candidateWidth < bestCandidateWidth
-        )
+          candidateWidth < bestCandidateWidth)
       ) {
         bestCost = cost;
         bestOutRows = outputRows;
@@ -576,10 +570,7 @@ function selectPhysicalOperator(
       widthWeight *
       lw;
     const rightSort =
-      rr *
-      Math.ceil(Math.log2(Math.max(2, rr))) *
-      candidateWidthWeight *
-      rw;
+      rr * Math.ceil(Math.log2(Math.max(2, rr))) * candidateWidthWeight * rw;
     const mergeCost =
       leftSort +
       rightSort +
@@ -749,10 +740,7 @@ function isLeafNode(node: JoinNode): node is JoinLeaf {
   return node.kind === "leaf";
 }
 
-function loopPredicateLeftArg(
-  leftNode: JoinNode,
-  row: LuaTable,
-): LuaValue {
+function loopPredicateLeftArg(leftNode: JoinNode, row: LuaTable): LuaValue {
   if (isLeafNode(leftNode)) {
     return row.rawGet(leftNode.source.name);
   }
@@ -1121,12 +1109,7 @@ async function dispatchJoin(
     }
 
     if (equiPred) {
-      return hashSemiAntiJoin(
-        leftRows,
-        rightItems,
-        joinType,
-        equiPred,
-      );
+      return hashSemiAntiJoin(leftRows, rightItems, joinType, equiPred);
     }
 
     throw new LuaRuntimeError(
@@ -1757,6 +1740,187 @@ export function wrapPlanWithQueryOps(
 
 // Helpers
 
+type RestrictedSourceRef = {
+  source: string;
+  joinType: "semi" | "anti";
+};
+
+function collectRestrictedPostJoinSources(
+  node: JoinNode,
+): Map<string, "semi" | "anti"> {
+  const restricted = new Map<string, "semi" | "anti">();
+
+  const collectLeafNames = (n: JoinNode, out: string[]) => {
+    if (n.kind === "leaf") {
+      out.push(n.source.name);
+      return;
+    }
+    collectLeafNames(n.left, out);
+    collectLeafNames(n.right, out);
+  };
+
+  const walk = (n: JoinNode) => {
+    if (n.kind === "leaf") return;
+
+    if (n.joinType === "semi" || n.joinType === "anti") {
+      const rightNames: string[] = [];
+      collectLeafNames(n.right, rightNames);
+      for (const name of rightNames) {
+        restricted.set(name, n.joinType);
+      }
+    }
+
+    walk(n.left);
+    walk(n.right);
+  };
+
+  walk(node);
+  return restricted;
+}
+
+function collectIllegalRestrictedRefs(
+  expr: LuaExpression | undefined,
+  restricted: Map<string, "semi" | "anti">,
+  out: RestrictedSourceRef[],
+): void {
+  if (!expr) return;
+
+  switch (expr.type) {
+    case "Variable":
+      if (restricted.has(expr.name)) {
+        out.push({
+          source: expr.name,
+          joinType: restricted.get(expr.name)!,
+        });
+      }
+      return;
+
+    case "PropertyAccess":
+      if (expr.object.type === "Variable" && restricted.has(expr.object.name)) {
+        out.push({
+          source: expr.object.name,
+          joinType: restricted.get(expr.object.name)!,
+        });
+        return;
+      }
+      collectIllegalRestrictedRefs(expr.object, restricted, out);
+      return;
+
+    case "TableAccess":
+      collectIllegalRestrictedRefs(expr.object, restricted, out);
+      collectIllegalRestrictedRefs(expr.key, restricted, out);
+      return;
+
+    case "Binary":
+      collectIllegalRestrictedRefs(expr.left, restricted, out);
+      collectIllegalRestrictedRefs(expr.right, restricted, out);
+      return;
+
+    case "Unary":
+      collectIllegalRestrictedRefs(expr.argument, restricted, out);
+      return;
+
+    case "Parenthesized":
+      collectIllegalRestrictedRefs(expr.expression, restricted, out);
+      return;
+
+    case "FunctionCall":
+      collectIllegalRestrictedRefs(expr.prefix, restricted, out);
+      for (const arg of expr.args) {
+        collectIllegalRestrictedRefs(arg, restricted, out);
+      }
+      if (expr.orderBy) {
+        for (const ob of expr.orderBy) {
+          collectIllegalRestrictedRefs(ob.expression, restricted, out);
+        }
+      }
+      return;
+
+    case "FilteredCall":
+      collectIllegalRestrictedRefs(expr.call, restricted, out);
+      collectIllegalRestrictedRefs(expr.filter, restricted, out);
+      return;
+
+    case "AggregateCall":
+      collectIllegalRestrictedRefs(expr.call, restricted, out);
+      for (const ob of expr.orderBy) {
+        collectIllegalRestrictedRefs(ob.expression, restricted, out);
+      }
+      return;
+
+    case "TableConstructor":
+      for (const field of expr.fields) {
+        switch (field.type) {
+          case "DynamicField":
+            collectIllegalRestrictedRefs(field.key, restricted, out);
+            collectIllegalRestrictedRefs(field.value, restricted, out);
+            break;
+          case "PropField":
+          case "ExpressionField":
+            collectIllegalRestrictedRefs(field.value, restricted, out);
+            break;
+        }
+      }
+      return;
+
+    default:
+      return;
+  }
+}
+
+function throwIllegalRestrictedRef(
+  ref: RestrictedSourceRef,
+  sf: LuaStackFrame,
+  ctx: LuaExpression["ctx"],
+): never {
+  throw new LuaRuntimeError(
+    `invalid reference to ${ref.joinType}-joined source '${ref.source}'`,
+    sf.withCtx(ctx),
+  );
+}
+
+export function validatePostJoinSourceReferences(
+  tree: JoinNode,
+  query: {
+    where?: LuaExpression;
+    groupBy?: { expr: LuaExpression; alias?: string }[];
+    having?: LuaExpression;
+    select?: LuaExpression;
+    orderBy?: { expr: LuaExpression; desc: boolean }[];
+  },
+  sf: LuaStackFrame,
+): void {
+  const restricted = collectRestrictedPostJoinSources(tree);
+  if (restricted.size === 0) return;
+
+  const check = (expr: LuaExpression | undefined) => {
+    if (!expr) return;
+    const bad: RestrictedSourceRef[] = [];
+    collectIllegalRestrictedRefs(expr, restricted, bad);
+    if (bad.length > 0) {
+      throwIllegalRestrictedRef(bad[0], sf, expr.ctx);
+    }
+  };
+
+  // Residual WHERE only. Join predicates have already been consumed separately.
+  check(query.where);
+
+  if (query.groupBy) {
+    for (const g of query.groupBy) {
+      check(g.expr);
+    }
+  }
+
+  check(query.having);
+  check(query.select);
+
+  if (query.orderBy) {
+    for (const o of query.orderBy) {
+      check(o.expr);
+    }
+  }
+}
+
 function formatHintLabel(hint: LuaJoinHint): string {
   const parts: string[] = [];
   if (hint.joinType) parts.push(hint.joinType);
@@ -1963,10 +2127,7 @@ export async function executeAndInstrument(
   return joinResult;
 }
 
-function estimateRowsRemoved(
-  inputRows: number,
-  outputRows: number,
-): number {
+function estimateRowsRemoved(inputRows: number, outputRows: number): number {
   return Math.max(0, inputRows - outputRows);
 }
 
@@ -2039,7 +2200,11 @@ export async function executeExplainWrappersExact(
     return rows;
   }
 
-  const childRows = await executeExplainWrappersExact(node.children[0], rows, opts);
+  const childRows = await executeExplainWrappersExact(
+    node.children[0],
+    rows,
+    opts,
+  );
 
   switch (node.nodeType) {
     case "Filter":
