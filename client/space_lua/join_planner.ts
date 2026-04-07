@@ -8,7 +8,7 @@ import type { LuaExpression, LuaFunctionBody, LuaJoinHint } from "./ast.ts";
 import { evalExpression } from "./eval.ts";
 import type { CollectionStats } from "./query_collection.ts";
 import {
-  type LuaEnv,
+  LuaEnv,
   LuaFunction,
   LuaRuntimeError,
   type LuaStackFrame,
@@ -1803,7 +1803,7 @@ export async function applyPushedFilters(
   for (const filter of relevant) {
     const filtered: any[] = [];
     for (const item of result) {
-      const filterEnv = new (await import("./runtime.ts")).LuaEnv(env);
+      const filterEnv = new LuaEnv(env);
       filterEnv.setLocal(sourceName, item);
       const val = await evalExpression(filter.expression, filterEnv, sf);
       if (luaTruthy(val)) {

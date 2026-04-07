@@ -18,7 +18,7 @@ import type {
   LuaUnaryExpression,
 } from "./ast.ts";
 import { evalExpression, luaOp } from "./eval.ts";
-import { HyperLogLog } from "./hll.ts";
+import { HalfXorSketch, type SketchConfig } from "./half_xor.ts";
 import { isSqlNull, LIQ_NULL } from "./liq_null.ts";
 import {
   jsToLuaValue,
@@ -59,35 +59,45 @@ export interface LuaQueryCollectionWithStats extends LuaQueryCollection {
 export class StatsTracker {
   rowCount = 0;
   private totalColumnCount = 0;
-  private hllMap = new Map<string, HyperLogLog>();
+  private sketchMap = new Map<string, HalfXorSketch>();
+  private sketchConfig: SketchConfig;
 
-  index(item: Record<string, any>): void {
+  constructor(sketchConfig?: SketchConfig) {
+    this.sketchConfig = sketchConfig ?? {};
+  }
+
+  index(item: Record<string, any>, contextTag: string = "Unknown"): void {
     this.rowCount++;
     const keys = Object.keys(item);
     this.totalColumnCount += keys.length;
     for (const key of keys) {
       const val = item[key];
-      if (val === null || val === undefined) {
-        continue; // Don't feed nulls to HLL
+      if (val === null || val === undefined) continue;
+      let sketch = this.sketchMap.get(key);
+      if (!sketch) {
+        sketch = new HalfXorSketch(this.sketchConfig);
+        this.sketchMap.set(key, sketch);
       }
-      let hll = this.hllMap.get(key);
-      if (!hll) {
-        hll = new HyperLogLog();
-        this.hllMap.set(key, hll);
-      }
-      hll.add(String(val));
+      sketch.add(String(val), `${contextTag}.${key}`);
     }
   }
 
-  unindex(): void {
-    // Decrement only (HLL cannot remove but approximation stays valid)
+  unindex(item: Record<string, any>): void {
     if (this.rowCount > 0) this.rowCount--;
+    const keys = Object.keys(item);
+    this.totalColumnCount = Math.max(0, this.totalColumnCount - keys.length);
+    for (const key of keys) {
+      const val = item[key];
+      if (val === null || val === undefined) continue;
+      const sketch = this.sketchMap.get(key);
+      if (sketch) sketch.remove(String(val));
+    }
   }
 
   getStats(): CollectionStats {
     const ndv = new Map<string, number>();
-    for (const [col, hll] of this.hllMap) {
-      ndv.set(col, hll.estimate());
+    for (const [col, sketch] of this.sketchMap) {
+      ndv.set(col, sketch.estimate());
     }
     const avgColumnCount =
       this.rowCount > 0 ? Math.round(this.totalColumnCount / this.rowCount) : 0;
@@ -96,8 +106,8 @@ export class StatsTracker {
 
   getSerializedSketches(): Record<string, string> {
     const sketches: Record<string, string> = {};
-    for (const [col, hll] of this.hllMap) {
-      sketches[col] = hll.serialize();
+    for (const [col, sketch] of this.sketchMap) {
+      sketches[col] = sketch.serialize();
     }
     return sketches;
   }
@@ -105,7 +115,7 @@ export class StatsTracker {
   clear(): void {
     this.rowCount = 0;
     this.totalColumnCount = 0;
-    this.hllMap.clear();
+    this.sketchMap.clear();
   }
 }
 
@@ -254,33 +264,52 @@ export type LuaCollectionQuery = {
  * Compute CollectionStats from a plain JavaScript array.
  * Used by the join planner for inline array/table sources.
  */
-export function computeStatsFromArray(items: any[]): CollectionStats {
+export function computeStatsFromArray(
+  items: any[],
+  sketchConfig?: SketchConfig,
+): CollectionStats {
+  const EXACT_THRESHOLD = 10_000;
   const ndv = new Map<string, number>();
-  const seen = new Map<string, Set<string>>();
   let totalColumnCount = 0;
 
-  for (const item of items) {
-    if (typeof item === "object" && item !== null) {
-      const keys = item instanceof LuaTable ? luaKeys(item) : Object.keys(item);
-      totalColumnCount += keys.length;
-      for (const key of keys) {
-        if (typeof key !== "string") continue;
-        const val = item instanceof LuaTable ? item.rawGet(key) : item[key];
-        if (val === null || val === undefined) {
-          continue;
+  if (items.length <= EXACT_THRESHOLD) {
+    // Exact counting for small arrays
+    const seen = new Map<string, Set<string>>();
+    for (const item of items) {
+      if (typeof item === "object" && item !== null) {
+        const keys = item instanceof LuaTable ? luaKeys(item) : Object.keys(item);
+        totalColumnCount += keys.length;
+        for (const key of keys) {
+          if (typeof key !== "string") continue;
+          const val = item instanceof LuaTable ? item.rawGet(key) : item[key];
+          if (val === null || val === undefined) continue;
+          let s = seen.get(key);
+          if (!s) { s = new Set(); seen.set(key, s); }
+          s.add(String(val));
         }
-        let s = seen.get(key);
-        if (!s) {
-          s = new Set();
-          seen.set(key, s);
-        }
-        s.add(String(val));
       }
     }
+    for (const [k, s] of seen) ndv.set(k, s.size);
+  } else {
+    // Sketch-based for large arrays
+    const sketches = new Map<string, HalfXorSketch>();
+    for (const item of items) {
+      if (typeof item === "object" && item !== null) {
+        const keys = item instanceof LuaTable ? luaKeys(item) : Object.keys(item);
+        totalColumnCount += keys.length;
+        for (const key of keys) {
+          if (typeof key !== "string") continue;
+          const val = item instanceof LuaTable ? item.rawGet(key) : item[key];
+          if (val === null || val === undefined) continue;
+          let sketch = sketches.get(key);
+          if (!sketch) { sketch = new HalfXorSketch(sketchConfig); sketches.set(key, sketch); }
+          sketch.add(String(val));
+        }
+      }
+    }
+    for (const [k, sketch] of sketches) ndv.set(k, sketch.estimate());
   }
-  for (const [k, s] of seen) {
-    ndv.set(k, s.size);
-  }
+
   const avgColumnCount =
     items.length > 0 ? Math.round(totalColumnCount / items.length) : 0;
   return { rowCount: items.length, ndv, avgColumnCount };

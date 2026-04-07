@@ -9,9 +9,9 @@ import {
   StatsTracker,
 } from "../space_lua/query_collection.ts";
 import {
-  type HyperLogLog,
-  deserializeHyperLogLog,
-} from "../space_lua/hll.ts";
+  HalfXorSketch,
+  deserializeNDVSketch,
+} from "../space_lua/half_xor.ts";
 import {
   jsToLuaValue,
   LuaEnv,
@@ -32,11 +32,12 @@ import {
 const indexKey = "idx";
 const pageKey = "ridx";
 const statsKey = "$indexStats";
+const tagSketchKey = "$tagSketch";
 
 const indexVersionKey = ["$indexVersion"];
 
 // Bump this one every time a full reindex is needed
-const desiredIndexVersion = 9;
+const desiredIndexVersion = 10;
 
 type TagDefinition = {
   metatable?: any;
@@ -382,6 +383,10 @@ export class ObjectIndex {
     return [statsKey, "tag", tag];
   }
 
+  private mergedTagSketchKey(tag: string, column: string): KvKey {
+    return [tagSketchKey, tag, column];
+  }
+
   private async getPersistedPageTagStats(
     page: string,
     tag: string,
@@ -442,48 +447,52 @@ export class ObjectIndex {
     await this.ds.set(this.tagStatsKey(tag), stats);
   }
 
-  private mergePageSketches(
-    merged: Map<string, HyperLogLog>,
-    pageStats: PersistedPageTagStats | undefined,
-  ): void {
-    const sketches = pageStats?.ndvSketches ?? {};
-    for (const [col, serialized] of Object.entries(sketches)) {
-      const hll = deserializeHyperLogLog(serialized);
-      const existing = merged.get(col);
+  private async updateTagNdvIncremental(
+    tag: string,
+    oldPageStats: PersistedPageTagStats | undefined,
+    newPageStats: PersistedPageTagStats | undefined,
+  ): Promise<void> {
+    const allColumns = new Set<string>([
+      ...Object.keys(oldPageStats?.ndvSketches ?? {}),
+      ...Object.keys(newPageStats?.ndvSketches ?? {}),
+    ]);
+
+    const ndvResult: Record<string, number> = {};
+
+    for (const col of allColumns) {
+      const key = this.mergedTagSketchKey(tag, col);
+      const existing = await this.ds.get<string>(key);
+      let merged: HalfXorSketch;
+
       if (existing) {
-        existing.merge(hll);
+        merged = deserializeNDVSketch(existing);
       } else {
-        merged.set(col, hll);
+        merged = new HalfXorSketch();
       }
-    }
-  }
 
-  private async recomputePersistedTagNdv(tag: string): Promise<void> {
-    const merged = new Map<string, HyperLogLog>();
-
-    for await (const { key, value } of this.ds.query<PersistedPageTagStats>({
-      prefix: [statsKey, "page"],
-    })) {
-      if (key[3] !== tag) {
-        continue;
+      // Subtract old page contribution
+      const oldSerialized = oldPageStats?.ndvSketches?.[col];
+      if (oldSerialized) {
+        merged.subtract(deserializeNDVSketch(oldSerialized));
       }
-      this.mergePageSketches(merged, value);
+
+      // Add new page contribution
+      const newSerialized = newPageStats?.ndvSketches?.[col];
+      if (newSerialized) {
+        merged.merge(deserializeNDVSketch(newSerialized));
+      }
+
+      await this.ds.set(key, merged.serialize());
+      ndvResult[col] = merged.estimate();
     }
 
+    // Update the tag-level stats NDV
     const current = await this.getPersistedTagStatsRaw(tag);
     await this.setPersistedTagStatsRaw(tag, {
       rowCount: current?.rowCount ?? 0,
       totalColumnCount: current?.totalColumnCount ?? 0,
-      ndv: Object.fromEntries(
-        [...merged.entries()].map(([col, hll]) => [col, hll.estimate()]),
-      ),
+      ndv: ndvResult,
     });
-  }
-
-  private async recomputePersistedTagNdvForTags(tags: Iterable<string>): Promise<void> {
-    for (const tag of tags) {
-      await this.recomputePersistedTagNdv(tag);
-    }
   }
 
   private async adjustPersistedTagTotals(
@@ -521,7 +530,7 @@ export class ObjectIndex {
       }
 
       if (value && typeof value === "object") {
-        tracker.index(value as Record<string, any>);
+        tracker.index(value as Record<string, any>, tag);
       } else {
         tracker.rowCount++;
       }
@@ -592,7 +601,11 @@ export class ObjectIndex {
       await this.setPersistedPageTagStats(page, tag, newVal);
     }
 
-    await this.recomputePersistedTagNdvForTags(allTags);
+    for (const tag of allTags) {
+      const oldVal = oldStats.get(tag);
+      const newVal = newStats.get(tag);
+      await this.updateTagNdvIncremental(tag, oldVal, newVal);
+    }
   }
 
   private async removePageTagStats(page: string): Promise<void> {
@@ -623,7 +636,9 @@ export class ObjectIndex {
       await this.ds.delete(this.pageStatsKey(page, tag));
     }
 
-    await this.recomputePersistedTagNdvForTags(changedTags);
+    for (const { tag, stats } of pageStats) {
+      await this.updateTagNdvIncremental(tag, stats, undefined);
+    }
   }
 
   /**
@@ -658,6 +673,9 @@ export class ObjectIndex {
       allKeys.push(key);
     }
     for await (const { key } of this.ds.query({ prefix: [statsKey] })) {
+      allKeys.push(key);
+    }
+    for await (const { key } of this.ds.query({ prefix: [tagSketchKey] })) {
       allKeys.push(key);
     }
     await this.ds.batchDelete(allKeys);
@@ -843,7 +861,7 @@ export class ObjectIndex {
         newStats.totalColumnCount - oldStats.totalColumnCount,
       );
       await this.setPersistedPageTagStats(page, tag, newStats);
-      await this.recomputePersistedTagNdv(tag);
+      await this.updateTagNdvIncremental(tag, oldStats, newStats);
     }
   }
 
@@ -853,7 +871,7 @@ export class ObjectIndex {
       tracker = new StatsTracker();
       this.tagStats.set(tag, tracker);
     }
-    tracker.index(obj);
+    tracker.index(obj, tag);
   }
 
   getTagStats(tag: string): CollectionStats | undefined {
