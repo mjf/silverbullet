@@ -19,6 +19,7 @@ import type {
 } from "./ast.ts";
 import { evalExpression, luaOp } from "./eval.ts";
 import { HalfXorSketch, type SketchConfig } from "./half_xor.ts";
+import { MCVList, type MCVConfig } from "./mcv.ts";
 import { isSqlNull, LIQ_NULL } from "./liq_null.ts";
 import {
   jsToLuaValue,
@@ -42,6 +43,7 @@ export type CollectionStats = {
   ndv: Map<string, number>;
   avgColumnCount?: number;
   statsSource?: "persisted" | "partial" | "computed" | "recomputed";
+  mcv?: Map<string, MCVList>;
 };
 
 export interface LuaQueryCollection {
@@ -64,10 +66,13 @@ export class StatsTracker {
   rowCount = 0;
   private totalColumnCount = 0;
   private sketchMap = new Map<string, HalfXorSketch>();
+  private mcvMap = new Map<string, MCVList>();
   private sketchConfig: SketchConfig;
+  private mcvConfig: MCVConfig;
 
-  constructor(sketchConfig?: SketchConfig) {
+  constructor(sketchConfig?: SketchConfig, mcvConfig?: MCVConfig) {
     this.sketchConfig = sketchConfig ?? {};
+    this.mcvConfig = mcvConfig ?? {};
   }
 
   index(item: Record<string, any>, contextTag: string = "Unknown"): void {
@@ -77,12 +82,21 @@ export class StatsTracker {
     for (const key of keys) {
       const val = item[key];
       if (val === null || val === undefined) continue;
+      const strVal = String(val);
+
       let sketch = this.sketchMap.get(key);
       if (!sketch) {
         sketch = new HalfXorSketch(this.sketchConfig);
         this.sketchMap.set(key, sketch);
       }
-      sketch.add(String(val), `${contextTag}.${key}`);
+      sketch.add(strVal, `${contextTag}.${key}`);
+
+      let mcv = this.mcvMap.get(key);
+      if (!mcv) {
+        mcv = new MCVList(this.mcvConfig);
+        this.mcvMap.set(key, mcv);
+      }
+      mcv.insert(strVal);
     }
   }
 
@@ -93,8 +107,11 @@ export class StatsTracker {
     for (const key of keys) {
       const val = item[key];
       if (val === null || val === undefined) continue;
+      const strVal = String(val);
       const sketch = this.sketchMap.get(key);
-      if (sketch) sketch.remove(String(val));
+      if (sketch) sketch.remove(strVal);
+      const mcv = this.mcvMap.get(key);
+      if (mcv) mcv.delete(strVal);
     }
   }
 
@@ -103,9 +120,13 @@ export class StatsTracker {
     for (const [col, sketch] of this.sketchMap) {
       ndv.set(col, sketch.estimate());
     }
+    const mcv = new Map<string, MCVList>();
+    for (const [col, m] of this.mcvMap) {
+      mcv.set(col, m);
+    }
     const avgColumnCount =
       this.rowCount > 0 ? Math.round(this.totalColumnCount / this.rowCount) : 0;
-    return { rowCount: this.rowCount, ndv, avgColumnCount };
+    return { rowCount: this.rowCount, ndv, avgColumnCount, mcv };
   }
 
   getSerializedSketches(): Record<string, string> {
@@ -116,10 +137,21 @@ export class StatsTracker {
     return sketches;
   }
 
+  getSerializedMCVs(): Record<string, string> {
+    const mcvs: Record<string, string> = {};
+    for (const [col, mcv] of this.mcvMap) {
+      if (mcv.trackedSize() > 0) {
+        mcvs[col] = mcv.serialize();
+      }
+    }
+    return mcvs;
+  }
+
   clear(): void {
     this.rowCount = 0;
     this.totalColumnCount = 0;
     this.sketchMap.clear();
+    this.mcvMap.clear();
   }
 }
 

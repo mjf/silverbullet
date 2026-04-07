@@ -4,7 +4,7 @@
  * Tracks the top-k most frequent values in a column.
  */
 
-const DEFAULT_MCV_CAPACITY = 32;
+const DEFAULT_MCV_CAPACITY = 128;
 
 export interface MCVConfig {
   capacity?: number;
@@ -159,8 +159,14 @@ export class MCVList {
     return this.getCount(value) / totalRows;
   }
 
-  // Estimate the fraction of left rows that match any right-side key
-  // given the right side MCV list and total row counts
+  /**
+   * Estimate the fraction of left rows that match any right-side key,
+   * given the right side MCV list and total row counts.
+   *
+   * For keys tracked in both MCVs, use exact counts.
+   * For keys tracked only on one side, estimate frequency from the
+   * other side remainder using uniform distribution over untracked keys.
+   */
   static estimateMatchFraction(
     leftMcv: MCVList | undefined,
     rightMcv: MCVList | undefined,
@@ -169,7 +175,7 @@ export class MCVList {
     leftNdv: number,
     rightNdv: number,
   ): { matchedLeftFraction: number; avgRightRowsPerKey: number } {
-    // No MCV available
+    // No MCV available — fall back to uniform
     if (
       !leftMcv ||
       !rightMcv ||
@@ -183,41 +189,60 @@ export class MCVList {
       return { matchedLeftFraction, avgRightRowsPerKey };
     }
 
+    // Average frequency of an untracked value on each side
+    const leftUntrackedNdv = Math.max(1, leftNdv - leftMcv.trackedSize());
+    const leftUntrackedRows = Math.max(0, leftRows - leftMcv.trackedRowCount());
+    const leftAvgPerUntracked =
+      leftUntrackedNdv > 0 ? leftUntrackedRows / leftUntrackedNdv : 0;
+
+    const rightUntrackedNdv = Math.max(1, rightNdv - rightMcv.trackedSize());
+    const rightUntrackedRows = Math.max(
+      0,
+      rightRows - rightMcv.trackedRowCount(),
+    );
+    const rightAvgPerUntracked =
+      rightUntrackedNdv > 0 ? rightUntrackedRows / rightUntrackedNdv : 0;
+
     let matchedLeftRows = 0;
     let matchedOutputRows = 0;
 
+    // Keys tracked on the right side
     for (const rEntry of rightMcv.entries()) {
       const leftCount = leftMcv.getCount(rEntry.value);
       if (leftCount > 0) {
+        // Both sides track this value — use exact counts
         matchedLeftRows += leftCount;
         matchedOutputRows += leftCount * rEntry.count;
+      } else {
+        // Right tracks it, left doesn't — estimate left frequency from remainder
+        matchedLeftRows += leftAvgPerUntracked;
+        matchedOutputRows += leftAvgPerUntracked * rEntry.count;
       }
     }
 
-    const leftUntrackedRows = Math.max(
-      0,
-      leftRows - leftMcv.totalCount() + leftMcv.remainderForEstimation(),
-    );
-    const rightUntrackedNdv = Math.max(0, rightNdv - rightMcv.trackedSize());
-    const leftUntrackedNdv = Math.max(0, leftNdv - leftMcv.trackedSize());
-
-    if (leftUntrackedNdv > 0 && rightUntrackedNdv > 0) {
-      const untrackedMatchFrac = Math.min(
-        1,
-        rightUntrackedNdv / leftUntrackedNdv,
-      );
-      const untrackedRightPerKey =
-        rightRows > 0 && rightNdv > 0
-          ? Math.max(
-              1,
-              (rightRows - rightMcv.trackedRowCount()) /
-                Math.max(1, rightUntrackedNdv),
-            )
-          : 1;
-      matchedLeftRows += leftUntrackedRows * untrackedMatchFrac;
-      matchedOutputRows +=
-        leftUntrackedRows * untrackedMatchFrac * untrackedRightPerKey;
+    // Keys tracked on the left but not on the right — estimate right frequency
+    for (const lEntry of leftMcv.entries()) {
+      const rightCount = rightMcv.getCount(lEntry.value);
+      if (rightCount > 0) {
+        // Already counted above
+        continue;
+      }
+      // Left tracks it, right doesn't — estimate right frequency from remainder
+      // But only if this left key plausibly exists on the right side
+      // Use probability: rightUntrackedNdv / leftUntrackedNdv as match chance
+      const matchProb = Math.min(1, rightUntrackedNdv / leftUntrackedNdv);
+      matchedLeftRows += lEntry.count * matchProb;
+      matchedOutputRows += lEntry.count * matchProb * rightAvgPerUntracked;
     }
+
+    // Remainder-to-remainder: untracked on both sides
+    const remainderMatchFrac = Math.min(
+      1,
+      rightUntrackedNdv / leftUntrackedNdv,
+    );
+    matchedLeftRows += leftUntrackedRows * remainderMatchFrac;
+    matchedOutputRows +=
+      leftUntrackedRows * remainderMatchFrac * rightAvgPerUntracked;
 
     const matchedLeftFraction =
       leftRows > 0 ? Math.min(1, matchedLeftRows / leftRows) : 0;

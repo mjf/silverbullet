@@ -19,6 +19,7 @@ import {
   luaTruthy,
   singleResult,
 } from "./runtime.ts";
+import { MCVList } from "./mcv.ts";
 
 // 1. Types and constants
 
@@ -116,6 +117,7 @@ export type JoinInner = {
   estimatedSelectivity?: number;
   estimatedRows?: number;
   estimatedNdv?: Map<string, Map<string, number>>;
+  estimatedMcv?: Map<string, Map<string, MCVList>>;
 };
 
 // Predicate
@@ -271,6 +273,122 @@ function getNodeNdv(node: JoinNode): Map<string, Map<string, number>> {
     copy.set(src, new Map(colMap));
   }
   return copy;
+}
+
+/**
+ * Extract per-source MCV maps from a join node.
+ */
+function getNodeMcv(
+  node: JoinNode,
+): Map<string, Map<string, MCVList>> | undefined {
+  if (node.kind === "leaf") {
+    if (!node.source.stats?.mcv) return undefined;
+    const result = new Map<string, Map<string, MCVList>>();
+    result.set(node.source.name, node.source.stats.mcv);
+    return result;
+  }
+  return node.estimatedMcv;
+}
+
+/**
+ * Propagate MCV through a join. For inner joins with an equi-pred,
+ * multiply left MCV counts by the right-side fanout for matching keys.
+ * Semi/anti carry only the left side unchanged.
+ */
+function propagateJoinMcv(
+  leftMcv: Map<string, Map<string, MCVList>> | undefined,
+  rightMcv: Map<string, MCVList> | undefined,
+  rightSourceName: string,
+  joinType: JoinType,
+  equiPred?: EquiPredicate,
+): Map<string, Map<string, MCVList>> | undefined {
+  if (!leftMcv && !rightMcv) return undefined;
+
+  const result = new Map<string, Map<string, MCVList>>();
+
+  // Copy left side
+  if (leftMcv) {
+    for (const [src, colMap] of leftMcv) {
+      const newColMap = new Map<string, MCVList>();
+      for (const [col, mcv] of colMap) {
+        // Deep copy via serialize/deserialize so we don't mutate originals
+        newColMap.set(col, MCVList.deserialize(mcv.serialize()));
+      }
+      result.set(src, newColMap);
+    }
+  }
+
+  // For inner joins with equi-pred, build an amplified MCV for the
+  // join key column reflecting post-join row frequencies.
+  // Iterate over BOTH tracked sets to maximize coverage.
+  if (joinType === "inner" && equiPred && leftMcv && rightMcv) {
+    const leftColMcv = result
+      .get(equiPred.leftSource)
+      ?.get(equiPred.leftColumn);
+    const rightColMcv = rightMcv.get(equiPred.rightColumn);
+
+    if (leftColMcv && rightColMcv) {
+      const amplified = new MCVList({ capacity: leftColMcv.capacity });
+
+      // Average count for an untracked value on each side
+      const leftUntrackedNdv = Math.max(
+        1,
+        leftColMcv.totalCount() - leftColMcv.trackedRowCount() > 0
+          ? leftColMcv.totalCount() - leftColMcv.trackedRowCount()
+          : 1,
+      );
+      const leftAvgUntracked =
+        leftColMcv.totalCount() > leftColMcv.trackedRowCount()
+          ? (leftColMcv.totalCount() - leftColMcv.trackedRowCount()) /
+            leftUntrackedNdv
+          : 1;
+
+      const rightUntrackedNdv = Math.max(
+        1,
+        rightColMcv.totalCount() - rightColMcv.trackedRowCount() > 0
+          ? rightColMcv.totalCount() - rightColMcv.trackedRowCount()
+          : 1,
+      );
+      const rightAvgUntracked =
+        rightColMcv.totalCount() > rightColMcv.trackedRowCount()
+          ? (rightColMcv.totalCount() - rightColMcv.trackedRowCount()) /
+            rightUntrackedNdv
+          : 1;
+
+      const seen = new Set<string>();
+
+      // From right MCV: these are the high-fanout keys on the right
+      for (const rEntry of rightColMcv.entries()) {
+        seen.add(rEntry.value);
+        const leftCount = leftColMcv.getCount(rEntry.value);
+        const effectiveLeft = leftCount > 0 ? leftCount : leftAvgUntracked;
+        const product = Math.round(effectiveLeft * rEntry.count);
+        for (let i = 0; i < product; i++) {
+          amplified.insert(rEntry.value);
+        }
+      }
+
+      // From left MCV: keys tracked on left but not right
+      for (const lEntry of leftColMcv.entries()) {
+        if (seen.has(lEntry.value)) continue;
+        const rightCount = rightColMcv.getCount(lEntry.value);
+        const effectiveRight = rightCount > 0 ? rightCount : rightAvgUntracked;
+        const product = Math.round(lEntry.count * effectiveRight);
+        for (let i = 0; i < product; i++) {
+          amplified.insert(lEntry.value);
+        }
+      }
+
+      result.get(equiPred.leftSource)?.set(equiPred.leftColumn, amplified);
+    }
+  }
+
+  // Inner joins carry right side too
+  if (joinType === "inner" && rightMcv) {
+    result.set(rightSourceName, new Map(rightMcv));
+  }
+
+  return result.size > 0 ? result : undefined;
 }
 
 /**
@@ -492,6 +610,7 @@ function estimateJoinWithCandidate(
   joinedNames: Set<string>,
   joinedRows: number,
   joinedNdv: Map<string, Map<string, number>>,
+  joinedMcv: Map<string, Map<string, MCVList>> | undefined,
   candidate: JoinSource,
   equiPreds?: EquiPredicate[],
   rangePreds?: RangePredicate[],
@@ -517,12 +636,7 @@ function estimateJoinWithCandidate(
     const observedRightNdv = candidate.stats?.ndv?.get(equiPred.rightColumn);
 
     // Conservative inferred-NDV fallback when persisted stats are absent.
-    // This preserves monotonicity and gives the planner some fanout signal
-    // during long indexing windows where NDV is not yet available.
     const inferredLeftNdv = Math.max(1, Math.min(joinedRows, candidateRows));
-
-    // Bias missing right-side NDV toward duplicate child rows so inner joins
-    // still get some fanout signal during incomplete indexing/stats windows.
     const inferredRightNdv = Math.max(
       1,
       Math.min(joinedRows, Math.ceil(candidateRows / 2)),
@@ -531,15 +645,51 @@ function estimateJoinWithCandidate(
     const leftNdv = observedLeftNdv ?? inferredLeftNdv;
     const rightNdv = observedRightNdv ?? inferredRightNdv;
 
-    const { baseOutputRows } = estimateJoinKeyFanout(
-      leftNdv,
-      rightNdv,
-      joinedRows,
-      candidateRows,
-      joinType,
-    );
+    // Try MCV-aware estimation first
+    const leftMcv = joinedMcv
+      ?.get(equiPred.leftSource)
+      ?.get(equiPred.leftColumn);
+    const rightMcv = candidate.stats?.mcv?.get(equiPred.rightColumn);
 
-    outputRows = baseOutputRows;
+    if (
+      leftMcv &&
+      rightMcv &&
+      leftMcv.trackedSize() > 0 &&
+      rightMcv.trackedSize() > 0
+    ) {
+      const mcvEst = MCVList.estimateMatchFraction(
+        leftMcv,
+        rightMcv,
+        joinedRows,
+        candidateRows,
+        leftNdv,
+        rightNdv,
+      );
+
+      switch (joinType) {
+        case "inner":
+          outputRows =
+            joinedRows * mcvEst.matchedLeftFraction * mcvEst.avgRightRowsPerKey;
+          break;
+        case "semi":
+          outputRows = joinedRows * mcvEst.matchedLeftFraction;
+          break;
+        case "anti":
+          outputRows = joinedRows * Math.max(0, 1 - mcvEst.matchedLeftFraction);
+          break;
+      }
+    } else {
+      // Fall back to NDV-only estimation
+      const { baseOutputRows } = estimateJoinKeyFanout(
+        leftNdv,
+        rightNdv,
+        joinedRows,
+        candidateRows,
+        joinType,
+      );
+      outputRows = baseOutputRows;
+    }
+
     equiSel = outputRows / Math.max(1, joinedRows * candidateRows);
   } else {
     equiSel = 1 / Math.max(joinedRows, candidateRows, 1);
@@ -598,6 +748,7 @@ export function buildJoinTree(
   let accRows = estimatedRows(ordered[0]);
   let accWidth = estimatedWidth(ordered[0]);
   let accNdv = getNodeNdv(tree);
+  let accMcv = getNodeMcv(tree);
 
   for (let i = 1; i < ordered.length; i++) {
     const right = ordered[i];
@@ -608,6 +759,7 @@ export function buildJoinTree(
       leftNames,
       accRows,
       accNdv,
+      accMcv,
       right,
       equiPreds,
       rangePreds,
@@ -632,6 +784,14 @@ export function buildJoinTree(
       outputRows,
     );
 
+    const joinMcv = propagateJoinMcv(
+      accMcv,
+      right.stats?.mcv,
+      right.name,
+      jt,
+      equiPred,
+    );
+
     tree = {
       kind: "join",
       left: tree,
@@ -642,11 +802,13 @@ export function buildJoinTree(
       estimatedSelectivity: selectivity,
       estimatedRows: outputRows,
       estimatedNdv: joinNdv,
+      estimatedMcv: joinMcv,
     };
 
     accRows = outputRows;
     accWidth += estimatedWidth(right);
     accNdv = joinNdv;
+    accMcv = joinMcv;
   }
 
   return tree;
@@ -691,6 +853,7 @@ function orderSources(
   let joinedRows = estimatedRows(ordered[0]);
   let joinedWidth = estimatedWidth(ordered[0]);
   let joinedNdv = getNodeNdv({ kind: "leaf", source: ordered[0] });
+  let joinedMcv = getNodeMcv({ kind: "leaf", source: ordered[0] });
 
   while (remaining.length > 0) {
     let bestIdx = 0;
@@ -698,6 +861,7 @@ function orderSources(
     let bestOutRows = Infinity;
     let bestCandidateWidth = Infinity;
     let bestNextNdv = joinedNdv;
+    let bestNextMcv = joinedMcv;
 
     for (let i = 0; i < remaining.length; i++) {
       const candidate = remaining[i];
@@ -707,6 +871,7 @@ function orderSources(
         joinedNames,
         joinedRows,
         joinedNdv,
+        joinedMcv,
         candidate,
         equiPreds,
         rangePreds,
@@ -739,6 +904,13 @@ function orderSources(
           equiPred,
           outputRows,
         );
+        bestNextMcv = propagateJoinMcv(
+          joinedMcv,
+          candidate.stats?.mcv,
+          candidate.name,
+          joinType,
+          equiPred,
+        );
       }
     }
 
@@ -748,6 +920,7 @@ function orderSources(
     joinedRows = bestOutRows;
     joinedWidth += estimatedWidth(chosen);
     joinedNdv = bestNextNdv;
+    joinedMcv = bestNextMcv;
   }
 
   return ordered;

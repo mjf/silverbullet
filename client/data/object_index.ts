@@ -8,10 +8,8 @@ import {
   type CollectionStats,
   StatsTracker,
 } from "../space_lua/query_collection.ts";
-import {
-  HalfXorSketch,
-  deserializeNDVSketch,
-} from "../space_lua/half_xor.ts";
+import { HalfXorSketch, deserializeNDVSketch } from "../space_lua/half_xor.ts";
+import { MCVList } from "../space_lua/mcv.ts";
 import {
   jsToLuaValue,
   LuaEnv,
@@ -57,12 +55,14 @@ type PersistedPageTagStats = {
   rowCount: number;
   totalColumnCount: number;
   ndvSketches?: Record<string, string>;
+  mcvSketches?: Record<string, string>;
 };
 
 type PersistedTagStats = {
   rowCount: number;
   totalColumnCount: number;
   ndv?: Record<string, number>;
+  mcv?: Record<string, string>;
 };
 
 export class ObjectValidationError extends Error {
@@ -387,13 +387,19 @@ export class ObjectIndex {
     return [tagSketchKey, tag, column];
   }
 
+  private mergedTagMcvKey(tag: string, column: string): KvKey {
+    return [tagSketchKey, "mcv", tag, column];
+  }
+
   private async getPersistedPageTagStats(
     page: string,
     tag: string,
   ): Promise<PersistedPageTagStats> {
     return (
-      await this.ds.get<PersistedPageTagStats>(this.pageStatsKey(page, tag))
-    ) ?? { rowCount: 0, totalColumnCount: 0, ndvSketches: {} };
+      (await this.ds.get<PersistedPageTagStats>(
+        this.pageStatsKey(page, tag),
+      )) ?? { rowCount: 0, totalColumnCount: 0, ndvSketches: {} }
+    );
   }
 
   private async setPersistedPageTagStats(
@@ -422,17 +428,28 @@ export class ObjectIndex {
         ? Math.round(stored.totalColumnCount / stored.rowCount)
         : 0;
 
+    // Deserialize MCV lists
+    const mcv = new Map<string, MCVList>();
+    if (stored.mcv) {
+      for (const [col, serialized] of Object.entries(stored.mcv)) {
+        mcv.set(col, MCVList.deserialize(serialized));
+      }
+    }
+
     return {
       rowCount: stored.rowCount ?? 0,
       ndv: new Map(Object.entries(stored.ndv ?? {})),
       avgColumnCount,
+      mcv: mcv.size > 0 ? mcv : undefined,
     };
   }
 
   private async getPersistedTagStatsRaw(
     tag: string,
   ): Promise<PersistedTagStats | undefined> {
-    return await this.ds.get<PersistedTagStats>(this.tagStatsKey(tag)) ?? undefined;
+    return (
+      (await this.ds.get<PersistedTagStats>(this.tagStatsKey(tag))) ?? undefined
+    );
   }
 
   private async setPersistedTagStatsRaw(
@@ -447,19 +464,25 @@ export class ObjectIndex {
     await this.ds.set(this.tagStatsKey(tag), stats);
   }
 
+  // Incremental NDV + MCV update: subtract old page, add new one
   private async updateTagNdvIncremental(
     tag: string,
     oldPageStats: PersistedPageTagStats | undefined,
     newPageStats: PersistedPageTagStats | undefined,
   ): Promise<void> {
-    const allColumns = new Set<string>([
+    const allSketchColumns = new Set<string>([
       ...Object.keys(oldPageStats?.ndvSketches ?? {}),
       ...Object.keys(newPageStats?.ndvSketches ?? {}),
+    ]);
+    const allMcvColumns = new Set<string>([
+      ...Object.keys(oldPageStats?.mcvSketches ?? {}),
+      ...Object.keys(newPageStats?.mcvSketches ?? {}),
     ]);
 
     const ndvResult: Record<string, number> = {};
 
-    for (const col of allColumns) {
+    // Update Half-Xor sketches
+    for (const col of allSketchColumns) {
       const key = this.mergedTagSketchKey(tag, col);
       const existing = await this.ds.get<string>(key);
       let merged: HalfXorSketch;
@@ -486,12 +509,42 @@ export class ObjectIndex {
       ndvResult[col] = merged.estimate();
     }
 
-    // Update the tag-level stats NDV
+    // Update MCV lists
+    const mcvResult: Record<string, string> = {};
+    for (const col of allMcvColumns) {
+      const key = this.mergedTagMcvKey(tag, col);
+      const existing = await this.ds.get<string>(key);
+      let merged: MCVList;
+
+      if (existing) {
+        merged = MCVList.deserialize(existing);
+      } else {
+        merged = new MCVList();
+      }
+
+      // Subtract old page contribution
+      const oldMcv = oldPageStats?.mcvSketches?.[col];
+      if (oldMcv) {
+        merged.subtract(MCVList.deserialize(oldMcv));
+      }
+
+      // Add new page contribution
+      const newMcv = newPageStats?.mcvSketches?.[col];
+      if (newMcv) {
+        merged.merge(MCVList.deserialize(newMcv));
+      }
+
+      await this.ds.set(key, merged.serialize());
+      mcvResult[col] = merged.serialize();
+    }
+
+    // Update the tag-level stats
     const current = await this.getPersistedTagStatsRaw(tag);
     await this.setPersistedTagStatsRaw(tag, {
       rowCount: current?.rowCount ?? 0,
       totalColumnCount: current?.totalColumnCount ?? 0,
       ndv: ndvResult,
+      mcv: mcvResult,
     });
   }
 
@@ -546,6 +599,7 @@ export class ObjectIndex {
             ? (computed.avgColumnCount ?? 0) * computed.rowCount
             : 0,
         ndvSketches: tracker.getSerializedSketches(),
+        mcvSketches: tracker.getSerializedMCVs(),
       });
     }
 
@@ -562,17 +616,17 @@ export class ObjectIndex {
       prefix: [statsKey, "page", page],
     })) {
       const tag = key[3] as string;
-      oldStats.set(tag, value ?? {
-        rowCount: 0,
-        totalColumnCount: 0,
-        ndvSketches: {},
-      });
+      oldStats.set(
+        tag,
+        value ?? {
+          rowCount: 0,
+          totalColumnCount: 0,
+          ndvSketches: {},
+        },
+      );
     }
 
-    const allTags = new Set<string>([
-      ...oldStats.keys(),
-      ...newStats.keys(),
-    ]);
+    const allTags = new Set<string>([...oldStats.keys(), ...newStats.keys()]);
 
     for (const tag of allTags) {
       const oldVal = oldStats.get(tag) ?? {
@@ -610,10 +664,7 @@ export class ObjectIndex {
 
   private async removePageTagStats(page: string): Promise<void> {
     const pageStats: Array<{ tag: string; stats: PersistedPageTagStats }> = [];
-    for await (const {
-      key,
-      value,
-    } of this.ds.query<PersistedPageTagStats>({
+    for await (const { key, value } of this.ds.query<PersistedPageTagStats>({
       prefix: [statsKey, "page", page],
     })) {
       pageStats.push({
