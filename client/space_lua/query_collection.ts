@@ -41,6 +41,7 @@ export type CollectionStats = {
   rowCount: number;
   ndv: Map<string, number>;
   avgColumnCount?: number;
+  statsSource?: "persisted" | "partial" | "computed" | "recomputed";
 };
 
 export interface LuaQueryCollection {
@@ -53,7 +54,10 @@ export interface LuaQueryCollection {
 }
 
 export interface LuaQueryCollectionWithStats extends LuaQueryCollection {
-  getStats?(): CollectionStats | Promise<CollectionStats | undefined> | undefined;
+  getStats?():
+    | CollectionStats
+    | Promise<CollectionStats | undefined>
+    | undefined;
 }
 
 export class StatsTracker {
@@ -277,14 +281,18 @@ export function computeStatsFromArray(
     const seen = new Map<string, Set<string>>();
     for (const item of items) {
       if (typeof item === "object" && item !== null) {
-        const keys = item instanceof LuaTable ? luaKeys(item) : Object.keys(item);
+        const keys =
+          item instanceof LuaTable ? luaKeys(item) : Object.keys(item);
         totalColumnCount += keys.length;
         for (const key of keys) {
           if (typeof key !== "string") continue;
           const val = item instanceof LuaTable ? item.rawGet(key) : item[key];
           if (val === null || val === undefined) continue;
           let s = seen.get(key);
-          if (!s) { s = new Set(); seen.set(key, s); }
+          if (!s) {
+            s = new Set();
+            seen.set(key, s);
+          }
           s.add(String(val));
         }
       }
@@ -295,14 +303,18 @@ export function computeStatsFromArray(
     const sketches = new Map<string, HalfXorSketch>();
     for (const item of items) {
       if (typeof item === "object" && item !== null) {
-        const keys = item instanceof LuaTable ? luaKeys(item) : Object.keys(item);
+        const keys =
+          item instanceof LuaTable ? luaKeys(item) : Object.keys(item);
         totalColumnCount += keys.length;
         for (const key of keys) {
           if (typeof key !== "string") continue;
           const val = item instanceof LuaTable ? item.rawGet(key) : item[key];
           if (val === null || val === undefined) continue;
           let sketch = sketches.get(key);
-          if (!sketch) { sketch = new HalfXorSketch(sketchConfig); sketches.set(key, sketch); }
+          if (!sketch) {
+            sketch = new HalfXorSketch(sketchConfig);
+            sketches.set(key, sketch);
+          }
           sketch.add(String(val));
         }
       }
@@ -312,7 +324,13 @@ export function computeStatsFromArray(
 
   const avgColumnCount =
     items.length > 0 ? Math.round(totalColumnCount / items.length) : 0;
-  return { rowCount: items.length, ndv, avgColumnCount };
+
+  return {
+    rowCount: items.length,
+    ndv,
+    avgColumnCount,
+    statsSource: "computed",
+  };
 }
 
 /**

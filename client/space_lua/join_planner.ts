@@ -88,11 +88,14 @@ function getCandidateWidthWeight(config?: JoinPlannerConfig): number {
 
 export type JoinType = "inner" | "semi" | "anti";
 
+export type StatsSource = "persisted" | "partial" | "computed" | "recomputed";
+
 export type JoinSource = {
   name: string;
   expression: LuaExpression;
   hint?: LuaJoinHint;
   stats?: CollectionStats;
+  statsSource?: StatsSource;
   joinType?: JoinType;
 };
 
@@ -177,6 +180,7 @@ export type ExplainNode = {
   sortKeys?: string[];
   limitCount?: number;
   offsetCount?: number;
+  statsSource?: StatsSource;
   children: ExplainNode[];
 };
 
@@ -289,10 +293,7 @@ function getAccumulatedColumnNdv(
  * If NDV is unavailable, fall back conservatively to 1 so we do not invent
  * fanout out of thin air. This keeps the estimator monotone and safe.
  */
-function estimateRowsPerKey(
-  rowCount: number,
-  ndv: number | undefined,
-): number {
+function estimateRowsPerKey(rowCount: number, ndv: number | undefined): number {
   if (ndv === undefined || ndv <= 0) {
     return 1;
   }
@@ -415,7 +416,9 @@ function propagateJoinNdv(
   }
 
   if (equiPred) {
-    const leftColNdv = leftNdv.get(equiPred.leftSource)?.get(equiPred.leftColumn);
+    const leftColNdv = leftNdv
+      .get(equiPred.leftSource)
+      ?.get(equiPred.leftColumn);
     const rightColNdv = rightLeafNdv.get(equiPred.rightColumn);
 
     if (leftColNdv !== undefined || rightColNdv !== undefined) {
@@ -1626,7 +1629,10 @@ function isExplicitlyScopedToSource(
       return expr.name === targetSource;
 
     case "PropertyAccess":
-      if (expr.object.type === "Variable" && sourceNames.has(expr.object.name)) {
+      if (
+        expr.object.type === "Variable" &&
+        sourceNames.has(expr.object.name)
+      ) {
         return expr.object.name === targetSource;
       }
       return isExplicitlyScopedToSource(expr.object, sourceNames, targetSource);
@@ -1661,11 +1667,15 @@ function isExplicitlyScopedToSource(
       return (
         isExplicitlyScopedToSource(expr.prefix, sourceNames, targetSource) &&
         expr.args.every((arg) =>
-          isExplicitlyScopedToSource(arg, sourceNames, targetSource)
+          isExplicitlyScopedToSource(arg, sourceNames, targetSource),
         ) &&
         (!expr.orderBy ||
           expr.orderBy.every((ob) =>
-            isExplicitlyScopedToSource(ob.expression, sourceNames, targetSource)
+            isExplicitlyScopedToSource(
+              ob.expression,
+              sourceNames,
+              targetSource,
+            ),
           ))
       );
 
@@ -1679,7 +1689,7 @@ function isExplicitlyScopedToSource(
       return (
         isExplicitlyScopedToSource(expr.call, sourceNames, targetSource) &&
         expr.orderBy.every((ob) =>
-          isExplicitlyScopedToSource(ob.expression, sourceNames, targetSource)
+          isExplicitlyScopedToSource(ob.expression, sourceNames, targetSource),
         )
       );
 
@@ -1693,11 +1703,7 @@ function isExplicitlyScopedToSource(
                 sourceNames,
                 targetSource,
               ) &&
-              isExplicitlyScopedToSource(
-                field.value,
-                sourceNames,
-                targetSource,
-              )
+              isExplicitlyScopedToSource(field.value, sourceNames, targetSource)
             );
           case "PropField":
           case "ExpressionField":
@@ -1850,6 +1856,7 @@ export function explainJoinTree(
     return {
       nodeType: "Scan",
       source: tree.source.name,
+      statsSource: tree.source.statsSource,
       hintUsed: tree.source.hint
         ? formatHintLabel(tree.source.hint)
         : undefined,
@@ -1863,7 +1870,11 @@ export function explainJoinTree(
   }
 
   const leftPlan = explainJoinTree(tree.left, _opts, pushedFilterExprBySource);
-  const rightPlan = explainJoinTree(tree.right, _opts, pushedFilterExprBySource);
+  const rightPlan = explainJoinTree(
+    tree.right,
+    _opts,
+    pushedFilterExprBySource,
+  );
   const jt = tree.joinType ?? "inner";
 
   const nodeType: ExplainNodeType =
@@ -2634,6 +2645,11 @@ function formatNode(
     lines.push(
       `${detailPad}Rows Removed by Filter: ${node.rowsRemovedByFilter}`,
     );
+  }
+
+  // Stats source (only shown when not persisted — persisted is the normal case)
+  if (node.statsSource && node.statsSource !== "persisted") {
+    lines.push(`${detailPad}Stats Source: ${node.statsSource}`);
   }
 
   // Limit/offset

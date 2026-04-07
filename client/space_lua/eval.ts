@@ -1021,6 +1021,7 @@ function explainSingleSource(
   return {
     nodeType: "Scan",
     source: sourceName,
+    statsSource: stats?.statsSource,
     startupCost: 0,
     estimatedCost: rows,
     estimatedRows: rows,
@@ -1398,9 +1399,11 @@ export function evalExpression(
                 const stats = await val.getStats();
                 if (stats) {
                   src.stats = stats;
+                  src.statsSource = stats.statsSource ?? "persisted";
                 }
               } else if (Array.isArray(val)) {
                 src.stats = computeStatsFromArray(val);
+                src.statsSource = "computed";
               } else if (val instanceof LuaTable) {
                 const len = val.length;
                 if (len > 0) {
@@ -1412,6 +1415,7 @@ export function evalExpression(
                 } else {
                   src.stats = computeStatsFromArray([]);
                 }
+                src.statsSource = "computed";
               }
             }
 
@@ -1474,6 +1478,8 @@ export function evalExpression(
               );
 
               src.stats = computeStatsFromArray(filtered);
+              // Originally persisted, but re-computed after pushed filter
+              src.statsSource = "recomputed";
               materializedOverrides.set(src.name, filtered);
             }
 
@@ -1587,9 +1593,8 @@ export function evalExpression(
                   )
                   .map((s) => [s.name, s.stats]),
               );
-              const joinRootNdv = joinTree.kind === "join"
-                ? joinTree.estimatedNdv
-                : undefined;
+              const joinRootNdv =
+                joinTree.kind === "join" ? joinTree.estimatedNdv : undefined;
               explainPlan = wrapPlanWithQueryOps(
                 explainJoinTree(
                   joinTree,
@@ -1598,7 +1603,7 @@ export function evalExpression(
                 ),
                 explainQuery,
                 explainSourceStats,
-		joinRootNdv,
+                joinRootNdv,
               );
             }
 
