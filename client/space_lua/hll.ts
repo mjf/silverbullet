@@ -23,8 +23,17 @@ function rho(hash: number): number {
 export class HyperLogLog {
   private registers: Uint8Array;
 
-  constructor() {
-    this.registers = new Uint8Array(M);
+  constructor(registers?: Uint8Array) {
+    if (registers) {
+      if (registers.length !== M) {
+        throw new Error(
+          `HyperLogLog register array must have length ${M}, got ${registers.length}`,
+        );
+      }
+      this.registers = new Uint8Array(registers);
+    } else {
+      this.registers = new Uint8Array(M);
+    }
   }
 
   add(value: string): void {
@@ -62,4 +71,34 @@ export class HyperLogLog {
       }
     }
   }
+
+  serialize(): string {
+    let s = "";
+    for (let i = 0; i < M; i++) {
+      s += String.fromCharCode(this.registers[i]);
+    }
+    return btoa(s);
+  }
+
+  static deserialize(serialized: string): HyperLogLog {
+    const raw = atob(serialized);
+    if (raw.length !== M) {
+      throw new Error(
+        `Serialized HyperLogLog must decode to ${M} registers, got ${raw.length}`,
+      );
+    }
+    const registers = new Uint8Array(M);
+    for (let i = 0; i < M; i++) {
+      registers[i] = raw.charCodeAt(i);
+    }
+    return new HyperLogLog(registers);
+  }
+}
+
+export function serializeHyperLogLog(hll: HyperLogLog): string {
+  return hll.serialize();
+}
+
+export function deserializeHyperLogLog(serialized: string): HyperLogLog {
+  return HyperLogLog.deserialize(serialized);
 }

@@ -94,6 +94,14 @@ export class StatsTracker {
     return { rowCount: this.rowCount, ndv, avgColumnCount };
   }
 
+  getSerializedSketches(): Record<string, string> {
+    const sketches: Record<string, string> = {};
+    for (const [col, hll] of this.hllMap) {
+      sketches[col] = hll.serialize();
+    }
+    return sketches;
+  }
+
   clear(): void {
     this.rowCount = 0;
     this.totalColumnCount = 0;

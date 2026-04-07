@@ -9,6 +9,10 @@ import {
   StatsTracker,
 } from "../space_lua/query_collection.ts";
 import {
+  type HyperLogLog,
+  deserializeHyperLogLog,
+} from "../space_lua/hll.ts";
+import {
   jsToLuaValue,
   LuaEnv,
   LuaStackFrame,
@@ -51,6 +55,7 @@ type TagDefinition = {
 type PersistedPageTagStats = {
   rowCount: number;
   totalColumnCount: number;
+  ndvSketches?: Record<string, string>;
 };
 
 type PersistedTagStats = {
@@ -315,6 +320,10 @@ export class ObjectIndex {
     await this.ds.delete(indexVersionKey);
   }
 
+  private normalizePageName(page: string): string {
+    return page.endsWith(".md") ? page.replace(/\.md$/, "") : page;
+  }
+
   cleanKey(ref: string, page: string) {
     if (ref.startsWith(`${page}@`)) {
       return ref.substring(page.length + 1);
@@ -366,15 +375,11 @@ export class ObjectIndex {
   }
 
   private pageStatsKey(page: string, tag: string): KvKey {
-    return [statsKey, "page", page, tag];
+    return [statsKey, "page", this.normalizePageName(page), tag];
   }
 
   private tagStatsKey(tag: string): KvKey {
     return [statsKey, "tag", tag];
-  }
-
-  private countObjectColumns(obj: Record<string, any>): number {
-    return Object.keys(obj).length;
   }
 
   private async getPersistedPageTagStats(
@@ -383,7 +388,7 @@ export class ObjectIndex {
   ): Promise<PersistedPageTagStats> {
     return (
       await this.ds.get<PersistedPageTagStats>(this.pageStatsKey(page, tag))
-    ) ?? { rowCount: 0, totalColumnCount: 0 };
+    ) ?? { rowCount: 0, totalColumnCount: 0, ndvSketches: {} };
   }
 
   private async setPersistedPageTagStats(
@@ -437,6 +442,50 @@ export class ObjectIndex {
     await this.ds.set(this.tagStatsKey(tag), stats);
   }
 
+  private mergePageSketches(
+    merged: Map<string, HyperLogLog>,
+    pageStats: PersistedPageTagStats | undefined,
+  ): void {
+    const sketches = pageStats?.ndvSketches ?? {};
+    for (const [col, serialized] of Object.entries(sketches)) {
+      const hll = deserializeHyperLogLog(serialized);
+      const existing = merged.get(col);
+      if (existing) {
+        existing.merge(hll);
+      } else {
+        merged.set(col, hll);
+      }
+    }
+  }
+
+  private async recomputePersistedTagNdv(tag: string): Promise<void> {
+    const merged = new Map<string, HyperLogLog>();
+
+    for await (const { key, value } of this.ds.query<PersistedPageTagStats>({
+      prefix: [statsKey, "page"],
+    })) {
+      if (key[3] !== tag) {
+        continue;
+      }
+      this.mergePageSketches(merged, value);
+    }
+
+    const current = await this.getPersistedTagStatsRaw(tag);
+    await this.setPersistedTagStatsRaw(tag, {
+      rowCount: current?.rowCount ?? 0,
+      totalColumnCount: current?.totalColumnCount ?? 0,
+      ndv: Object.fromEntries(
+        [...merged.entries()].map(([col, hll]) => [col, hll.estimate()]),
+      ),
+    });
+  }
+
+  private async recomputePersistedTagNdvForTags(tags: Iterable<string>): Promise<void> {
+    for (const tag of tags) {
+      await this.recomputePersistedTagNdv(tag);
+    }
+  }
+
   private async adjustPersistedTagTotals(
     tag: string,
     rowCountDelta: number,
@@ -461,19 +510,36 @@ export class ObjectIndex {
   private computeTagStatsFromKVs<T>(
     kvs: KV<T>[],
   ): Map<string, PersistedPageTagStats> {
-    const stats = new Map<string, PersistedPageTagStats>();
+    const trackers = new Map<string, StatsTracker>();
+
     for (const { key, value } of kvs) {
       const tag = key[0] as string;
-      const prev = stats.get(tag) ?? { rowCount: 0, totalColumnCount: 0 };
-      const columnCount =
-        value && typeof value === "object"
-          ? this.countObjectColumns(value as Record<string, any>)
-          : 0;
+      let tracker = trackers.get(tag);
+      if (!tracker) {
+        tracker = new StatsTracker();
+        trackers.set(tag, tracker);
+      }
+
+      if (value && typeof value === "object") {
+        tracker.index(value as Record<string, any>);
+      } else {
+        tracker.rowCount++;
+      }
+    }
+
+    const stats = new Map<string, PersistedPageTagStats>();
+    for (const [tag, tracker] of trackers) {
+      const computed = tracker.getStats();
       stats.set(tag, {
-        rowCount: prev.rowCount + 1,
-        totalColumnCount: prev.totalColumnCount + columnCount,
+        rowCount: computed.rowCount,
+        totalColumnCount:
+          computed.rowCount > 0
+            ? (computed.avgColumnCount ?? 0) * computed.rowCount
+            : 0,
+        ndvSketches: tracker.getSerializedSketches(),
       });
     }
+
     return stats;
   }
 
@@ -487,7 +553,11 @@ export class ObjectIndex {
       prefix: [statsKey, "page", page],
     })) {
       const tag = key[3] as string;
-      oldStats.set(tag, value ?? { rowCount: 0, totalColumnCount: 0 });
+      oldStats.set(tag, value ?? {
+        rowCount: 0,
+        totalColumnCount: 0,
+        ndvSketches: {},
+      });
     }
 
     const allTags = new Set<string>([
@@ -496,8 +566,16 @@ export class ObjectIndex {
     ]);
 
     for (const tag of allTags) {
-      const oldVal = oldStats.get(tag) ?? { rowCount: 0, totalColumnCount: 0 };
-      const newVal = newStats.get(tag) ?? { rowCount: 0, totalColumnCount: 0 };
+      const oldVal = oldStats.get(tag) ?? {
+        rowCount: 0,
+        totalColumnCount: 0,
+        ndvSketches: {},
+      };
+      const newVal = newStats.get(tag) ?? {
+        rowCount: 0,
+        totalColumnCount: 0,
+        ndvSketches: {},
+      };
 
       const rowCountDelta = newVal.rowCount - oldVal.rowCount;
       const totalColumnCountDelta =
@@ -513,6 +591,8 @@ export class ObjectIndex {
 
       await this.setPersistedPageTagStats(page, tag, newVal);
     }
+
+    await this.recomputePersistedTagNdvForTags(allTags);
   }
 
   private async removePageTagStats(page: string): Promise<void> {
@@ -525,11 +605,14 @@ export class ObjectIndex {
     })) {
       pageStats.push({
         tag: key[3] as string,
-        stats: value ?? { rowCount: 0, totalColumnCount: 0 },
+        stats: value ?? { rowCount: 0, totalColumnCount: 0, ndvSketches: {} },
       });
     }
 
+    const changedTags = new Set<string>();
+
     for (const { tag, stats } of pageStats) {
+      changedTags.add(tag);
       if (stats.rowCount !== 0 || stats.totalColumnCount !== 0) {
         await this.adjustPersistedTagTotals(
           tag,
@@ -539,6 +622,8 @@ export class ObjectIndex {
       }
       await this.ds.delete(this.pageStatsKey(page, tag));
     }
+
+    await this.recomputePersistedTagNdvForTags(changedTags);
   }
 
   /**
@@ -546,18 +631,16 @@ export class ObjectIndex {
    * @param file
    */
   public async clearFileIndex(file: string): Promise<void> {
-    if (file.endsWith(".md")) {
-      file = file.replace(/\.md$/, "");
-    }
-    await this.removePageTagStats(file);
+    const normalizedPage = this.normalizePageName(file);
+    await this.removePageTagStats(normalizedPage);
 
-    // console.log("Clearing index for", file);
+    // console.log("Clearing index for", normalizedPage);
     const allKeys: KvKey[] = [];
     for await (const { key } of this.ds.query({
-      prefix: [pageKey, file],
+      prefix: [pageKey, normalizedPage],
     })) {
       allKeys.push(key);
-      allKeys.push([indexKey, ...key.slice(2), file]);
+      allKeys.push([indexKey, ...key.slice(2), normalizedPage]);
     }
     await this.ds.batchDelete(allKeys);
   }
@@ -745,9 +828,10 @@ export class ObjectIndex {
   async deleteObject(page: string, tag: string, ref: string): Promise<void> {
     await this.batchDelete(page, [[tag, this.cleanKey(ref, page)]]);
     const oldStats = await this.getPersistedPageTagStats(page, tag);
-    const newStats = {
+    const newStats: PersistedPageTagStats = {
       rowCount: Math.max(0, oldStats.rowCount - 1),
       totalColumnCount: oldStats.totalColumnCount,
+      ndvSketches: oldStats.ndvSketches ?? {},
     };
     if (
       newStats.rowCount !== oldStats.rowCount ||
@@ -759,6 +843,7 @@ export class ObjectIndex {
         newStats.totalColumnCount - oldStats.totalColumnCount,
       );
       await this.setPersistedPageTagStats(page, tag, newStats);
+      await this.recomputePersistedTagNdv(tag);
     }
   }
 
