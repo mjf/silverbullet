@@ -21,9 +21,7 @@ import {
 } from "./runtime.ts";
 import { MCVList } from "./mcv.ts";
 
-// 1. Types and constants
-
-// Config
+// 1. Constants
 
 const DEFAULT_WATCHDOG_LIMIT = 5e5;
 const DEFAULT_YIELD_CHUNK = 5000;
@@ -33,6 +31,14 @@ const DEFAULT_RANGE_SELECTIVITY = 0.33;
 const DEFAULT_MERGE_JOIN_THRESHOLD = 200;
 const DEFAULT_WIDTH_WEIGHT = 1;
 const DEFAULT_CANDIDATE_WIDTH_WEIGHT = 2;
+
+/** Fallback row estimate when a source has no stats */
+const DEFAULT_ESTIMATED_ROWS = 100;
+
+/** Fallback average column count when a source has no stats */
+const DEFAULT_ESTIMATED_WIDTH = 5;
+
+// 2. Config types and accessors
 
 export type MaterializedSourceOverrides = Map<string, any[]>;
 
@@ -85,7 +91,7 @@ function getCandidateWidthWeight(config?: JoinPlannerConfig): number {
   );
 }
 
-// Join
+// 3. Join types
 
 export type JoinType = "inner" | "semi" | "anti";
 
@@ -120,7 +126,7 @@ export type JoinInner = {
   estimatedMcv?: Map<string, Map<string, MCVList>>;
 };
 
-// Predicate
+// 4. Predicate types
 
 export type EquiPredicate = {
   leftSource: string;
@@ -137,7 +143,7 @@ export type RangePredicate = {
   rightColumn: string;
 };
 
-// Stats
+// 5. Stats types
 
 export type OpStats = {
   actualRows: number;
@@ -148,7 +154,7 @@ export type OpStats = {
   peakMemoryRows: number;
 };
 
-// Explain
+// 6. Explain types
 
 export type ExplainNodeType =
   | "Scan"
@@ -198,14 +204,14 @@ export type ExplainResult = {
   executionTimeMs?: number;
 };
 
-// 2. Cardinality and selectivity estimation
+// 7. Cardinality and selectivity estimation
 
 function estimatedRows(s: JoinSource): number {
-  return s.stats?.rowCount ?? 100;
+  return s.stats?.rowCount ?? DEFAULT_ESTIMATED_ROWS;
 }
 
 function estimatedWidth(s: JoinSource): number {
-  return s.stats?.avgColumnCount ?? 5;
+  return s.stats?.avgColumnCount ?? DEFAULT_ESTIMATED_WIDTH;
 }
 
 function clampWidth(width: number): number {
@@ -232,14 +238,14 @@ function estimateJoinCardinality(
 }
 
 /**
- * Estimate selectivity for range predicates
+ * Estimate selectivity for range predicates.
+ * Each matching range predicate reduces cardinality by DEFAULT_RANGE_SELECTIVITY.
  */
 function estimateRangeSelectivity(
   rangePredicates: RangePredicate[],
   leftNames: Set<string>,
   rightName: string,
 ): number {
-  // Each range predicate reduces cardinality by DEFAULT_RANGE_SELECTIVITY
   let sel = 1.0;
   for (const rp of rangePredicates) {
     if (
@@ -292,7 +298,8 @@ function getNodeMcv(
 
 /**
  * Propagate MCV through a join. For inner joins with an equi-pred,
- * multiply left MCV counts by the right-side fanout for matching keys.
+ * build an amplified MCV for the join key column reflecting post-join
+ * row frequencies using setDirect for O(k) instead of O(product).
  * Semi/anti carry only the left side unchanged.
  */
 function propagateJoinMcv(
@@ -320,7 +327,6 @@ function propagateJoinMcv(
 
   // For inner joins with equi-pred, build an amplified MCV for the
   // join key column reflecting post-join row frequencies.
-  // Iterate over BOTH tracked sets to maximize coverage.
   if (joinType === "inner" && equiPred && leftMcv && rightMcv) {
     const leftColMcv = result
       .get(equiPred.leftSource)
@@ -331,53 +337,51 @@ function propagateJoinMcv(
       const amplified = new MCVList({ capacity: leftColMcv.capacity });
 
       // Average count for an untracked value on each side
+      const leftTracked = leftColMcv.trackedRowCount();
+      const leftTotal = leftColMcv.totalCount();
       const leftUntrackedNdv = Math.max(
         1,
-        leftColMcv.totalCount() - leftColMcv.trackedRowCount() > 0
-          ? leftColMcv.totalCount() - leftColMcv.trackedRowCount()
-          : 1,
+        leftTotal - leftTracked > 0 ? leftTotal - leftTracked : 1,
       );
       const leftAvgUntracked =
-        leftColMcv.totalCount() > leftColMcv.trackedRowCount()
-          ? (leftColMcv.totalCount() - leftColMcv.trackedRowCount()) /
-            leftUntrackedNdv
+        leftTotal > leftTracked
+          ? (leftTotal - leftTracked) / leftUntrackedNdv
           : 1;
 
+      const rightTracked = rightColMcv.trackedRowCount();
+      const rightTotal = rightColMcv.totalCount();
       const rightUntrackedNdv = Math.max(
         1,
-        rightColMcv.totalCount() - rightColMcv.trackedRowCount() > 0
-          ? rightColMcv.totalCount() - rightColMcv.trackedRowCount()
-          : 1,
+        rightTotal - rightTracked > 0 ? rightTotal - rightTracked : 1,
       );
       const rightAvgUntracked =
-        rightColMcv.totalCount() > rightColMcv.trackedRowCount()
-          ? (rightColMcv.totalCount() - rightColMcv.trackedRowCount()) /
-            rightUntrackedNdv
+        rightTotal > rightTracked
+          ? (rightTotal - rightTracked) / rightUntrackedNdv
           : 1;
 
       const seen = new Set<string>();
 
       // From right MCV: these are the high-fanout keys on the right
-      for (const rEntry of rightColMcv.entries()) {
-        seen.add(rEntry.value);
-        const leftCount = leftColMcv.getCount(rEntry.value);
+      rightColMcv.forEachEntry((value, rCount) => {
+        seen.add(value);
+        const leftCount = leftColMcv.getCount(value);
         const effectiveLeft = leftCount > 0 ? leftCount : leftAvgUntracked;
-        const product = Math.round(effectiveLeft * rEntry.count);
-        for (let i = 0; i < product; i++) {
-          amplified.insert(rEntry.value);
+        const product = Math.round(effectiveLeft * rCount);
+        if (product > 0) {
+          amplified.setDirect(value, product);
         }
-      }
+      });
 
       // From left MCV: keys tracked on left but not right
-      for (const lEntry of leftColMcv.entries()) {
-        if (seen.has(lEntry.value)) continue;
-        const rightCount = rightColMcv.getCount(lEntry.value);
+      leftColMcv.forEachEntry((value, lCount) => {
+        if (seen.has(value)) return;
+        const rightCount = rightColMcv.getCount(value);
         const effectiveRight = rightCount > 0 ? rightCount : rightAvgUntracked;
-        const product = Math.round(lEntry.count * effectiveRight);
-        for (let i = 0; i < product; i++) {
-          amplified.insert(lEntry.value);
+        const product = Math.round(lCount * effectiveRight);
+        if (product > 0) {
+          amplified.setDirect(value, product);
         }
-      }
+      });
 
       result.get(equiPred.leftSource)?.set(equiPred.leftColumn, amplified);
     }
@@ -636,7 +640,9 @@ function estimateJoinWithCandidate(
     const observedRightNdv = candidate.stats?.ndv?.get(equiPred.rightColumn);
 
     // Conservative inferred-NDV fallback when persisted stats are absent.
+    // Assume at most min(leftRows, rightRows) distinct keys on either side.
     const inferredLeftNdv = Math.max(1, Math.min(joinedRows, candidateRows));
+    // Assume about half of right-side rows are distinct (conservative)
     const inferredRightNdv = Math.max(
       1,
       Math.min(joinedRows, Math.ceil(candidateRows / 2)),
@@ -718,7 +724,60 @@ function estimateJoinWithCandidate(
   return { selectivity: combinedSel, equiPred, outputRows };
 }
 
-// 3. Join tree construction
+// 8. Join cost model (shared by planner and EXPLAIN)
+
+type JoinCost = {
+  startupCost: number;
+  totalCost: number;
+};
+
+/**
+ * Compute join startup and total costs for a given physical operator.
+ * Used by both the physical operator selector and EXPLAIN plan builder.
+ */
+function computeJoinCost(
+  method: "hash" | "loop" | "merge",
+  joinType: JoinType,
+  leftCost: number,
+  leftRows: number,
+  leftWidth: number,
+  rightCost: number,
+  rightRows: number,
+  rightWidth: number,
+  config?: JoinPlannerConfig,
+): JoinCost {
+  const ww = getWidthWeight(config);
+  const cww = getCandidateWidthWeight(config);
+  const lw = clampWidth(leftWidth);
+  const rw = clampWidth(rightWidth);
+
+  if (method === "hash") {
+    const startupCost = rightCost + rightRows * cww * rw;
+    const totalCost = startupCost + leftCost + leftRows;
+    return { startupCost, totalCost };
+  }
+
+  if (method === "merge") {
+    const leftSort =
+      leftRows * Math.ceil(Math.log2(Math.max(2, leftRows))) * ww * lw;
+    const rightSort =
+      rightRows * Math.ceil(Math.log2(Math.max(2, rightRows))) * cww * rw;
+    const startupCost = leftCost + rightCost + leftSort + rightSort;
+    const totalCost =
+      startupCost + leftRows * ww * lw + rightRows * cww * rw;
+    return { startupCost, totalCost };
+  }
+
+  // Nested loop
+  const startupCost = leftCost;
+  const discount = joinType === "inner" ? 1.0 : 0.5;
+  const totalCost =
+    leftCost +
+    leftRows * rightRows * discount * (ww * lw + cww * rw);
+  return { startupCost, totalCost };
+}
+
+// 9. Join tree construction
 
 export function buildJoinTree(
   sources: JoinSource[],
@@ -926,14 +985,14 @@ function orderSources(
   return ordered;
 }
 
-// 4. Physical operator selection
+// 10. Physical operator selection
 
 function selectPhysicalOperator(
   leftRowCount: number,
   right: JoinSource,
   joinType: JoinType = "inner",
   hasEquiPred: boolean = false,
-  leftWidth: number = 5,
+  leftWidth: number = DEFAULT_ESTIMATED_WIDTH,
   config?: JoinPlannerConfig,
 ): "hash" | "loop" | "merge" {
   if (right.hint) {
@@ -953,43 +1012,28 @@ function selectPhysicalOperator(
     if (k === "loop") return "loop";
   }
 
-  const rr = right.stats?.rowCount ?? 100;
+  const rr = right.stats?.rowCount ?? DEFAULT_ESTIMATED_ROWS;
   const rw = clampWidth(estimatedWidth(right));
   const lw = clampWidth(leftWidth);
-  const widthWeight = getWidthWeight(config);
-  const candidateWidthWeight = getCandidateWidthWeight(config);
 
   if (rr <= getSmallTableThreshold(config)) return "loop";
 
-  // Width-aware heuristics:
-  // - hash builds/copies the right side, so weight build width
-  // - nested loop copies combined rows, so weight both sides
-  // - merge sorts both sides, so weight both widths
-  const hashCost = rr * candidateWidthWeight * rw + leftRowCount;
-  const discount = joinType === "inner" ? 1.0 : 0.5;
-  const nljCost =
-    leftRowCount *
-    rr *
-    discount *
-    (widthWeight * lw + candidateWidthWeight * rw);
+  // Use the shared cost model
+  const hashCost = computeJoinCost(
+    "hash", joinType, 0, leftRowCount, lw, 0, rr, rw, config,
+  ).totalCost;
+  const nljCost = computeJoinCost(
+    "loop", joinType, 0, leftRowCount, lw, 0, rr, rw, config,
+  ).totalCost;
 
   if (
     hasEquiPred &&
     leftRowCount > getMergeJoinThreshold(config) &&
     rr > getMergeJoinThreshold(config)
   ) {
-    const leftSort =
-      leftRowCount *
-      Math.ceil(Math.log2(Math.max(2, leftRowCount))) *
-      widthWeight *
-      lw;
-    const rightSort =
-      rr * Math.ceil(Math.log2(Math.max(2, rr))) * candidateWidthWeight * rw;
-    const mergeCost =
-      leftSort +
-      rightSort +
-      leftRowCount * widthWeight * lw +
-      rr * candidateWidthWeight * rw;
+    const mergeCost = computeJoinCost(
+      "merge", joinType, 0, leftRowCount, lw, 0, rr, rw, config,
+    ).totalCost;
     if (mergeCost < hashCost && mergeCost < nljCost) {
       return "merge";
     }
@@ -998,7 +1042,7 @@ function selectPhysicalOperator(
   return hashCost < nljCost ? "hash" : "loop";
 }
 
-// 5. Row helpers and materialization
+// 11. Row helpers and materialization
 
 async function cooperativeYield(): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, 0));
@@ -1170,7 +1214,7 @@ function loopPredicateLeftArg(leftNode: JoinNode, row: LuaTable): LuaValue {
   return row;
 }
 
-// 6. Join operators
+// 12. Join operators
 
 // Semi/Anti
 
@@ -1588,7 +1632,7 @@ async function dispatchJoin(
   return crossJoin(leftRows, rightItems, rightName, sf, config);
 }
 
-// 7. Join tree execution
+// 13. Join tree execution
 
 export async function executeJoinTree(
   tree: JoinNode,
@@ -1607,7 +1651,7 @@ export async function executeJoinTree(
   return dispatchJoin(tree, leftRows, rightItems, rightSource, env, sf, config);
 }
 
-// 8. Equi-predicate and range predicate extraction
+// 14. Equi-predicate and range predicate extraction
 
 export function extractEquiPredicates(
   expr: LuaExpression | undefined,
@@ -1718,7 +1762,7 @@ function parseGroupKeySourceColumn(
   return null;
 }
 
-// 9. Single-source filter pushdown
+// 15. Single-source filter pushdown
 
 /**
  * A filter that references exactly one source from the `from` clause.
@@ -1994,7 +2038,7 @@ export async function applyPushedFilters(
   return result;
 }
 
-// 10. Equi-predicate stripping for residual where
+// 16. Equi-predicate stripping for residual where
 
 export function stripUsedJoinPredicates(
   expr: LuaExpression | undefined,
@@ -2014,7 +2058,7 @@ function collectUsedEquiPredsFromJoinTree(node: JoinNode): EquiPredicate[] {
   return result;
 }
 
-// 11. Explain infrastructure
+// 17. Explain infrastructure
 
 // Plan construction
 
@@ -2066,29 +2110,17 @@ export function explainJoinTree(
       DEFAULT_SELECTIVITY,
     );
 
-  let startupCost: number;
-  let totalCost: number;
-  if (tree.method === "hash") {
-    startupCost = rightPlan.estimatedCost + rightPlan.estimatedRows;
-    totalCost = startupCost + leftPlan.estimatedCost + leftPlan.estimatedRows;
-  } else if (tree.method === "merge") {
-    // Sort both sides + linear merge
-    const leftSort =
-      leftPlan.estimatedRows *
-      Math.ceil(Math.log2(Math.max(2, leftPlan.estimatedRows)));
-    const rightSort =
-      rightPlan.estimatedRows *
-      Math.ceil(Math.log2(Math.max(2, rightPlan.estimatedRows)));
-    startupCost =
-      leftPlan.estimatedCost + rightPlan.estimatedCost + leftSort + rightSort;
-    totalCost = startupCost + leftPlan.estimatedRows + rightPlan.estimatedRows;
-  } else {
-    startupCost = leftPlan.startupCost;
-    const discount = jt === "inner" ? 1.0 : 0.5;
-    totalCost =
-      leftPlan.estimatedCost +
-      leftPlan.estimatedRows * rightPlan.estimatedRows * discount;
-  }
+  // Use shared cost model
+  const { startupCost, totalCost } = computeJoinCost(
+    tree.method,
+    jt,
+    leftPlan.estimatedCost,
+    leftPlan.estimatedRows,
+    leftPlan.estimatedWidth,
+    rightPlan.estimatedCost,
+    rightPlan.estimatedRows,
+    rightPlan.estimatedWidth,
+  );
 
   const rightSource =
     tree.right.kind === "leaf" ? tree.right.source : undefined;
@@ -2550,7 +2582,7 @@ function estimateGroupRowsFromNdv(
   return Math.max(1, Math.min(inputRows, Math.round(combinedNdv)));
 }
 
-// Explain analyze execution
+// 18. Explain analyze execution
 
 export async function executeAndInstrument(
   tree: JoinNode,
@@ -2726,7 +2758,7 @@ export async function executeExplainWrappersExact(
   }
 }
 
-// Explain output formatting
+// 19. Explain output formatting
 
 export function formatExplainOutput(
   result: ExplainResult,

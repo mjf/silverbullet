@@ -398,7 +398,12 @@ export class ObjectIndex {
     return (
       (await this.ds.get<PersistedPageTagStats>(
         this.pageStatsKey(page, tag),
-      )) ?? { rowCount: 0, totalColumnCount: 0, ndvSketches: {} }
+      )) ?? {
+        rowCount: 0,
+        totalColumnCount: 0,
+        ndvSketches: {},
+        mcvSketches: {},
+      }
     );
   }
 
@@ -436,10 +441,15 @@ export class ObjectIndex {
       }
     }
 
+    // Determine statsSource: partial if index hasn't completed yet
+    const indexComplete = await this.hasFullIndexCompleted();
+    const statsSource = indexComplete ? "persisted" : "partial";
+
     return {
       rowCount: stored.rowCount ?? 0,
       ndv: new Map(Object.entries(stored.ndv ?? {})),
       avgColumnCount,
+      statsSource,
       mcv: mcv.size > 0 ? mcv : undefined,
     };
   }
@@ -465,10 +475,14 @@ export class ObjectIndex {
   }
 
   // Incremental NDV + MCV update: subtract old page, add new one
-  private async updateTagNdvIncremental(
+  // Also handles rowCount/totalColumnCount deltas to avoid a wasted
+  // intermediate write from adjustPersistedTagTotals.
+  private async updateTagStatsIncremental(
     tag: string,
     oldPageStats: PersistedPageTagStats | undefined,
     newPageStats: PersistedPageTagStats | undefined,
+    rowCountDelta: number,
+    totalColumnCountDelta: number,
   ): Promise<void> {
     const allSketchColumns = new Set<string>([
       ...Object.keys(oldPageStats?.ndvSketches ?? {}),
@@ -538,23 +552,7 @@ export class ObjectIndex {
       mcvResult[col] = merged.serialize();
     }
 
-    // Update the tag-level stats
-    const current = await this.getPersistedTagStatsRaw(tag);
-    await this.setPersistedTagStatsRaw(tag, {
-      rowCount: current?.rowCount ?? 0,
-      totalColumnCount: current?.totalColumnCount ?? 0,
-      ndv: ndvResult,
-      mcv: mcvResult,
-    });
-  }
-
-  private async adjustPersistedTagTotals(
-    tag: string,
-    rowCountDelta: number,
-    totalColumnCountDelta: number,
-  ): Promise<void> {
-    if (rowCountDelta === 0 && totalColumnCountDelta === 0) return;
-
+    // Single write: update rowCount, totalColumnCount, ndv and mcv together
     const current = await this.getPersistedTagStatsRaw(tag);
     const nextRowCount = Math.max(0, (current?.rowCount ?? 0) + rowCountDelta);
     const nextTotalColumnCount = Math.max(
@@ -565,7 +563,8 @@ export class ObjectIndex {
     await this.setPersistedTagStatsRaw(tag, {
       rowCount: nextRowCount,
       totalColumnCount: nextTotalColumnCount,
-      ndv: current?.ndv ?? {},
+      ndv: ndvResult,
+      mcv: mcvResult,
     });
   }
 
@@ -622,6 +621,7 @@ export class ObjectIndex {
           rowCount: 0,
           totalColumnCount: 0,
           ndvSketches: {},
+          mcvSketches: {},
         },
       );
     }
@@ -633,32 +633,29 @@ export class ObjectIndex {
         rowCount: 0,
         totalColumnCount: 0,
         ndvSketches: {},
+        mcvSketches: {},
       };
       const newVal = newStats.get(tag) ?? {
         rowCount: 0,
         totalColumnCount: 0,
         ndvSketches: {},
+        mcvSketches: {},
       };
 
       const rowCountDelta = newVal.rowCount - oldVal.rowCount;
       const totalColumnCountDelta =
         newVal.totalColumnCount - oldVal.totalColumnCount;
 
-      if (rowCountDelta !== 0 || totalColumnCountDelta !== 0) {
-        await this.adjustPersistedTagTotals(
-          tag,
-          rowCountDelta,
-          totalColumnCountDelta,
-        );
-      }
-
       await this.setPersistedPageTagStats(page, tag, newVal);
-    }
 
-    for (const tag of allTags) {
-      const oldVal = oldStats.get(tag);
-      const newVal = newStats.get(tag);
-      await this.updateTagNdvIncremental(tag, oldVal, newVal);
+      // Single combined write for totals + NDV + MCV
+      await this.updateTagStatsIncremental(
+        tag,
+        oldVal,
+        newVal,
+        rowCountDelta,
+        totalColumnCountDelta,
+      );
     }
   }
 
@@ -669,26 +666,26 @@ export class ObjectIndex {
     })) {
       pageStats.push({
         tag: key[3] as string,
-        stats: value ?? { rowCount: 0, totalColumnCount: 0, ndvSketches: {} },
+        stats: value ?? {
+          rowCount: 0,
+          totalColumnCount: 0,
+          ndvSketches: {},
+          mcvSketches: {},
+        },
       });
     }
 
-    const changedTags = new Set<string>();
-
     for (const { tag, stats } of pageStats) {
-      changedTags.add(tag);
-      if (stats.rowCount !== 0 || stats.totalColumnCount !== 0) {
-        await this.adjustPersistedTagTotals(
-          tag,
-          -stats.rowCount,
-          -stats.totalColumnCount,
-        );
-      }
       await this.ds.delete(this.pageStatsKey(page, tag));
-    }
 
-    for (const { tag, stats } of pageStats) {
-      await this.updateTagNdvIncremental(tag, stats, undefined);
+      // Single combined write for totals + NDV + MCV removal
+      await this.updateTagStatsIncremental(
+        tag,
+        stats,
+        undefined,
+        -stats.rowCount,
+        -stats.totalColumnCount,
+      );
     }
   }
 
@@ -894,6 +891,7 @@ export class ObjectIndex {
     return kvs;
   }
 
+  // Finding 2: deleteObject now correctly passes mcvSketches
   async deleteObject(page: string, tag: string, ref: string): Promise<void> {
     await this.batchDelete(page, [[tag, this.cleanKey(ref, page)]]);
     const oldStats = await this.getPersistedPageTagStats(page, tag);
@@ -901,18 +899,22 @@ export class ObjectIndex {
       rowCount: Math.max(0, oldStats.rowCount - 1),
       totalColumnCount: oldStats.totalColumnCount,
       ndvSketches: oldStats.ndvSketches ?? {},
+      mcvSketches: oldStats.mcvSketches ?? {},
     };
-    if (
-      newStats.rowCount !== oldStats.rowCount ||
-      newStats.totalColumnCount !== oldStats.totalColumnCount
-    ) {
-      await this.adjustPersistedTagTotals(
-        tag,
-        newStats.rowCount - oldStats.rowCount,
-        newStats.totalColumnCount - oldStats.totalColumnCount,
-      );
+
+    const rowCountDelta = newStats.rowCount - oldStats.rowCount;
+    const totalColumnCountDelta =
+      newStats.totalColumnCount - oldStats.totalColumnCount;
+
+    if (rowCountDelta !== 0 || totalColumnCountDelta !== 0) {
       await this.setPersistedPageTagStats(page, tag, newStats);
-      await this.updateTagNdvIncremental(tag, oldStats, newStats);
+      await this.updateTagStatsIncremental(
+        tag,
+        oldStats,
+        newStats,
+        rowCountDelta,
+        totalColumnCountDelta,
+      );
     }
   }
 
