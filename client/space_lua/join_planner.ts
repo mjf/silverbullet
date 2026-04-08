@@ -184,7 +184,9 @@ export type ExplainNode = {
   actualStartupTimeMs?: number;
   actualTimeMs?: number;
   memoryRows?: number;
+  hashBuckets?: number;
   rowsRemovedByFilter?: number;
+  rowsRemovedByJoinFilter?: number;
   equiPred?: EquiPredicate;
   filterExpr?: string;
   sortKeys?: string[];
@@ -2678,12 +2680,42 @@ export async function executeAndInstrument(
 
   plan.actualRows = joinResult.length;
   plan.actualLoops = 1;
+
   if (tree.method === "hash") {
     plan.memoryRows = rightItems.length;
+
+    // Count distinct hash buckets by re-hashing the build side
+    if (tree.equiPred) {
+      const ep = normalizeEquiPredicateForJoin(
+        tree.equiPred,
+        tree.left,
+        rightSource,
+      );
+      const seen = new Set<string>();
+      for (const rItem of rightItems) {
+        const val = extractField(rItem, ep.rightColumn);
+        const key = hashJoinKey(val);
+        if (key !== null) seen.add(key);
+      }
+      plan.hashBuckets = seen.size;
+    }
   }
+
   if (tree.method === "loop") {
     plan.children[1].actualLoops = leftRows.length;
   }
+
+  // Rows removed by join filter: cross-product minus output.
+  // For NLJ without equi-pred this is the true predicate-filtered count.
+  // For NLJ with equi-pred it shows how many comparisons were rejected.
+  if (tree.method === "loop") {
+    const crossProduct = leftRows.length * rightItems.length;
+    const removed = crossProduct - joinResult.length;
+    if (removed > 0) {
+      plan.rowsRemovedByJoinFilter = removed;
+    }
+  }
+
   if (opts.analyze && opts.timing) {
     const startupElapsed = Math.round((joinT0 - t0) * 1000) / 1000;
     const totalElapsed = Math.round((performance.now() - t0) * 1000) / 1000;
@@ -2847,7 +2879,7 @@ function formatNode(
   let actBlock = "";
   if (opts.analyze && node.actualRows !== undefined) {
     let timeStr = "";
-    if (opts.analyze && opts.timing && node.actualTimeMs !== undefined) {
+    if (opts.timing && node.actualTimeMs !== undefined) {
       const st = (node.actualStartupTimeMs ?? 0).toFixed(3);
       const tt = node.actualTimeMs.toFixed(3);
       timeStr = ` time=${st}..${tt}`;
@@ -2860,7 +2892,9 @@ function formatNode(
   // Detail lines
   const detailPad = pad + (isRoot ? "  " : "      ");
 
-  // Always shown: join condition, sort/group keys, limit/offset
+  // === Always shown (matches PostgreSQL default output) ===
+
+  // Join condition
   if (node.equiPred) {
     const condLabel =
       node.method === "hash"
@@ -2874,12 +2908,14 @@ function formatNode(
     );
   }
 
+  // Sort / Group keys
   if (node.sortKeys) {
     const keyLabel =
       node.nodeType === "GroupAggregate" ? "Group Key" : "Sort Key";
     lines.push(`${detailPad}${keyLabel}: ${node.sortKeys.join(", ")}`);
   }
 
+  // Limit / Offset
   if (node.limitCount !== undefined) {
     lines.push(`${detailPad}Count: ${node.limitCount}`);
   }
@@ -2887,6 +2923,40 @@ function formatNode(
     lines.push(`${detailPad}Offset: ${node.offsetCount}`);
   }
 
+  // Filter expression and rows removed by filter
+  if (node.filterExpr) {
+    lines.push(`${detailPad}Filter: ${node.filterExpr}`);
+  }
+  if (
+    opts.analyze &&
+    node.rowsRemovedByFilter !== undefined &&
+    node.rowsRemovedByFilter > 0
+  ) {
+    lines.push(
+      `${detailPad}Rows Removed by Filter: ${node.rowsRemovedByFilter}`,
+    );
+  }
+
+  // Rows removed by join filter (NLJ)
+  if (
+    opts.analyze &&
+    node.rowsRemovedByJoinFilter !== undefined &&
+    node.rowsRemovedByJoinFilter > 0
+  ) {
+    lines.push(
+      `${detailPad}Rows Removed by Join Filter: ${node.rowsRemovedByJoinFilter}`,
+    );
+  }
+
+  // Memory and hash buckets
+  if (node.memoryRows !== undefined) {
+    lines.push(`${detailPad}Memory: ${node.memoryRows} rows`);
+  }
+  if (node.hashBuckets !== undefined) {
+    lines.push(`${detailPad}Hash Buckets: ${node.hashBuckets}`);
+  }
+
+  // === Verbose only ===
   if (opts.verbose) {
     if (node.functionCall) {
       lines.push(`${detailPad}Function Call: ${node.functionCall}`);
@@ -2896,26 +2966,8 @@ function formatNode(
       lines.push(`${detailPad}Join Hint: ${node.hintUsed}`);
     }
 
-    if (node.filterExpr) {
-      lines.push(`${detailPad}Filter: ${node.filterExpr}`);
-    }
-
-    if (
-      opts.analyze &&
-      node.rowsRemovedByFilter !== undefined &&
-      node.rowsRemovedByFilter > 0
-    ) {
-      lines.push(
-        `${detailPad}Rows Removed by Filter: ${node.rowsRemovedByFilter}`,
-      );
-    }
-
     if (node.statsSource && node.statsSource !== "persisted") {
       lines.push(`${detailPad}Stats Source: ${node.statsSource}`);
-    }
-
-    if (node.memoryRows !== undefined) {
-      lines.push(`${detailPad}Memory: ${node.memoryRows} rows`);
     }
   }
 
