@@ -1374,6 +1374,8 @@ export function evalExpression(
 
         if (fromSource.kind === "cross") {
           return (async () => {
+            const planT0 = performance.now();
+
             // Check for plan order hint
             const planClause = q.clauses.find(
               (c) => c.type === "PlanOrderBy",
@@ -1609,15 +1611,17 @@ export function evalExpression(
               );
             }
 
+            // Planning ends here — capture boundary before execution
+            const planEndT = performance.now();
+
             if (explainOpts && !explainOpts.analyze) {
               const result: ExplainResult = {
                 plan: explainPlan!,
-                planningTimeMs: 0,
+                planningTimeMs: Math.round((planEndT - planT0) * 1000) / 1000,
               };
               return formatExplainOutput(result, explainOpts);
             }
 
-            // ------
             if (explainOpts?.analyze) {
               const execT0 = performance.now();
               const joinPlan = unwrapToJoinPlan(explainPlan!);
@@ -1632,11 +1636,11 @@ export function evalExpression(
               );
               propagateActuals(explainPlan!, explainOpts);
 
+              const execEndT = performance.now();
               const result: ExplainResult = {
                 plan: explainPlan!,
-                planningTimeMs: 0,
-                executionTimeMs:
-                  Math.round((performance.now() - execT0) * 1000) / 1000,
+                planningTimeMs: Math.round((planEndT - planT0) * 1000) / 1000,
+                executionTimeMs: Math.round((execEndT - execT0) * 1000) / 1000,
               };
               return formatExplainOutput(result, explainOpts);
             }
@@ -1727,6 +1731,8 @@ export function evalExpression(
         const { objectVariable, expression: objectExpression } = fromSource;
         return Promise.resolve(evalExpression(objectExpression, env, sf)).then(
           async (collection: LuaValue) => {
+            const planT0 = performance.now();
+
             if (!collection) {
               throw new LuaRuntimeError("Collection is nil", sf.withCtx(q.ctx));
             }
@@ -1837,10 +1843,13 @@ export function evalExpression(
               );
             }
 
+            // Planning ends here — capture boundary before execution
+            const planEndT = performance.now();
+
             if (explainOpts && !explainOpts.analyze) {
               const result: ExplainResult = {
                 plan: explainPlan!,
-                planningTimeMs: 0,
+                planningTimeMs: Math.round((planEndT - planT0) * 1000) / 1000,
               };
               return formatExplainOutput(result, explainOpts);
             }
@@ -1856,11 +1865,12 @@ export function evalExpression(
                 sf,
                 explainOpts,
               );
+
+              const execEndT = performance.now();
               const result: ExplainResult = {
                 plan: explainPlan!,
-                planningTimeMs: 0,
-                executionTimeMs:
-                  Math.round((performance.now() - execT0) * 1000) / 1000,
+                planningTimeMs: Math.round((planEndT - planT0) * 1000) / 1000,
+                executionTimeMs: Math.round((execEndT - execT0) * 1000) / 1000,
               };
               return formatExplainOutput(result, explainOpts);
             }

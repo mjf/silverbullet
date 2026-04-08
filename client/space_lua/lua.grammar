@@ -119,7 +119,7 @@ ExplainOptionList {
 }
 
 ExplainParenEntry {
-  ExplainOptionName exp?
+  ExplainOptionName ExplainBoolValue?
 }
 
 ExplainOptionName {

@@ -765,8 +765,7 @@ function computeJoinCost(
     const rightSort =
       rightRows * Math.ceil(Math.log2(Math.max(2, rightRows))) * cww * rw;
     const startupCost = leftCost + rightCost + leftSort + rightSort;
-    const totalCost =
-      startupCost + leftRows * ww * lw + rightRows * cww * rw;
+    const totalCost = startupCost + leftRows * ww * lw + rightRows * cww * rw;
     return { startupCost, totalCost };
   }
 
@@ -774,8 +773,7 @@ function computeJoinCost(
   const startupCost = leftCost;
   const discount = joinType === "inner" ? 1.0 : 0.5;
   const totalCost =
-    leftCost +
-    leftRows * rightRows * discount * (ww * lw + cww * rw);
+    leftCost + leftRows * rightRows * discount * (ww * lw + cww * rw);
   return { startupCost, totalCost };
 }
 
@@ -1022,10 +1020,26 @@ function selectPhysicalOperator(
 
   // Use the shared cost model
   const hashCost = computeJoinCost(
-    "hash", joinType, 0, leftRowCount, lw, 0, rr, rw, config,
+    "hash",
+    joinType,
+    0,
+    leftRowCount,
+    lw,
+    0,
+    rr,
+    rw,
+    config,
   ).totalCost;
   const nljCost = computeJoinCost(
-    "loop", joinType, 0, leftRowCount, lw, 0, rr, rw, config,
+    "loop",
+    joinType,
+    0,
+    leftRowCount,
+    lw,
+    0,
+    rr,
+    rw,
+    config,
   ).totalCost;
 
   if (
@@ -1034,7 +1048,15 @@ function selectPhysicalOperator(
     rr > getMergeJoinThreshold(config)
   ) {
     const mergeCost = computeJoinCost(
-      "merge", joinType, 0, leftRowCount, lw, 0, rr, rw, config,
+      "merge",
+      joinType,
+      0,
+      leftRowCount,
+      lw,
+      0,
+      rr,
+      rw,
+      config,
     ).totalCost;
     if (mergeCost < hashCost && mergeCost < nljCost) {
       return "merge";
@@ -2595,14 +2617,14 @@ export async function executeAndInstrument(
   config?: JoinPlannerConfig,
   overrides?: MaterializedSourceOverrides,
 ): Promise<LuaTable[]> {
-  const t0 = opts.timing ? performance.now() : 0;
+  const t0 = opts.analyze && opts.timing ? performance.now() : 0;
 
   if (tree.kind === "leaf") {
     const items = await materializeSource(tree.source, env, sf, overrides);
     const rows = items.map((item) => rowToTable(tree.source.name, item));
     plan.actualRows = rows.length;
     plan.actualLoops = 1;
-    if (opts.timing) {
+    if (opts.analyze && opts.timing) {
       const elapsed = Math.round((performance.now() - t0) * 1000) / 1000;
       plan.actualStartupTimeMs = elapsed;
       plan.actualTimeMs = elapsed;
@@ -2623,11 +2645,11 @@ export async function executeAndInstrument(
 
   // Recurse right (materialize)
   const rightSource = (tree.right as JoinLeaf).source;
-  const rightT0 = opts.timing ? performance.now() : 0;
+  const rightT0 = opts.analyze && opts.timing ? performance.now() : 0;
   const rightItems = await materializeSource(rightSource, env, sf, overrides);
   plan.children[1].actualRows = rightItems.length;
   plan.children[1].actualLoops = 1;
-  if (opts.timing) {
+  if (opts.analyze && opts.timing) {
     const rightElapsed =
       Math.round((performance.now() - rightT0) * 1000) / 1000;
     plan.children[1].actualStartupTimeMs = rightElapsed;
@@ -2635,7 +2657,7 @@ export async function executeAndInstrument(
   }
 
   // Startup time = everything up to this point (child materialization)
-  const joinT0 = opts.timing ? performance.now() : 0;
+  const joinT0 = opts.analyze && opts.timing ? performance.now() : 0;
 
   // Execute join operator
   const joinResult = await dispatchJoin(
@@ -2656,7 +2678,7 @@ export async function executeAndInstrument(
   if (tree.method === "loop") {
     plan.children[1].actualLoops = leftRows.length;
   }
-  if (opts.timing) {
+  if (opts.analyze && opts.timing) {
     const startupElapsed = Math.round((joinT0 - t0) * 1000) / 1000;
     const totalElapsed = Math.round((performance.now() - t0) * 1000) / 1000;
     plan.actualStartupTimeMs = startupElapsed;
@@ -2777,7 +2799,23 @@ export function formatExplainOutput(
       lines.push(`Execution Time: ${result.executionTimeMs.toFixed(3)} ms`);
     }
   }
-  return `\`\`\`\n${lines.join("\n")}\n\`\`\``;
+
+  // Indent all content lines by one space
+  const indented = lines.map((l) => ` ${l}`);
+
+  // Header and separator sized to widest line
+  const maxWidth = Math.max(
+    "QUERY PLAN".length,
+    ...indented.map((l) => l.length),
+  );
+  const header = "QUERY PLAN".padStart(
+    Math.ceil(("QUERY PLAN".length + maxWidth) / 2),
+  );
+  const separator = "-".repeat(maxWidth);
+
+  const rowCount = indented.length;
+
+  return `\`\`\`\n${header}\n${separator}\n${indented.join("\n")}\n(${rowCount} ${rowCount === 1 ? "row" : "rows"})\n\`\`\``;
 }
 
 function formatNode(
@@ -2803,7 +2841,7 @@ function formatNode(
   let actBlock = "";
   if (opts.analyze && node.actualRows !== undefined) {
     let timeStr = "";
-    if (opts.timing && node.actualTimeMs !== undefined) {
+    if (opts.analyze && opts.timing && node.actualTimeMs !== undefined) {
       const st = (node.actualStartupTimeMs ?? 0).toFixed(3);
       const tt = node.actualTimeMs.toFixed(3);
       timeStr = ` time=${st}..${tt}`;
