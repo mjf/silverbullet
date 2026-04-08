@@ -2785,9 +2785,8 @@ function formatNode(
   const label = formatNodeLabel(node);
 
   // Cost block
-  const showCosts = opts.analyze || opts.costs;
   let estBlock = "";
-  if (showCosts) {
+  if (opts.costs) {
     const s = (node.startupCost ?? 0).toFixed(2);
     const t = (node.estimatedCost ?? 0).toFixed(2);
     estBlock = `  (cost=${s}..${t} rows=${node.estimatedRows} width=${node.estimatedWidth})`;

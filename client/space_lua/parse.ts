@@ -1477,9 +1477,10 @@ function parseQueryClause(t: ParseTree, ctx: ASTCtx): LuaQueryClause {
       };
     }
     case "ExplainClause": {
+      const explicit = new Set<string>();
       const options: Record<string, boolean> = {
         analyze: false,
-        costs: false,
+        costs: true,
         timing: false,
       };
 
@@ -1499,6 +1500,7 @@ function parseQueryClause(t: ParseTree, ctx: ASTCtx): LuaQueryClause {
         const name = nameNode?.children?.[0]?.children?.[0]?.text
           ?? nameNode?.children?.[0]?.text;
         if (name && name in options) {
+          explicit.add(name);
           options[name] = valNode ? parseBoolValue(valNode) : true;
         }
       };
@@ -1518,6 +1520,11 @@ function parseQueryClause(t: ParseTree, ctx: ASTCtx): LuaQueryClause {
             processEntry(child);
           }
         }
+      }
+
+      // PostgreSQL default: timing defaults to true when analyze is on
+      if (options.analyze && !explicit.has("timing")) {
+        options.timing = true;
       }
 
       return {
