@@ -35,7 +35,7 @@ const tagSketchKey = "$tagSketch";
 const indexVersionKey = ["$indexVersion"];
 
 // Bump this one every time a full reindex is needed
-const desiredIndexVersion = 10;
+const desiredIndexVersion = 11;
 
 type TagDefinition = {
   metatable?: any;
@@ -454,26 +454,6 @@ export class ObjectIndex {
     };
   }
 
-  private async getPersistedTagStatsRaw(
-    tag: string,
-  ): Promise<PersistedTagStats | undefined> {
-    return (
-      (await this.ds.get<PersistedTagStats>(this.tagStatsKey(tag))) ?? undefined
-    );
-  }
-
-  private async setPersistedTagStatsRaw(
-    tag: string,
-    stats: PersistedTagStats,
-  ): Promise<void> {
-    if (stats.rowCount <= 0) {
-      await this.ds.delete(this.tagStatsKey(tag));
-      return;
-    }
-
-    await this.ds.set(this.tagStatsKey(tag), stats);
-  }
-
   // Incremental NDV + MCV update: subtract old page, add new one
   // Also handles rowCount/totalColumnCount deltas to avoid a wasted
   // intermediate write from adjustPersistedTagTotals.
@@ -493,79 +473,100 @@ export class ObjectIndex {
       ...Object.keys(newPageStats?.mcvSketches ?? {}),
     ]);
 
+    // 1. Collect all keys we need to read
+    const readKeys: KvKey[] = [];
+    const sketchColumns = [...allSketchColumns];
+    const mcvColumns = [...allMcvColumns];
+
+    for (const col of sketchColumns) {
+      readKeys.push(this.mergedTagSketchKey(tag, col));
+    }
+    for (const col of mcvColumns) {
+      readKeys.push(this.mergedTagMcvKey(tag, col));
+    }
+    readKeys.push(this.tagStatsKey(tag));
+
+    // 2. Single batch read
+    const readValues =
+      readKeys.length > 0 ? await this.ds.batchGet(readKeys) : [];
+
+    // 3. Compute all merges in memory
+    let ri = 0;
+    const writes: KV[] = [];
+
     const ndvResult: Record<string, number> = {};
+    for (const col of sketchColumns) {
+      const existing = readValues[ri++] as string | null;
+      const merged = existing
+        ? deserializeNDVSketch(existing)
+        : new HalfXorSketch();
 
-    // Update Half-Xor sketches
-    for (const col of allSketchColumns) {
-      const key = this.mergedTagSketchKey(tag, col);
-      const existing = await this.ds.get<string>(key);
-      let merged: HalfXorSketch;
-
-      if (existing) {
-        merged = deserializeNDVSketch(existing);
-      } else {
-        merged = new HalfXorSketch();
-      }
-
-      // Subtract old page contribution
       const oldSerialized = oldPageStats?.ndvSketches?.[col];
       if (oldSerialized) {
         merged.subtract(deserializeNDVSketch(oldSerialized));
       }
-
-      // Add new page contribution
       const newSerialized = newPageStats?.ndvSketches?.[col];
       if (newSerialized) {
         merged.merge(deserializeNDVSketch(newSerialized));
       }
 
-      await this.ds.set(key, merged.serialize());
+      writes.push({
+        key: this.mergedTagSketchKey(tag, col),
+        value: merged.serialize(),
+      });
       ndvResult[col] = merged.estimate();
     }
 
-    // Update MCV lists
     const mcvResult: Record<string, string> = {};
-    for (const col of allMcvColumns) {
-      const key = this.mergedTagMcvKey(tag, col);
-      const existing = await this.ds.get<string>(key);
-      let merged: MCVList;
+    for (const col of mcvColumns) {
+      const existing = readValues[ri++] as string | null;
+      const merged = existing ? MCVList.deserialize(existing) : new MCVList();
 
-      if (existing) {
-        merged = MCVList.deserialize(existing);
-      } else {
-        merged = new MCVList();
-      }
-
-      // Subtract old page contribution
       const oldMcv = oldPageStats?.mcvSketches?.[col];
       if (oldMcv) {
         merged.subtract(MCVList.deserialize(oldMcv));
       }
-
-      // Add new page contribution
       const newMcv = newPageStats?.mcvSketches?.[col];
       if (newMcv) {
         merged.merge(MCVList.deserialize(newMcv));
       }
 
-      await this.ds.set(key, merged.serialize());
+      writes.push({
+        key: this.mergedTagMcvKey(tag, col),
+        value: merged.serialize(),
+      });
       mcvResult[col] = merged.serialize();
     }
 
-    // Single write: update rowCount, totalColumnCount, ndv and mcv together
-    const current = await this.getPersistedTagStatsRaw(tag);
+    // Tag stats totals
+    const current = readValues[ri] as PersistedTagStats | null;
     const nextRowCount = Math.max(0, (current?.rowCount ?? 0) + rowCountDelta);
     const nextTotalColumnCount = Math.max(
       0,
       (current?.totalColumnCount ?? 0) + totalColumnCountDelta,
     );
 
-    await this.setPersistedTagStatsRaw(tag, {
-      rowCount: nextRowCount,
-      totalColumnCount: nextTotalColumnCount,
-      ndv: ndvResult,
-      mcv: mcvResult,
-    });
+    if (nextRowCount <= 0) {
+      // Tag gone — delete stats key, but still write sketch/mcv updates
+      const deleteKeys = [this.tagStatsKey(tag)];
+      if (writes.length > 0) {
+        await this.ds.batchSet(writes);
+      }
+      await this.ds.batchDelete(deleteKeys);
+    } else {
+      writes.push({
+        key: this.tagStatsKey(tag),
+        value: {
+          rowCount: nextRowCount,
+          totalColumnCount: nextTotalColumnCount,
+          ndv: ndvResult,
+          mcv: mcvResult,
+        } as PersistedTagStats,
+      });
+
+      // 4. Single batch write
+      await this.ds.batchSet(writes);
+    }
   }
 
   private computeTagStatsFromKVs<T>(
@@ -628,6 +629,38 @@ export class ObjectIndex {
 
     const allTags = new Set<string>([...oldStats.keys(), ...newStats.keys()]);
 
+    // Batch all page-tag stats writes
+    const pageStatsWrites: KV[] = [];
+    const pageStatsDeletes: KvKey[] = [];
+
+    for (const tag of allTags) {
+      const newVal = newStats.get(tag) ?? {
+        rowCount: 0,
+        totalColumnCount: 0,
+        ndvSketches: {},
+        mcvSketches: {},
+      };
+
+      if (newVal.rowCount <= 0) {
+        pageStatsDeletes.push(this.pageStatsKey(page, tag));
+      } else {
+        pageStatsWrites.push({
+          key: this.pageStatsKey(page, tag),
+          value: newVal,
+        });
+      }
+    }
+
+    // Single batch for all page-tag stats
+    if (pageStatsWrites.length > 0) {
+      await this.ds.batchSet(pageStatsWrites);
+    }
+    if (pageStatsDeletes.length > 0) {
+      await this.ds.batchDelete(pageStatsDeletes);
+    }
+
+    // Now update merged tag stats — each tag still needs its own
+    // updateTagStatsIncremental call (which is itself now batched internally)
     for (const tag of allTags) {
       const oldVal = oldStats.get(tag) ?? {
         rowCount: 0,
@@ -646,9 +679,6 @@ export class ObjectIndex {
       const totalColumnCountDelta =
         newVal.totalColumnCount - oldVal.totalColumnCount;
 
-      await this.setPersistedPageTagStats(page, tag, newVal);
-
-      // Single combined write for totals + NDV + MCV
       await this.updateTagStatsIncremental(
         tag,
         oldVal,
@@ -675,10 +705,15 @@ export class ObjectIndex {
       });
     }
 
-    for (const { tag, stats } of pageStats) {
-      await this.ds.delete(this.pageStatsKey(page, tag));
+    // Batch delete all page-level stats keys at once
+    if (pageStats.length > 0) {
+      await this.ds.batchDelete(
+        pageStats.map(({ tag }) => this.pageStatsKey(page, tag)),
+      );
+    }
 
-      // Single combined write for totals + NDV + MCV removal
+    // Each tag's merged stats update is internally batched now
+    for (const { tag, stats } of pageStats) {
       await this.updateTagStatsIncremental(
         tag,
         stats,

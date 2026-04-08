@@ -31,7 +31,7 @@ export interface NDVSketch {
   readonly numBuckets: number;
 }
 
-const DEFAULT_NUM_BUCKETS = 128;
+const DEFAULT_NUM_BUCKETS = 512;
 
 export class HalfXorSketch implements NDVSketch {
   private xorMatrix: Uint32Array;
