@@ -107,15 +107,27 @@ QueryClause {
 }
 
 ExplainClause {
-  ckw<"explain"> ckw<"analyze">? ExplainOptionList?
+  ckw<"explain"> ExplainBareEntry* ExplainOptionList?
+}
+
+ExplainBareEntry {
+  ExplainOptionName ExplainBareValue?
 }
 
 ExplainOptionList {
-  "(" list<ExplainOption> ")"
+  "(" list<ExplainParenEntry> ")"
 }
 
-ExplainOption {
-  ckw<"costs"> | ckw<"timing">
+ExplainParenEntry {
+  ExplainOptionName exp?
+}
+
+ExplainOptionName {
+  ckw<"analyze"> | ckw<"costs"> | ckw<"timing">
+}
+
+ExplainBareValue {
+  kw<"true"> | kw<"false"> | Number | Name
 }
 
 FromClause { ckw<"from"> FromFieldList }
@@ -142,9 +154,12 @@ AggOrderBy { ckw<"order"> ckw<"by"> list<OrderBy> }
 UsingClause { kw<"using"> (Name | kw<"function"> FuncBody) }
 
 JoinHint {
-  (ckw<"semi"> | ckw<"anti">)?
-  (ckw<"hash"> | ckw<"merge"> | ckw<"loop"> UsingClause?)
+  JoinType JoinMethod? |
+  JoinMethod JoinType?
 }
+
+JoinType { ckw<"semi"> | ckw<"anti"> }
+JoinMethod { ckw<"hash"> | ckw<"merge"> | ckw<"loop"> UsingClause? }
 
 field[@isGroup=Field] {
   FieldDynamic { "[" exp "]" "=" exp } |
