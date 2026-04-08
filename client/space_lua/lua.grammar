@@ -111,7 +111,7 @@ ExplainClause {
 }
 
 ExplainBareEntry {
-  ExplainOptionName ExplainBareValue?
+  ExplainOptionName ExplainBoolValue?
 }
 
 ExplainOptionList {
@@ -126,8 +126,10 @@ ExplainOptionName {
   ckw<"analyze"> | ckw<"costs"> | ckw<"timing">
 }
 
-ExplainBareValue {
-  kw<"true"> | kw<"false"> | Number | Name
+ExplainBoolValue {
+  kw<"true"> | kw<"false"> | ckw<"on"> | ckw<"off"> |
+  @extend[@name=ExplainOne]<Number, "1"> |
+  @extend[@name=ExplainZero]<Number, "0">
 }
 
 FromClause { ckw<"from"> FromFieldList }

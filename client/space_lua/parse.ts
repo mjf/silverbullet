@@ -1477,13 +1477,36 @@ function parseQueryClause(t: ParseTree, ctx: ASTCtx): LuaQueryClause {
       };
     }
     case "ExplainClause": {
-      let analyze = false;
-      let costs = false;
-      let timing = false;
+      const options: Record<string, boolean> = {
+        analyze: false,
+        costs: false,
+        timing: false,
+      };
+
+      const parseBoolValue = (node: ParseTree): boolean => {
+        const text = node.children?.[0]?.children?.[0]?.text
+          ?? node.children?.[0]?.text;
+        return text !== "false" && text !== "off" && text !== "0";
+      };
+
+      const processEntry = (child: ParseTree) => {
+        const nameNode = child.children?.find(
+          (c) => c.type === "ExplainOptionName",
+        );
+        const valNode = child.children?.find(
+          (c) => c.type === "ExplainBoolValue",
+        );
+        const name = nameNode?.children?.[0]?.children?.[0]?.text
+          ?? nameNode?.children?.[0]?.text;
+        if (name && name in options) {
+          options[name] = valNode ? parseBoolValue(valNode) : true;
+        }
+      };
 
       for (const child of t.children!) {
-        const text = child.children?.[0]?.text ?? child.text;
-        if (text === "analyze") analyze = true;
+        if (child.type === "ExplainBareEntry") {
+          processEntry(child);
+        }
       }
 
       const optList = t.children!.find(
@@ -1491,20 +1514,17 @@ function parseQueryClause(t: ParseTree, ctx: ASTCtx): LuaQueryClause {
       );
       if (optList) {
         for (const child of optList.children!) {
-          if (child.type === "ExplainOption") {
-            const text = child.children?.[0]?.children?.[0]?.text
-              ?? child.children?.[0]?.text;
-            if (text === "costs") costs = true;
-            if (text === "timing") timing = true;
+          if (child.type === "ExplainParenEntry") {
+            processEntry(child);
           }
         }
       }
 
       return {
         type: "Explain",
-        analyze,
-        costs,
-        timing,
+        analyze: options.analyze,
+        costs: options.costs,
+        timing: options.timing,
         ctx: context(t, ctx),
       };
     }
