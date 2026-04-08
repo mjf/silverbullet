@@ -38,7 +38,7 @@ const luaStyleTags = styleTags({
   CompareOp: t.operator,
   "true false": t.bool,
   Comment: t.lineComment,
-  "return break goto do end while repeat until function local if then else elseif in for nil or and not query from where limit offset select order by desc asc nulls first last group having filter using plan semi anti hash loop merge all distinct explain analyze costs timing":
+  "return break goto do end while repeat until function local if then else elseif in for nil or and not query from where limit offset select order by desc asc nulls first last group having filter using plan semi anti hash loop merge all distinct explain analyze costs summary timing verbose":
     t.keyword,
 });
 
@@ -1481,7 +1481,9 @@ function parseQueryClause(t: ParseTree, ctx: ASTCtx): LuaQueryClause {
       const options: Record<string, boolean> = {
         analyze: false,
         costs: true,
+        summary: false,
         timing: false,
+        verbose: false,
       };
 
       const parseBoolValue = (node: ParseTree): boolean => {
@@ -1522,14 +1524,22 @@ function parseQueryClause(t: ParseTree, ctx: ASTCtx): LuaQueryClause {
         }
       }
 
-      // PostgreSQL default: timing defaults to true when analyze is on
+      // Defaults: timing and summary default to true when analyze is on
       if (options.analyze && !explicit.has("timing")) {
         options.timing = true;
+      }
+      if (options.analyze && !explicit.has("summary")) {
+        options.summary = true;
+      }
+      if (!options.analyze && !explicit.has("summary")) {
+        options.summary = false;
       }
 
       return {
         type: "Explain",
         analyze: options.analyze,
+        verbose: options.verbose,
+        summary: options.summary,
         costs: options.costs,
         timing: options.timing,
         ctx: context(t, ctx),

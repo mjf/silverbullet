@@ -1366,7 +1366,9 @@ export function evalExpression(
           ? {
               analyze: explainClause.analyze,
               costs: explainClause.costs,
+              summary: explainClause.summary,
               timing: explainClause.timing,
+              verbose: explainClause.verbose,
             }
           : undefined;
 

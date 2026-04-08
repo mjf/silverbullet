@@ -321,6 +321,8 @@ export type LuaQueryExpression = {
 export type LuaExplainClause = {
   type: "Explain";
   analyze: boolean;
+  verbose: boolean;
+  summary: boolean;
   costs: boolean;
   timing: boolean;
 } & ASTContext;

@@ -194,6 +194,8 @@ export type ExplainNode = {
 
 export type ExplainOptions = {
   analyze: boolean;
+  verbose: boolean;
+  summary: boolean;
   costs: boolean;
   timing: boolean;
 };
@@ -2651,6 +2653,9 @@ export async function executeAndInstrument(
   if (tree.method === "hash") {
     plan.memoryRows = rightItems.length;
   }
+  if (tree.method === "loop") {
+    plan.children[1].actualLoops = leftRows.length;
+  }
   if (opts.timing) {
     const startupElapsed = Math.round((joinT0 - t0) * 1000) / 1000;
     const totalElapsed = Math.round((performance.now() - t0) * 1000) / 1000;
@@ -2766,9 +2771,11 @@ export function formatExplainOutput(
 ): string {
   const lines: string[] = [];
   formatNode(result.plan, opts, 0, lines);
-  lines.push(`Planning Time: ${result.planningTimeMs.toFixed(3)} ms`);
-  if (opts.analyze && result.executionTimeMs !== undefined) {
-    lines.push(`Execution Time: ${result.executionTimeMs.toFixed(3)} ms`);
+  if (opts.summary) {
+    lines.push(`Planning Time: ${result.planningTimeMs.toFixed(3)} ms`);
+    if (opts.analyze && result.executionTimeMs !== undefined) {
+      lines.push(`Execution Time: ${result.executionTimeMs.toFixed(3)} ms`);
+    }
   }
   return `\`\`\`\n${lines.join("\n")}\n\`\`\``;
 }
@@ -2809,7 +2816,7 @@ function formatNode(
   // Detail lines
   const detailPad = pad + (isRoot ? "  " : "      ");
 
-  // Equi-predicate (Hash Cond / Merge Cond / Join Filter)
+  // Always shown: join condition, sort/group keys, limit/offset
   if (node.equiPred) {
     const condLabel =
       node.method === "hash"
@@ -2823,40 +2830,12 @@ function formatNode(
     );
   }
 
-  // Sort/group keys
   if (node.sortKeys) {
     const keyLabel =
       node.nodeType === "GroupAggregate" ? "Group Key" : "Sort Key";
     lines.push(`${detailPad}${keyLabel}: ${node.sortKeys.join(", ")}`);
   }
 
-  // Join hint
-  if (node.hintUsed) {
-    lines.push(`${detailPad}Join Hint: ${node.hintUsed}`);
-  }
-
-  // Filter expression
-  if (node.filterExpr) {
-    lines.push(`${detailPad}Filter: ${node.filterExpr}`);
-  }
-
-  // Rows removed by filter (only available with analyze)
-  if (
-    opts.analyze &&
-    node.rowsRemovedByFilter !== undefined &&
-    node.rowsRemovedByFilter > 0
-  ) {
-    lines.push(
-      `${detailPad}Rows Removed by Filter: ${node.rowsRemovedByFilter}`,
-    );
-  }
-
-  // Stats source (only shown when not persisted — persisted is the normal case)
-  if (node.statsSource && node.statsSource !== "persisted") {
-    lines.push(`${detailPad}Stats Source: ${node.statsSource}`);
-  }
-
-  // Limit/offset
   if (node.limitCount !== undefined) {
     lines.push(`${detailPad}Count: ${node.limitCount}`);
   }
@@ -2864,9 +2843,33 @@ function formatNode(
     lines.push(`${detailPad}Offset: ${node.offsetCount}`);
   }
 
-  // memory usage
-  if (node.memoryRows !== undefined) {
-    lines.push(`${detailPad}Memory: ${node.memoryRows} rows`);
+  // Verbose only: hints, filters, memory, stats source, rows removed
+  if (opts.verbose) {
+    if (node.hintUsed) {
+      lines.push(`${detailPad}Join Hint: ${node.hintUsed}`);
+    }
+
+    if (node.filterExpr) {
+      lines.push(`${detailPad}Filter: ${node.filterExpr}`);
+    }
+
+    if (
+      opts.analyze &&
+      node.rowsRemovedByFilter !== undefined &&
+      node.rowsRemovedByFilter > 0
+    ) {
+      lines.push(
+        `${detailPad}Rows Removed by Filter: ${node.rowsRemovedByFilter}`,
+      );
+    }
+
+    if (node.statsSource && node.statsSource !== "persisted") {
+      lines.push(`${detailPad}Stats Source: ${node.statsSource}`);
+    }
+
+    if (node.memoryRows !== undefined) {
+      lines.push(`${detailPad}Memory: ${node.memoryRows} rows`);
+    }
   }
 
   // Children
