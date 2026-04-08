@@ -1013,14 +1013,17 @@ async function getStatsForValue(
 
 function explainSingleSource(
   sourceName: string,
+  sourceExpression: LuaExpression,
   stats?: CollectionStats,
 ): ExplainNode {
   const rows = stats?.rowCount ?? 100;
   const width = stats?.avgColumnCount ?? 5;
+  const isFnScan = sourceExpression.type === "FunctionCall";
 
   return {
-    nodeType: "Scan",
+    nodeType: isFnScan ? "FunctionScan" : "Scan",
     source: sourceName,
+    functionCall: isFnScan ? exprToString(sourceExpression) : undefined,
     statsSource: stats?.statsSource,
     startupCost: 0,
     estimatedCost: rows,
@@ -1837,7 +1840,7 @@ export function evalExpression(
                 [sourceName, stats],
               ]);
               explainPlan = wrapPlanWithQueryOps(
-                explainSingleSource(sourceName, stats),
+                explainSingleSource(sourceName, objectExpression, stats),
                 explainQuery,
                 explainSourceStats,
               );

@@ -158,6 +158,7 @@ export type OpStats = {
 
 export type ExplainNodeType =
   | "Scan"
+  | "FunctionScan"
   | "Filter"
   | "HashJoin"
   | "NestedLoop"
@@ -171,6 +172,7 @@ export type ExplainNode = {
   nodeType: ExplainNodeType;
   joinType?: JoinType;
   source?: string;
+  functionCall?: string;
   method?: "hash" | "loop" | "merge";
   hintUsed?: string;
   startupCost: number;
@@ -2094,9 +2096,13 @@ export function explainJoinTree(
   if (tree.kind === "leaf") {
     const rows = estimatedRows(tree.source);
     const width = estimatedWidth(tree.source);
+    const isFnScan = tree.source.expression.type === "FunctionCall";
     return {
-      nodeType: "Scan",
+      nodeType: isFnScan ? "FunctionScan" : "Scan",
       source: tree.source.name,
+      functionCall: isFnScan
+        ? exprToString(tree.source.expression)
+        : undefined,
       statsSource: tree.source.statsSource,
       hintUsed: tree.source.hint
         ? formatHintLabel(tree.source.hint)
@@ -2881,8 +2887,11 @@ function formatNode(
     lines.push(`${detailPad}Offset: ${node.offsetCount}`);
   }
 
-  // Verbose only: hints, filters, memory, stats source, rows removed
   if (opts.verbose) {
+    if (node.functionCall) {
+      lines.push(`${detailPad}Function Call: ${node.functionCall}`);
+    }
+
     if (node.hintUsed) {
       lines.push(`${detailPad}Join Hint: ${node.hintUsed}`);
     }
@@ -2920,6 +2929,8 @@ function formatNodeLabel(node: ExplainNode): string {
   switch (node.nodeType) {
     case "Scan":
       return `Scan on ${node.source}`;
+    case "FunctionScan":
+      return `Function Scan on ${node.source}`;
     case "Filter":
       return "Filter";
     case "HashJoin":
