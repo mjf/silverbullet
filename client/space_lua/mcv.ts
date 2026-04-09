@@ -345,4 +345,14 @@ export class MCVList {
 
     return { matchedLeftFraction, avgRightRowsPerKey };
   }
+
+  // Return top-k most common values as strings, sorted by count descending
+  topKeys(k: number): string[] {
+    const entries: { value: string; count: number }[] = [];
+    this.forEachEntry((value, count) => {
+      entries.push({ value, count });
+    });
+    entries.sort((a, b) => b.count - a.count);
+    return entries.slice(0, k).map((e) => e.value);
+  }
 }

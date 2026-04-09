@@ -197,6 +197,8 @@ export type ExplainNode = {
     "half-xor heuristic" |
     "row-count heuristic";
   mcvUsed?: boolean;
+  mcvFallback?: "one-sided" | "no-mcv";
+  mcvKeys?: string[];
   joinKeyNdv?: {
     left: string;
     leftNdv: number;
@@ -558,26 +560,26 @@ function propagateJoinNdv(
       ?.get(equiPred.leftColumn);
     const rightColNdv = rightLeafNdv.get(equiPred.rightColumn);
 
-    if (leftColNdv !== undefined || rightColNdv !== undefined) {
-      const keyNdv = Math.max(
-        1,
-        Math.min(
-          leftColNdv ?? Infinity,
-          rightColNdv ?? Infinity,
-          Math.max(1, joinedRows),
-        ),
-      );
+    // Always compute key NDV — use Infinity for missing sides so
+    // min() collapses to the known side or to joinedRows.
+    const keyNdv = Math.max(
+      1,
+      Math.min(
+        leftColNdv ?? Infinity,
+        rightColNdv ?? Infinity,
+        Math.max(1, joinedRows),
+      ),
+    );
 
-      const leftMap = result.get(equiPred.leftSource);
-      if (leftMap && leftColNdv !== undefined) {
-        leftMap.set(equiPred.leftColumn, keyNdv);
-      }
+    const leftMap = result.get(equiPred.leftSource);
+    if (leftMap) {
+      leftMap.set(equiPred.leftColumn, keyNdv);
+    }
 
-      if (joinType === "inner" && rightColNdv !== undefined) {
-        const rightMap = result.get(rightSourceName);
-        if (rightMap) {
-          rightMap.set(equiPred.rightColumn, keyNdv);
-        }
+    if (joinType === "inner") {
+      const rightMap = result.get(rightSourceName);
+      if (rightMap) {
+        rightMap.set(equiPred.rightColumn, keyNdv);
       }
     }
   }
@@ -855,28 +857,6 @@ export function buildJoinTree(
       equiPred,
       outputRows,
     );
-
-    // After propagateJoinNdv, ensure equi-pred key NDVs are present
-    // even when they were inferred (not from stats).
-    if (equiPred && joinNdv) {
-      const leftMap = joinNdv.get(equiPred.leftSource);
-      if (leftMap && !leftMap.has(equiPred.leftColumn)) {
-        // Inferred: min(leftRows, rightRows)
-        leftMap.set(
-          equiPred.leftColumn,
-          Math.max(1, Math.min(accRows, estimatedRows(right))),
-        );
-      }
-      if (jt === "inner") {
-        const rightMap = joinNdv.get(right.name);
-        if (rightMap && !rightMap.has(equiPred.rightColumn)) {
-          rightMap.set(
-            equiPred.rightColumn,
-            Math.max(1, Math.min(accRows, Math.ceil(estimatedRows(right) / 2))),
-          );
-        }
-      }
-    }
 
     const joinMcv = propagateJoinMcv(
       accMcv,
@@ -2213,6 +2193,8 @@ export function explainJoinTree(
   // Verbose: derive estimation provenance for join key
   let ndvSource: ExplainNode["ndvSource"];
   let mcvUsed = false;
+  let leftHasMcv = false;
+  let rightHasMcv = false;
   let joinKeyNdv: ExplainNode["joinKeyNdv"] | undefined;
 
   if (tree.equiPred) {
@@ -2249,21 +2231,27 @@ export function explainJoinTree(
       ?.get(ep.leftSource)
       ?.get(ep.leftColumn);
     const rightMcv = rightStats?.mcv?.get(ep.rightColumn);
-    mcvUsed = !!(leftMcv && rightMcv);
+    const leftMcvKeys = leftMcv ? leftMcv.topKeys(5) : [];
+    const rightMcvKeys = rightMcv ? rightMcv.topKeys(5) : [];
+    leftHasMcv = leftMcvKeys.length > 0;
+    rightHasMcv = rightMcvKeys.length > 0;
+    mcvUsed = leftHasMcv && rightHasMcv;
 
     // Join key NDVs
     const lNdv = tree.estimatedNdv
       ?.get(ep.leftSource)
       ?.get(ep.leftColumn);
-    const rNdv = rightStats?.ndv?.get(ep.rightColumn);
-    if (lNdv !== undefined || rNdv !== undefined) {
-      joinKeyNdv = {
-        left: `${ep.leftSource}.${ep.leftColumn}`,
-        leftNdv: lNdv ?? -1,
-        right: `${ep.rightSource}.${ep.rightColumn}`,
-        rightNdv: rNdv ?? -1,
-      };
-    }
+    const rNdv = tree.estimatedNdv
+      ?.get(ep.rightSource)
+      ?.get(ep.rightColumn)
+      ?? rightStats?.ndv?.get(ep.rightColumn);
+
+    joinKeyNdv = {
+      left: `${ep.leftSource}.${ep.leftColumn}`,
+      leftNdv: lNdv ?? -1,
+      right: `${ep.rightSource}.${ep.rightColumn}`,
+      rightNdv: rNdv ?? -1,
+    };
   }
 
   return {
@@ -2279,6 +2267,17 @@ export function explainJoinTree(
     selectivity: tree.estimatedSelectivity,
     ndvSource,
     mcvUsed: mcvUsed || undefined,
+    mcvFallback: mcvUsed
+      ? undefined
+      : (leftHasMcv || rightHasMcv)
+        ? "one-sided"
+        : "no-mcv",
+    mcvKeys: (leftHasMcv || rightHasMcv)
+      ? [
+          ...(leftHasMcv ? [`${ep.leftSource}.${ep.leftColumn}: {${leftMcvKeys.join(", ")}}`] : []),
+          ...(rightHasMcv ? [`${ep.rightSource}.${ep.rightColumn}: {${rightMcvKeys.join(", ")}}`] : []),
+        ]
+      : undefined,
     joinKeyNdv,
     children: [leftPlan, rightPlan],
   };
@@ -3087,14 +3086,20 @@ function formatNode(
       const l = node.joinKeyNdv;
       const fmtNdv = (n: number) => (n < 0 ? "n/a" : String(n));
       lines.push(
-        `${detailPad}NDV: ${node.ndvSource}  (keys ${l.left}=${fmtNdv(l.leftNdv)}, ${l.right}=${fmtNdv(l.rightNdv)})`,
+        `${detailPad}NDV: ${node.ndvSource}  (keys ${l.left}=${fmtNdv(l.leftNdv)} ${l.right}=${fmtNdv(l.rightNdv)})`,
       );
     } else if (node.ndvSource) {
       lines.push(`${detailPad}NDV: ${node.ndvSource}`);
     }
 
     if (node.mcvUsed) {
-      lines.push(`${detailPad}MCV: used`);
+      const keyStr = node.mcvKeys ? `  (keys ${node.mcvKeys.join(" ")})` : "";
+      lines.push(`${detailPad}MCV: both sides${keyStr}`);
+    } else if (node.mcvFallback === "one-sided") {
+      const keyStr = node.mcvKeys ? `  (key ${node.mcvKeys.join(" ")})` : "";
+      lines.push(`${detailPad}MCV: single side${keyStr}`);
+    } else if (node.mcvFallback === "no-mcv") {
+      lines.push(`${detailPad}MCV: not available`);
     }
   }
 
