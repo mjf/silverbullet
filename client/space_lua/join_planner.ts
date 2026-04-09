@@ -95,14 +95,11 @@ function getCandidateWidthWeight(config?: JoinPlannerConfig): number {
 
 export type JoinType = "inner" | "semi" | "anti";
 
-export type StatsSource = "persisted" | "partial" | "computed" | "recomputed";
-
 export type JoinSource = {
   name: string;
   expression: LuaExpression;
   hint?: LuaJoinHint;
   stats?: CollectionStats;
-  statsSource?: StatsSource;
   joinType?: JoinType;
 };
 
@@ -192,8 +189,20 @@ export type ExplainNode = {
   sortKeys?: string[];
   limitCount?: number;
   offsetCount?: number;
-  statsSource?: StatsSource;
   children: ExplainNode[];
+  // Verbose: estimation provenance (join nodes only)
+  selectivity?: number;
+  ndvSource?:
+    "roaring-bitmap index" |
+    "half-xor heuristic" |
+    "row-count heuristic";
+  mcvUsed?: boolean;
+  joinKeyNdv?: {
+    left: string;
+    leftNdv: number;
+    right: string;
+    rightNdv: number;
+  };
 };
 
 export type ExplainOptions = {
@@ -846,6 +855,28 @@ export function buildJoinTree(
       equiPred,
       outputRows,
     );
+
+    // After propagateJoinNdv, ensure equi-pred key NDVs are present
+    // even when they were inferred (not from stats).
+    if (equiPred && joinNdv) {
+      const leftMap = joinNdv.get(equiPred.leftSource);
+      if (leftMap && !leftMap.has(equiPred.leftColumn)) {
+        // Inferred: min(leftRows, rightRows)
+        leftMap.set(
+          equiPred.leftColumn,
+          Math.max(1, Math.min(accRows, estimatedRows(right))),
+        );
+      }
+      if (jt === "inner") {
+        const rightMap = joinNdv.get(right.name);
+        if (rightMap && !rightMap.has(equiPred.rightColumn)) {
+          rightMap.set(
+            equiPred.rightColumn,
+            Math.max(1, Math.min(accRows, Math.ceil(estimatedRows(right) / 2))),
+          );
+        }
+      }
+    }
 
     const joinMcv = propagateJoinMcv(
       accMcv,
@@ -2088,6 +2119,24 @@ function collectUsedEquiPredsFromJoinTree(node: JoinNode): EquiPredicate[] {
 
 // 17. Explain infrastructure
 
+// Helpers
+
+/**
+ * Walk the join tree to find a leaf source by name.
+ */
+function findLeafSource(
+  node: JoinNode,
+  sourceName: string,
+): JoinSource | undefined {
+  if (node.kind === "leaf") {
+    return node.source.name === sourceName ? node.source : undefined;
+  }
+  return (
+    findLeafSource(node.left, sourceName) ??
+    findLeafSource(node.right, sourceName)
+  );
+}
+
 // Plan construction
 
 export function explainJoinTree(
@@ -2105,7 +2154,6 @@ export function explainJoinTree(
       functionCall: isFnScan
         ? exprToString(tree.source.expression)
         : undefined,
-      statsSource: tree.source.statsSource,
       hintUsed: tree.source.hint
         ? formatHintLabel(tree.source.hint)
         : undefined,
@@ -2162,6 +2210,62 @@ export function explainJoinTree(
 
   const width = leftPlan.estimatedWidth + rightPlan.estimatedWidth;
 
+  // Verbose: derive estimation provenance for join key
+  let ndvSource: ExplainNode["ndvSource"];
+  let mcvUsed = false;
+  let joinKeyNdv: ExplainNode["joinKeyNdv"] | undefined;
+
+  if (tree.equiPred) {
+    const ep = tree.equiPred;
+
+    const leftLeafSource = findLeafSource(tree.left, ep.leftSource);
+    const rightStats = rightSource?.stats;
+
+    const hasObservedLeftNdv = tree.estimatedNdv
+      ?.get(ep.leftSource)
+      ?.has(ep.leftColumn);
+    const hasObservedRightNdv = rightStats?.ndv?.has(ep.rightColumn);
+
+    if (hasObservedLeftNdv || hasObservedRightNdv) {
+      const leftSS = leftLeafSource?.stats?.statsSource;
+      const rightSS = rightStats?.statsSource;
+      const anyPersisted = leftSS === "persisted" || rightSS === "persisted";
+      const anySketch =
+        leftSS === "computed" ||
+        rightSS === "computed" ||
+        leftSS === "recomputed" ||
+        rightSS === "recomputed";
+      ndvSource = anyPersisted
+        ? "roaring-bitmap index"
+        : anySketch
+          ? "half-xor heuristic"
+          : "row-count heuristic";
+    } else {
+      ndvSource = "row-count heuristic";
+    }
+
+    // Was MCV used?
+    const leftMcv = tree.estimatedMcv
+      ?.get(ep.leftSource)
+      ?.get(ep.leftColumn);
+    const rightMcv = rightStats?.mcv?.get(ep.rightColumn);
+    mcvUsed = !!(leftMcv && rightMcv);
+
+    // Join key NDVs
+    const lNdv = tree.estimatedNdv
+      ?.get(ep.leftSource)
+      ?.get(ep.leftColumn);
+    const rNdv = rightStats?.ndv?.get(ep.rightColumn);
+    if (lNdv !== undefined || rNdv !== undefined) {
+      joinKeyNdv = {
+        left: `${ep.leftSource}.${ep.leftColumn}`,
+        leftNdv: lNdv ?? -1,
+        right: `${ep.rightSource}.${ep.rightColumn}`,
+        rightNdv: rNdv ?? -1,
+      };
+    }
+  }
+
   return {
     nodeType,
     joinType: jt,
@@ -2172,6 +2276,10 @@ export function explainJoinTree(
     estimatedCost: Math.round(totalCost),
     estimatedRows: Math.max(1, Math.round(estRows)),
     estimatedWidth: width,
+    selectivity: tree.estimatedSelectivity,
+    ndvSource,
+    mcvUsed: mcvUsed || undefined,
+    joinKeyNdv,
     children: [leftPlan, rightPlan],
   };
 }
@@ -2841,10 +2949,10 @@ export function formatExplainOutput(
   // Indent all content lines by one space
   const indented = lines.map((l) => ` ${l}`);
 
-  // Header and separator sized to widest line
-  const maxWidth = Math.max(
-    "QUERY PLAN".length,
-    ...indented.map((l) => l.length),
+  // Header and separator sized to widest line, capped
+  const maxWidth = Math.min(
+    120,
+    Math.max("QUERY PLAN".length, ...indented.map((l) => l.length)),
   );
   const header = "QUERY PLAN".padStart(
     Math.ceil(("QUERY PLAN".length + maxWidth) / 2),
@@ -2966,8 +3074,27 @@ function formatNode(
       lines.push(`${detailPad}Join Hint: ${node.hintUsed}`);
     }
 
-    if (node.statsSource && node.statsSource !== "persisted") {
-      lines.push(`${detailPad}Stats Source: ${node.statsSource}`);
+    if (node.selectivity !== undefined) {
+      const sel = node.selectivity;
+      const formatted =
+        sel >= 0.01
+          ? sel.toFixed(4).replace(/0+$/, "").replace(/\.$/, ".0")
+          : sel.toPrecision(3);
+      lines.push(`${detailPad}Selectivity: ${formatted}`);
+    }
+
+    if (node.ndvSource && node.joinKeyNdv) {
+      const l = node.joinKeyNdv;
+      const fmtNdv = (n: number) => (n < 0 ? "n/a" : String(n));
+      lines.push(
+        `${detailPad}NDV: ${node.ndvSource}  (keys ${l.left}=${fmtNdv(l.leftNdv)}, ${l.right}=${fmtNdv(l.rightNdv)})`,
+      );
+    } else if (node.ndvSource) {
+      lines.push(`${detailPad}NDV: ${node.ndvSource}`);
+    }
+
+    if (node.mcvUsed) {
+      lines.push(`${detailPad}MCV: used`);
     }
   }
 

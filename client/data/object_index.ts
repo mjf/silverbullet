@@ -30,6 +30,9 @@ import {
   type BitmapIndexConfig,
   type EncodedObject,
 } from "./bitmap/bitmap_index.ts";
+import {
+  MCVList,
+} from "../space_lua/mcv.ts";
 
 // KV key prefixes
 const indexKey = "idx";
@@ -156,16 +159,30 @@ export class ObjectIndex {
         const rowCount = self.bitmapIndex.getRowCount(tagId);
         const meta = self.bitmapIndex.getTagMetaById(tagId);
         const ndv = new Map<string, number>();
+        const mcv = new Map<string, MCVList>();
+
         if (meta) {
           for (const [col, colMeta] of Object.entries(meta.columns)) {
             ndv.set(col, colMeta.ndv);
+
+            // Build MCVList from exact bitmap cardinalities
+            const topValues = self.bitmapIndex.getColumnMCV(tagId, col);
+            if (topValues.length > 0) {
+              const list = new MCVList();
+              for (const { value, count } of topValues) {
+                list.setDirect(value, count);
+              }
+              mcv.set(col, list);
+            }
           }
         }
+
         const indexComplete = await self.hasFullIndexCompleted();
         return {
           rowCount,
           ndv,
           avgColumnCount: ndv.size,
+          mcv: mcv.size > 0 ? mcv : undefined,
           statsSource: indexComplete ? "persisted" : "partial",
         };
       },

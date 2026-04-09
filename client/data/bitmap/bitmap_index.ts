@@ -433,6 +433,35 @@ export class BitmapIndex {
   }
 
   /**
+   * Compute Most Common Values for a column from bitmap cardinalities.
+   * Returns the top-k (value, count) pairs sorted by count descending.
+   * Exact — no sketches needed.
+   */
+  getColumnMCV(
+    tagId: number,
+    column: string,
+    topK: number = 10,
+  ): { value: string; count: number }[] {
+    const prefix = `${tagId}\0${column}\0`;
+    const entries: { valueId: number; count: number }[] = [];
+
+    for (const [cacheKey, bm] of this.bitmapCache) {
+      if (!cacheKey.startsWith(prefix) || bm.isEmpty()) continue;
+      const valueId = parseInt(cacheKey.substring(prefix.length), 10);
+      entries.push({ valueId, count: bm.cardinality() });
+    }
+
+    // Sort descending by count, take top-k
+    entries.sort((a, b) => b.count - a.count);
+    const topEntries = entries.slice(0, topK);
+
+    return topEntries.map(({ valueId, count }) => ({
+      value: String(this.dict.decodeValue(valueId) ?? valueId),
+      count,
+    }));
+  }
+
+  /**
    * Get row count for a tag.
    */
   getRowCount(tagId: number): number {
