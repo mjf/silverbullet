@@ -1,0 +1,295 @@
+/**
+ * Bitmap Predicate Analyzer for SilverBullet.
+ *
+ * Performs STATIC analysis of Lua WHERE expressions (no evaluation) to
+ * extract simple equality predicates resolvable by bitmap index lookup.
+ *
+ * The result is a set of candidate object IDs that MIGHT match.
+ * The full Lua WHERE expression is ALWAYS evaluated afterwards — bitmaps
+ * only narrow the KV scan, they never replace Lua evaluation.
+ *
+ * This follows the same pattern as:
+ *   - extractEquiPredicates() in join_planner.ts (AST walk, no eval)
+ *   - evalExpressionWithAggregates() in query_collection.ts (AST-aware
+ *     interception that falls through to evalExpression for non-aggregate nodes)
+ *
+ * Supported patterns (conjuncts of AND chains):
+ *   - column == literal     → single bitmap lookup
+ *   - literal == column     → (reversed operands)
+ *   - column ~= literal     → all-column-bitmaps MINUS literal's bitmap
+ *
+ * OR branches and complex expressions are left to Lua evaluation.
+ * The analyzer is conservative: when in doubt, it does NOT filter.
+ */
+
+import type {
+  LuaExpression,
+  LuaBinaryExpression,
+  LuaPropertyAccessExpression,
+  LuaVariable,
+} from "../../space_lua/ast.ts";
+import { RoaringBitmap } from "./roaring_bitmap.ts";
+import type { BitmapIndex } from "./bitmap_index.ts";
+
+/**
+ * Result of bitmap predicate analysis.
+ * The bitmap is a pre-filter: superset of true matches.
+ */
+export type BitmapPrefilterResult = {
+  /** Object IDs that might match (superset of true results). */
+  candidateIds: RoaringBitmap;
+  /** Columns resolved via bitmap (for EXPLAIN). */
+  resolvedColumns: string[];
+};
+
+/**
+ * Analyze a WHERE expression to extract a bitmap pre-filter.
+ *
+ * Returns null if no predicates could be resolved (caller does full scan).
+ * When non-null, caller should:
+ *   1. Fetch only objects whose IDs are in candidateIds
+ *   2. STILL evaluate the full WHERE expression on each fetched object
+ *
+ * @param expr - The WHERE clause AST
+ * @param tagId - Numeric tag ID for bitmap lookups
+ * @param objectVariable - The query's object variable (e.g. "i" in `from i = ...`)
+ * @param bitmapIndex - The bitmap index instance
+ */
+export function analyzeBitmapPrefilter(
+  expr: LuaExpression,
+  tagId: number,
+  objectVariable: string | undefined,
+  bitmapIndex: BitmapIndex,
+): BitmapPrefilterResult | null {
+  const ctx: AnalysisContext = {
+    tagId,
+    objectVariable,
+    bitmapIndex,
+    resolvedColumns: [],
+  };
+
+  // Flatten the AND chain (like join_planner's flattenAnd)
+  const conjuncts = flattenAnd(expr);
+
+  // Try to resolve each conjunct independently.
+  // For AND semantics: intersect all resolved bitmaps.
+  // Unresolvable conjuncts are ignored (Lua eval handles them).
+  let result: RoaringBitmap | null = null;
+
+  for (const conjunct of conjuncts) {
+    const bitmap = resolveConjunct(conjunct, ctx);
+    if (bitmap) {
+      if (result === null) {
+        result = bitmap;
+      } else {
+        result = RoaringBitmap.and(result, bitmap);
+      }
+    }
+  }
+
+  if (result === null) return null;
+
+  return {
+    candidateIds: result,
+    resolvedColumns: ctx.resolvedColumns,
+  };
+}
+
+// --- Internal ---
+
+type AnalysisContext = {
+  tagId: number;
+  objectVariable: string | undefined;
+  bitmapIndex: BitmapIndex;
+  resolvedColumns: string[];
+};
+
+/**
+ * Flatten `and` chains into individual conjuncts.
+ * Mirrors join_planner.ts:flattenAnd exactly.
+ */
+function flattenAnd(expr: LuaExpression): LuaExpression[] {
+  if (expr.type === "Binary" && expr.operator === "and") {
+    const bin = expr as LuaBinaryExpression;
+    return [...flattenAnd(bin.left), ...flattenAnd(bin.right)];
+  }
+  // Unwrap parenthesized
+  if (expr.type === "Parenthesized") {
+    return flattenAnd((expr as { expression: LuaExpression }).expression);
+  }
+  return [expr];
+}
+
+/**
+ * Try to resolve a single conjunct to a bitmap.
+ * Only handles simple equality/inequality against literals.
+ */
+function resolveConjunct(
+  expr: LuaExpression,
+  ctx: AnalysisContext,
+): RoaringBitmap | null {
+  if (expr.type !== "Binary") return null;
+  const bin = expr as LuaBinaryExpression;
+
+  if (bin.operator === "==") {
+    return resolveEquality(bin, ctx);
+  }
+
+  if (bin.operator === "~=") {
+    return resolveInequality(bin, ctx);
+  }
+
+  // Other operators (>, <, >=, <=, ..) → can't resolve via equality bitmaps
+  return null;
+}
+
+/**
+ * column == literal → lookup the bitmap for that value
+ */
+function resolveEquality(
+  expr: LuaBinaryExpression,
+  ctx: AnalysisContext,
+): RoaringBitmap | null {
+  const pair =
+    extractColumnAndLiteral(expr.left, expr.right, ctx) ??
+    extractColumnAndLiteral(expr.right, expr.left, ctx);
+
+  if (!pair) return null;
+
+  const { column, value } = pair;
+  const dict = ctx.bitmapIndex.getDictionary();
+  const valueId = dict.tryEncode(value);
+
+  if (valueId === undefined) {
+    // Value not in dictionary → no objects can match
+    ctx.resolvedColumns.push(column);
+    return new RoaringBitmap();
+  }
+
+  const bitmap = ctx.bitmapIndex.getBitmap(ctx.tagId, column, valueId);
+  if (!bitmap) {
+    ctx.resolvedColumns.push(column);
+    return new RoaringBitmap();
+  }
+
+  ctx.resolvedColumns.push(column);
+  return bitmap; // Caller will clone if needed
+}
+
+/**
+ * column ~= literal → all objects with this column MINUS objects with this value.
+ *
+ * Conservative: we return ALL column bitmaps unioned, minus the literal's bitmap.
+ * This is a superset (objects without the column at all are excluded, but that's
+ * still safe since Lua eval handles the full semantics).
+ */
+function resolveInequality(
+  expr: LuaBinaryExpression,
+  ctx: AnalysisContext,
+): RoaringBitmap | null {
+  const pair =
+    extractColumnAndLiteral(expr.left, expr.right, ctx) ??
+    extractColumnAndLiteral(expr.right, expr.left, ctx);
+
+  if (!pair) return null;
+
+  const { column, value } = pair;
+  const allBitmaps = ctx.bitmapIndex.getColumnBitmaps(ctx.tagId, column);
+  if (!allBitmaps || allBitmaps.length === 0) return null;
+
+  // Union all value bitmaps for this column
+  let allObjects = allBitmaps[0].clone();
+  for (let i = 1; i < allBitmaps.length; i++) {
+    allObjects = RoaringBitmap.or(allObjects, allBitmaps[i]);
+  }
+
+  const dict = ctx.bitmapIndex.getDictionary();
+  const valueId = dict.tryEncode(value);
+  if (valueId === undefined) {
+    // Value not in dictionary → nothing to exclude
+    ctx.resolvedColumns.push(column);
+    return allObjects;
+  }
+
+  const valueBitmap = ctx.bitmapIndex.getBitmap(ctx.tagId, column, valueId);
+  if (!valueBitmap) {
+    ctx.resolvedColumns.push(column);
+    return allObjects;
+  }
+
+  ctx.resolvedColumns.push(column);
+  return RoaringBitmap.andNot(allObjects, valueBitmap);
+}
+
+// --- AST pattern matching (no evaluation) ---
+
+type ColumnLiteralPair = {
+  column: string;
+  value: unknown;
+};
+
+function extractColumnAndLiteral(
+  colExpr: LuaExpression,
+  valExpr: LuaExpression,
+  ctx: AnalysisContext,
+): ColumnLiteralPair | null {
+  const column = extractColumnName(colExpr, ctx);
+  if (!column) return null;
+
+  const value = extractLiteral(valExpr);
+  if (value === undefined) return null;
+
+  return { column, value };
+}
+
+/**
+ * Extract column name from AST node.
+ * Matches patterns used in join_planner.ts:parseSourceColumn.
+ *
+ * - PropertyAccess: `i.page` → "page" (when i == objectVariable)
+ * - Variable: `page` → "page" (when no objectVariable, i.e. unqualified query)
+ */
+function extractColumnName(
+  expr: LuaExpression,
+  ctx: AnalysisContext,
+): string | null {
+  if (expr.type === "PropertyAccess") {
+    const pa = expr as LuaPropertyAccessExpression;
+    if (pa.object.type === "Variable") {
+      const varName = (pa.object as LuaVariable).name;
+      if (ctx.objectVariable && varName === ctx.objectVariable) {
+        return pa.property;
+      }
+    }
+    return null;
+  }
+
+  if (expr.type === "Variable") {
+    // Bare variable → column only when no objectVariable (unqualified access)
+    if (!ctx.objectVariable) {
+      return (expr as LuaVariable).name;
+    }
+    return null;
+  }
+
+  return null;
+}
+
+/**
+ * Extract a literal JS value from an AST node.
+ * No evaluation — only recognizes constant literals.
+ */
+function extractLiteral(expr: LuaExpression): unknown | undefined {
+  switch (expr.type) {
+    case "String":
+      return (expr as { value: string }).value;
+    case "Number":
+      return (expr as { value: number }).value;
+    case "Boolean":
+      return (expr as { value: boolean }).value;
+    case "Nil":
+      return null;
+    default:
+      return undefined; // Not a literal → skip
+  }
+}

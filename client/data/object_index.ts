@@ -2,20 +2,19 @@ import type { ObjectValue } from "@silverbulletmd/silverbullet/type/index";
 import type { Config } from "../config.ts";
 import {
   ArrayQueryCollection,
+  applyQuery,
   type LuaCollectionQuery,
   type LuaQueryCollection,
   type LuaQueryCollectionWithStats,
   type CollectionStats,
-  StatsTracker,
 } from "../space_lua/query_collection.ts";
-import { HalfXorSketch, deserializeNDVSketch } from "../space_lua/half_xor.ts";
-import { MCVList } from "../space_lua/mcv.ts";
 import {
   jsToLuaValue,
   LuaEnv,
   LuaStackFrame,
   LuaTable,
 } from "../space_lua/runtime.ts";
+import { parseExpressionString } from "../space_lua/parse.ts";
 import type { DataStore } from "./datastore.ts";
 import type { KV, KvKey } from "@silverbulletmd/silverbullet/type/datastore";
 import type { EventHook } from "../plugos/hooks/event.ts";
@@ -26,16 +25,20 @@ import {
   getAggregateSpec,
   getBuiltinAggregateEntries,
 } from "../space_lua/aggregates.ts";
+import {
+  BitmapIndex,
+  type BitmapIndexConfig,
+  type EncodedObject,
+} from "./bitmap/bitmap_index.ts";
 
+// KV key prefixes
 const indexKey = "idx";
-const pageKey = "ridx";
-const statsKey = "$indexStats";
-const tagSketchKey = "$tagSketch";
+const reverseKey = "ridx";
 
 const indexVersionKey = ["$indexVersion"];
 
-// Bump this one every time a full reindex is needed
-const desiredIndexVersion = 11;
+// Bump this every time a full reindex is needed
+const desiredIndexVersion = 12;
 
 type TagDefinition = {
   metatable?: any;
@@ -51,20 +54,6 @@ type TagDefinition = {
     | null;
 };
 
-type PersistedPageTagStats = {
-  rowCount: number;
-  totalColumnCount: number;
-  ndvSketches?: Record<string, string>;
-  mcvSketches?: Record<string, string>;
-};
-
-type PersistedTagStats = {
-  rowCount: number;
-  totalColumnCount: number;
-  ndv?: Record<string, number>;
-  mcv?: Record<string, string>;
-};
-
 export class ObjectValidationError extends Error {
   constructor(
     message: string,
@@ -75,22 +64,22 @@ export class ObjectValidationError extends Error {
 }
 
 export class ObjectIndex {
+  private bitmapIndex: BitmapIndex;
+
   constructor(
     private ds: DataStore,
     private config: Config,
     private eventHook: EventHook,
     private mq: DataStoreMQ,
-    private tagStats = new Map<string, StatsTracker>(),
+    bitmapConfig?: Partial<BitmapIndexConfig>,
   ) {
+    this.bitmapIndex = new BitmapIndex(bitmapConfig);
+
     // Clear any entries for deleted files
     this.eventHook.addLocalListener("file:deleted", (path: string) => {
       return this.clearFileIndex(path);
     });
 
-    // Tracks if the file:listed event has been triggered,
-    // which is fired after all file:changed events have been dispatched
-    // resulting in new index entries (if any) being queued in the index queue
-    // this is later used to track if the index is complete
     let indexStarted = false;
     this.eventHook.addLocalListener("file:listed", () => {
       indexStarted = true;
@@ -101,17 +90,13 @@ export class ObjectIndex {
       if (!hasCompleted) {
         const emptyQueueHandler = async () => {
           console.log("Index queue empty, checking if index is complete");
-          // Theoretically we could get empty queue notifications before the file:listed event has been triggered, so let's account for this
           if (indexStarted) {
-            // Indexing has just finished for the first time for this client
             console.info("Initial index complete, reloading editor state");
             await this.markFullIndexComplete();
-            // Unsubscribe yourself
             this.eventHook.removeLocalListener(
               "mq:emptyQueue:indexQueue",
               emptyQueueHandler,
             );
-            // Trigger an editor:reloadState event to reload the editor state (render widgets etc.)
             void this.eventHook.dispatchEvent("editor:reloadState");
           }
         };
@@ -123,6 +108,21 @@ export class ObjectIndex {
     });
   }
 
+  // --- Enricher: applies metatables to query results ---
+
+  private enrichValue(tagName: string, value: any): any {
+    const mt = this.config.get<LuaTable | undefined>(
+      ["tags", tagName, "metatable"],
+      undefined,
+    );
+    if (!mt) return value;
+    value = jsToLuaValue(value);
+    value.metatable = mt;
+    return value;
+  }
+
+  // --- Query collections ---
+
   tag(tagName: string): LuaQueryCollectionWithStats {
     if (!tagName) {
       throw new Error("Tag name is required");
@@ -131,64 +131,105 @@ export class ObjectIndex {
     const self = this;
 
     return {
-      query: (
+      async query(
         query: LuaCollectionQuery,
         env: LuaEnv,
         sf: LuaStackFrame,
         config?: Config,
-      ): Promise<any[]> => {
-        return self.ds.luaQuery(
-          [indexKey, tagName],
-          query,
-          env,
-          sf,
-          (key, value: any) => {
-            const tag = key[1];
-            const mt = self.config.get<LuaTable | undefined>(
-              ["tags", tag, "metatable"],
-              undefined,
-            );
-            if (!mt) {
-              // Return as is
-              return value;
-            }
-            // Convert to LuaTable
-            value = jsToLuaValue(value);
-            value.metatable = mt;
-            return value;
-          },
-          config,
-        );
+      ): Promise<any[]> {
+        // Load all objects for this tag via KV prefix scan, decode, enrich
+        const results: any[] = [];
+        for await (const { value } of self.ds.query({
+          prefix: [indexKey, tagName],
+        })) {
+          const decoded = self.bitmapIndex.decodeObject(value as EncodedObject);
+          results.push(self.enrichValue(tagName, decoded));
+        }
+        return applyQuery(results, query, env, sf, config);
       },
 
       async getStats(): Promise<CollectionStats> {
-        const persisted = await self.getPersistedTagStats(tagName);
-        if (persisted) {
-          return persisted;
+        const tagId = self.bitmapIndex.getDictionary().tryEncode(tagName);
+        if (tagId === undefined) {
+          return { rowCount: 0, ndv: new Map(), avgColumnCount: 0 };
         }
+        const rowCount = self.bitmapIndex.getRowCount(tagId);
+        const meta = self.bitmapIndex.getTagMetaById(tagId);
+        const ndv = new Map<string, number>();
+        if (meta) {
+          for (const [col, colMeta] of Object.entries(meta.columns)) {
+            ndv.set(col, colMeta.ndv);
+          }
+        }
+        const indexComplete = await self.hasFullIndexCompleted();
         return {
-          rowCount: 0,
-          ndv: new Map(),
-          avgColumnCount: 0,
+          rowCount,
+          ndv,
+          avgColumnCount: ndv.size,
+          statsSource: indexComplete ? "persisted" : "partial",
         };
       },
     };
   }
 
+  contentPages(): LuaQueryCollection {
+    return this.filteredTag(
+      "page",
+      (varName) =>
+        `not table.find(${varName}.tags, function(tag) return tag == "meta" or string.startsWith(tag, "meta/") end)`,
+    );
+  }
+
+  metaPages(): LuaQueryCollection {
+    return this.filteredTag(
+      "page",
+      (varName) =>
+        `table.find(${varName}.tags, function(tag) return tag == "meta" or string.startsWith(tag, "meta/") end)`,
+    );
+  }
+
+  private filteredTag(
+    tagName: string,
+    buildFilterExpr: (varName: string) => string,
+  ): LuaQueryCollection {
+    const self = this;
+    return {
+      async query(
+        query: LuaCollectionQuery,
+        env: LuaEnv,
+        sf: LuaStackFrame,
+        config?: Config,
+      ): Promise<any[]> {
+        const varName = query.objectVariable || "_";
+        const filter = parseExpressionString(buildFilterExpr(varName));
+        const where = query.where
+          ? {
+              type: "Binary" as const,
+              operator: "and",
+              left: filter,
+              right: query.where,
+              ctx: {},
+            }
+          : filter;
+
+        const results: any[] = [];
+        for await (const { value } of self.ds.query({
+          prefix: [indexKey, tagName],
+        })) {
+          const decoded = self.bitmapIndex.decodeObject(value as EncodedObject);
+          results.push(self.enrichValue(tagName, decoded));
+        }
+        return applyQuery(results, { ...query, where }, env, sf, config);
+      },
+    };
+  }
+
   /**
-   * Returns a queryable collection of all aggregate functions:
-   *
-   * - builtin,
-   * - user-defined, and
-   * - aliases.
-   *
-   * Every row has all columns: `builtin`, `name`, `description`,
-   * `initialize`, `iterate`, `finish` and `target`.
+   * Returns a queryable collection of all aggregate functions.
    */
   aggregates(): LuaQueryCollection {
     const entries: Record<string, any>[] = [];
 
-    // Builtins are always listed (even if overridden)
     for (const entry of getBuiltinAggregateEntries()) {
       entries.push({
         builtin: true,
@@ -201,7 +242,6 @@ export class ObjectIndex {
       });
     }
 
-    // Config entries (user-defined overrides and aliases)
     const userAggs: Record<string, any> = this.config.get("aggregates", {});
     for (const [key, spec] of Object.entries(userAggs)) {
       const aliasTarget =
@@ -250,9 +290,252 @@ export class ObjectIndex {
     return new ArrayQueryCollection(entries);
   }
 
-  getObjectByRef(page: string, tag: string, ref: string) {
-    return this.ds.get([indexKey, tag, this.cleanKey(ref, page), page]);
+  // --- Object CRUD ---
+
+  async getObjectByRef(
+    page: string,
+    tag: string,
+    ref: string,
+  ): Promise<any | null> {
+    const refKey = this.cleanKey(ref, page);
+    const objectId = await this.ds.get<number>([reverseKey, tag, refKey, page]);
+    if (objectId === null || objectId === undefined) return null;
+
+    const encoded = await this.ds.get<EncodedObject>([
+      indexKey,
+      tag,
+      String(objectId),
+    ]);
+    if (!encoded) return null;
+    return this.bitmapIndex.decodeObject(encoded);
   }
+
+  async deleteObject(page: string, tag: string, ref: string): Promise<void> {
+    const refKey = this.cleanKey(ref, page);
+    const objectId = await this.ds.get<number>([reverseKey, tag, refKey, page]);
+    if (objectId === null || objectId === undefined) return;
+
+    const encoded = await this.ds.get<EncodedObject>([
+      indexKey,
+      tag,
+      String(objectId),
+    ]);
+
+    if (encoded) {
+      const tagId = this.bitmapIndex.getDictionary().tryEncode(tag);
+      if (tagId !== undefined) {
+        const meta = this.bitmapIndex.getTagMetaById(tagId);
+        if (meta) {
+          this.bitmapIndex.unindexObject(tagId, objectId, encoded, meta);
+        }
+      }
+    }
+
+    await this.ds.batchDelete([
+      [indexKey, tag, String(objectId)],
+      [reverseKey, tag, refKey, page],
+    ]);
+    await this.flushBitmapState();
+  }
+
+  // --- Indexing ---
+
+  public async indexObjects<T>(
+    page: string,
+    objects: ObjectValue<T>[],
+  ): Promise<void> {
+    const kvs = await this.processObjectsToKVs<T>(page, objects, false);
+    if (kvs.length > 0) {
+      await this.batchSet(page, kvs);
+    }
+  }
+
+  public async validateObjects<T>(page: string, objects: ObjectValue<T>[]) {
+    await this.processObjectsToKVs(page, objects, true);
+  }
+
+  queryLuaObjects<T>(
+    globalEnv: LuaEnv,
+    tag: string,
+    query: LuaCollectionQuery,
+    scopedVariables?: Record<string, any>,
+  ): Promise<ObjectValue<T>[]> {
+    const sf = LuaStackFrame.createWithGlobalEnv(globalEnv);
+    let env = globalEnv;
+    if (scopedVariables) {
+      env = new LuaEnv(globalEnv);
+      for (const [key, value] of Object.entries(scopedVariables)) {
+        env.setLocal(key, jsToLuaValue(value));
+      }
+    }
+    // Use the tag() collection's query method
+    return this.tag(tag).query(query, env, sf) as Promise<ObjectValue<T>[]>;
+  }
+
+  // --- Batch write: encode objects, store, update bitmaps ---
+
+  private async batchSet(page: string, kvs: KV[]): Promise<void> {
+    const writes: KV[] = [];
+    const deletes: KvKey[] = [];
+
+    for (const { key, value } of kvs) {
+      const tag = key[0] as string;
+      const refKey = key[1] as string;
+
+      // Check if this ref already exists (re-index case)
+      const existingObjectId = await this.ds.get<number>([
+        reverseKey,
+        tag,
+        refKey,
+        page,
+      ]);
+
+      if (existingObjectId !== null && existingObjectId !== undefined) {
+        // Remove old object from bitmap index
+        const oldEncoded = await this.ds.get<EncodedObject>([
+          indexKey,
+          tag,
+          String(existingObjectId),
+        ]);
+        if (oldEncoded) {
+          const tagId = this.bitmapIndex.getDictionary().tryEncode(tag);
+          if (tagId !== undefined) {
+            const meta = this.bitmapIndex.getTagMetaById(tagId);
+            if (meta) {
+              this.bitmapIndex.unindexObject(
+                tagId,
+                existingObjectId,
+                oldEncoded,
+                meta,
+              );
+            }
+          }
+        }
+        deletes.push([indexKey, tag, String(existingObjectId)]);
+      }
+
+      // Encode and store new object
+      const encoded = this.bitmapIndex.encodeObject(
+        value as Record<string, unknown>,
+      );
+      const { tagId, meta } = this.bitmapIndex.getTagMeta(tag);
+      const objectId =
+        existingObjectId ?? this.bitmapIndex.allocateObjectId(tagId);
+
+      // If reusing an existing objectId, don't increment count (unindex decremented it)
+      if (existingObjectId !== null && existingObjectId !== undefined) {
+        meta.count++;
+        // dirtyMeta already set by unindexObject
+      }
+
+      this.bitmapIndex.indexObject(tagId, objectId, encoded, meta);
+
+      writes.push({
+        key: [indexKey, tag, String(objectId)],
+        value: encoded,
+      });
+      writes.push({
+        key: [reverseKey, tag, refKey, page],
+        value: objectId,
+      });
+    }
+
+    // Flush bitmap state to KV writes
+    const bitmapFlush = this.bitmapIndex.flushToKVs();
+    writes.push(...bitmapFlush.writes);
+    deletes.push(...bitmapFlush.deletes);
+
+    if (deletes.length > 0) {
+      await this.ds.batchDelete(deletes);
+    }
+    if (writes.length > 0) {
+      await this.ds.batchSet(writes);
+    }
+  }
+
+  private async flushBitmapState(): Promise<void> {
+    const { writes, deletes } = this.bitmapIndex.flushToKVs();
+    if (deletes.length > 0) {
+      await this.ds.batchDelete(deletes);
+    }
+    if (writes.length > 0) {
+      await this.ds.batchSet(writes);
+    }
+  }
+
+  // --- File clearing ---
+
+  public async clearFileIndex(file: string): Promise<void> {
+    const normalizedPage = this.normalizePageName(file);
+
+    // Find all reverse-index entries for this page
+    const allDeletes: KvKey[] = [];
+    for await (const { key, value } of this.ds.query<number>({
+      prefix: [reverseKey],
+    })) {
+      // key: [reverseKey, tag, refKey, page]
+      if (key[3] === normalizedPage) {
+        const tag = key[1] as string;
+        const objectId = value;
+
+        // Remove from bitmap index
+        const encoded = await this.ds.get<EncodedObject>([
+          indexKey,
+          tag,
+          String(objectId),
+        ]);
+        if (encoded) {
+          const tagId = this.bitmapIndex.getDictionary().tryEncode(tag);
+          if (tagId !== undefined) {
+            const meta = this.bitmapIndex.getTagMetaById(tagId);
+            if (meta) {
+              this.bitmapIndex.unindexObject(tagId, objectId, encoded, meta);
+            }
+          }
+        }
+
+        allDeletes.push(key); // reverse key
+        allDeletes.push([indexKey, tag, String(objectId)]); // object key
+      }
+    }
+
+    if (allDeletes.length > 0) {
+      await this.ds.batchDelete(allDeletes);
+    }
+    await this.flushBitmapState();
+  }
+
+  public async clearIndex(): Promise<void> {
+    this.bitmapIndex.clear();
+    const allKeys: KvKey[] = [];
+    for await (const { key } of this.ds.query({ prefix: [indexKey] })) {
+      allKeys.push(key);
+    }
+    for await (const { key } of this.ds.query({ prefix: [reverseKey] })) {
+      allKeys.push(key);
+    }
+    // Clean up bitmap storage keys
+    for await (const { key } of this.ds.query({ prefix: ["b"] })) {
+      allKeys.push(key);
+    }
+    for await (const { key } of this.ds.query({ prefix: ["m"] })) {
+      allKeys.push(key);
+    }
+    for await (const { key } of this.ds.query({ prefix: ["$dict"] })) {
+      allKeys.push(key);
+    }
+    // Clean up legacy keys from old index format
+    for await (const { key } of this.ds.query({ prefix: ["$indexStats"] })) {
+      allKeys.push(key);
+    }
+    for await (const { key } of this.ds.query({ prefix: ["$tagSketch"] })) {
+      allKeys.push(key);
+    }
+    await this.ds.batchDelete(allKeys);
+    console.log("Deleted", allKeys.length, "keys from the index");
+  }
+
+  // --- Reindex ---
 
   async ensureFullIndex(space: Space) {
     const currentIndexVersion = await this.getCurrentIndexVersion();
@@ -263,9 +546,7 @@ export class ObjectIndex {
     }
 
     if (
-      // If the index version is less than the desired version
       currentIndexVersion < desiredIndexVersion &&
-      // And the index queue is empty (meaning no indexing is ongoing)
       (await this.mq.isQueueEmpty("indexQueue"))
     ) {
       console.info(
@@ -274,10 +555,7 @@ export class ObjectIndex {
         currentIndexVersion,
         desiredIndexVersion,
       );
-
       await this.reindexSpace(space);
-
-      // Dispatch an editor:reloadState event to reload the editor state (render widgets etc.)
       void this.eventHook.dispatchEvent("editor:reloadState");
     }
   }
@@ -290,7 +568,6 @@ export class ObjectIndex {
     const files = await space.deduplicatedFileList();
 
     console.log("Queing", files.length, "pages to be indexed.");
-    // Queue all file names to be indexed
     const startTime = Date.now();
     await this.mq.batchSend(
       "indexQueue",
@@ -321,6 +598,8 @@ export class ObjectIndex {
     await this.ds.delete(indexVersionKey);
   }
 
+  // --- Helpers ---
+
   private normalizePageName(page: string): string {
     return page.endsWith(".md") ? page.replace(/\.md$/, "") : page;
   }
@@ -333,466 +612,7 @@ export class ObjectIndex {
     }
   }
 
-  queryLuaObjects<T>(
-    globalEnv: LuaEnv,
-    tag: string,
-    query: LuaCollectionQuery,
-    scopedVariables?: Record<string, any>,
-  ): Promise<ObjectValue<T>[]> {
-    const sf = LuaStackFrame.createWithGlobalEnv(globalEnv);
-    let env = globalEnv;
-    if (scopedVariables) {
-      env = new LuaEnv(globalEnv);
-      for (const [key, value] of Object.entries(scopedVariables)) {
-        env.setLocal(key, jsToLuaValue(value));
-      }
-    }
-    return this.ds.luaQuery([indexKey, tag], query, env, sf);
-  }
-
-  batchSet(page: string, kvs: KV[]): Promise<void> {
-    const finalBatch: KV[] = [];
-    for (const { key, value } of kvs) {
-      finalBatch.push(
-        {
-          key: [indexKey, ...key, page],
-          value,
-        },
-        {
-          key: [pageKey, page, ...key],
-          value: true,
-        },
-      );
-    }
-    return this.ds.batchSet(finalBatch);
-  }
-
-  batchDelete(page: string, keys: KvKey[]): Promise<void> {
-    const finalBatch: KvKey[] = [];
-    for (const key of keys) {
-      finalBatch.push([indexKey, ...key, page]);
-    }
-    return this.ds.batchDelete(finalBatch);
-  }
-
-  private pageStatsKey(page: string, tag: string): KvKey {
-    return [statsKey, "page", this.normalizePageName(page), tag];
-  }
-
-  private tagStatsKey(tag: string): KvKey {
-    return [statsKey, "tag", tag];
-  }
-
-  private mergedTagSketchKey(tag: string, column: string): KvKey {
-    return [tagSketchKey, tag, column];
-  }
-
-  private mergedTagMcvKey(tag: string, column: string): KvKey {
-    return [tagSketchKey, "mcv", tag, column];
-  }
-
-  private async getPersistedPageTagStats(
-    page: string,
-    tag: string,
-  ): Promise<PersistedPageTagStats> {
-    return (
-      (await this.ds.get<PersistedPageTagStats>(
-        this.pageStatsKey(page, tag),
-      )) ?? {
-        rowCount: 0,
-        totalColumnCount: 0,
-        ndvSketches: {},
-        mcvSketches: {},
-      }
-    );
-  }
-
-  private async setPersistedPageTagStats(
-    page: string,
-    tag: string,
-    stats: PersistedPageTagStats,
-  ): Promise<void> {
-    if (stats.rowCount <= 0) {
-      await this.ds.delete(this.pageStatsKey(page, tag));
-      return;
-    }
-    await this.ds.set(this.pageStatsKey(page, tag), stats);
-  }
-
-  private async getPersistedTagStats(
-    tag: string,
-  ): Promise<CollectionStats | undefined> {
-    const stored = await this.ds.get<PersistedTagStats>(this.tagStatsKey(tag));
-
-    if (!stored) {
-      return undefined;
-    }
-
-    const avgColumnCount =
-      stored.rowCount > 0
-        ? Math.round(stored.totalColumnCount / stored.rowCount)
-        : 0;
-
-    // Deserialize MCV lists
-    const mcv = new Map<string, MCVList>();
-    if (stored.mcv) {
-      for (const [col, serialized] of Object.entries(stored.mcv)) {
-        mcv.set(col, MCVList.deserialize(serialized));
-      }
-    }
-
-    // Determine statsSource: partial if index hasn't completed yet
-    const indexComplete = await this.hasFullIndexCompleted();
-    const statsSource = indexComplete ? "persisted" : "partial";
-
-    return {
-      rowCount: stored.rowCount ?? 0,
-      ndv: new Map(Object.entries(stored.ndv ?? {})),
-      avgColumnCount,
-      statsSource,
-      mcv: mcv.size > 0 ? mcv : undefined,
-    };
-  }
-
-  // Incremental NDV + MCV update: subtract old page, add new one
-  // Also handles rowCount/totalColumnCount deltas to avoid a wasted
-  // intermediate write from adjustPersistedTagTotals.
-  private async updateTagStatsIncremental(
-    tag: string,
-    oldPageStats: PersistedPageTagStats | undefined,
-    newPageStats: PersistedPageTagStats | undefined,
-    rowCountDelta: number,
-    totalColumnCountDelta: number,
-  ): Promise<void> {
-    const allSketchColumns = new Set<string>([
-      ...Object.keys(oldPageStats?.ndvSketches ?? {}),
-      ...Object.keys(newPageStats?.ndvSketches ?? {}),
-    ]);
-    const allMcvColumns = new Set<string>([
-      ...Object.keys(oldPageStats?.mcvSketches ?? {}),
-      ...Object.keys(newPageStats?.mcvSketches ?? {}),
-    ]);
-
-    // 1. Collect all keys we need to read
-    const readKeys: KvKey[] = [];
-    const sketchColumns = [...allSketchColumns];
-    const mcvColumns = [...allMcvColumns];
-
-    for (const col of sketchColumns) {
-      readKeys.push(this.mergedTagSketchKey(tag, col));
-    }
-    for (const col of mcvColumns) {
-      readKeys.push(this.mergedTagMcvKey(tag, col));
-    }
-    readKeys.push(this.tagStatsKey(tag));
-
-    // 2. Single batch read
-    const readValues =
-      readKeys.length > 0 ? await this.ds.batchGet(readKeys) : [];
-
-    // 3. Compute all merges in memory
-    let ri = 0;
-    const writes: KV[] = [];
-
-    const ndvResult: Record<string, number> = {};
-    for (const col of sketchColumns) {
-      const existing = readValues[ri++] as string | null;
-      const merged = existing
-        ? deserializeNDVSketch(existing)
-        : new HalfXorSketch();
-
-      const oldSerialized = oldPageStats?.ndvSketches?.[col];
-      if (oldSerialized) {
-        merged.subtract(deserializeNDVSketch(oldSerialized));
-      }
-      const newSerialized = newPageStats?.ndvSketches?.[col];
-      if (newSerialized) {
-        merged.merge(deserializeNDVSketch(newSerialized));
-      }
-
-      writes.push({
-        key: this.mergedTagSketchKey(tag, col),
-        value: merged.serialize(),
-      });
-      ndvResult[col] = merged.estimate();
-    }
-
-    const mcvResult: Record<string, string> = {};
-    for (const col of mcvColumns) {
-      const existing = readValues[ri++] as string | null;
-      const merged = existing ? MCVList.deserialize(existing) : new MCVList();
-
-      const oldMcv = oldPageStats?.mcvSketches?.[col];
-      if (oldMcv) {
-        merged.subtract(MCVList.deserialize(oldMcv));
-      }
-      const newMcv = newPageStats?.mcvSketches?.[col];
-      if (newMcv) {
-        merged.merge(MCVList.deserialize(newMcv));
-      }
-
-      writes.push({
-        key: this.mergedTagMcvKey(tag, col),
-        value: merged.serialize(),
-      });
-      mcvResult[col] = merged.serialize();
-    }
-
-    // Tag stats totals
-    const current = readValues[ri] as PersistedTagStats | null;
-    const nextRowCount = Math.max(0, (current?.rowCount ?? 0) + rowCountDelta);
-    const nextTotalColumnCount = Math.max(
-      0,
-      (current?.totalColumnCount ?? 0) + totalColumnCountDelta,
-    );
-
-    if (nextRowCount <= 0) {
-      // Tag gone — delete stats key, but still write sketch/mcv updates
-      const deleteKeys = [this.tagStatsKey(tag)];
-      if (writes.length > 0) {
-        await this.ds.batchSet(writes);
-      }
-      await this.ds.batchDelete(deleteKeys);
-    } else {
-      writes.push({
-        key: this.tagStatsKey(tag),
-        value: {
-          rowCount: nextRowCount,
-          totalColumnCount: nextTotalColumnCount,
-          ndv: ndvResult,
-          mcv: mcvResult,
-        } as PersistedTagStats,
-      });
-
-      // 4. Single batch write
-      await this.ds.batchSet(writes);
-    }
-  }
-
-  private computeTagStatsFromKVs<T>(
-    kvs: KV<T>[],
-  ): Map<string, PersistedPageTagStats> {
-    const trackers = new Map<string, StatsTracker>();
-
-    for (const { key, value } of kvs) {
-      const tag = key[0] as string;
-      let tracker = trackers.get(tag);
-      if (!tracker) {
-        tracker = new StatsTracker();
-        trackers.set(tag, tracker);
-      }
-
-      if (value && typeof value === "object") {
-        tracker.index(value as Record<string, any>, tag);
-      } else {
-        tracker.rowCount++;
-      }
-    }
-
-    const stats = new Map<string, PersistedPageTagStats>();
-    for (const [tag, tracker] of trackers) {
-      const computed = tracker.getStats();
-      stats.set(tag, {
-        rowCount: computed.rowCount,
-        totalColumnCount:
-          computed.rowCount > 0
-            ? (computed.avgColumnCount ?? 0) * computed.rowCount
-            : 0,
-        ndvSketches: tracker.getSerializedSketches(),
-        mcvSketches: tracker.getSerializedMCVs(),
-      });
-    }
-
-    return stats;
-  }
-
-  private async applyPageTagStatsDelta(
-    page: string,
-    newStats: Map<string, PersistedPageTagStats>,
-  ): Promise<void> {
-    const oldStats = new Map<string, PersistedPageTagStats>();
-
-    for await (const { key, value } of this.ds.query<PersistedPageTagStats>({
-      prefix: [statsKey, "page", page],
-    })) {
-      const tag = key[3] as string;
-      oldStats.set(
-        tag,
-        value ?? {
-          rowCount: 0,
-          totalColumnCount: 0,
-          ndvSketches: {},
-          mcvSketches: {},
-        },
-      );
-    }
-
-    const allTags = new Set<string>([...oldStats.keys(), ...newStats.keys()]);
-
-    // Batch all page-tag stats writes
-    const pageStatsWrites: KV[] = [];
-    const pageStatsDeletes: KvKey[] = [];
-
-    for (const tag of allTags) {
-      const newVal = newStats.get(tag) ?? {
-        rowCount: 0,
-        totalColumnCount: 0,
-        ndvSketches: {},
-        mcvSketches: {},
-      };
-
-      if (newVal.rowCount <= 0) {
-        pageStatsDeletes.push(this.pageStatsKey(page, tag));
-      } else {
-        pageStatsWrites.push({
-          key: this.pageStatsKey(page, tag),
-          value: newVal,
-        });
-      }
-    }
-
-    // Single batch for all page-tag stats
-    if (pageStatsWrites.length > 0) {
-      await this.ds.batchSet(pageStatsWrites);
-    }
-    if (pageStatsDeletes.length > 0) {
-      await this.ds.batchDelete(pageStatsDeletes);
-    }
-
-    // Now update merged tag stats — each tag still needs its own
-    // updateTagStatsIncremental call (which is itself now batched internally)
-    for (const tag of allTags) {
-      const oldVal = oldStats.get(tag) ?? {
-        rowCount: 0,
-        totalColumnCount: 0,
-        ndvSketches: {},
-        mcvSketches: {},
-      };
-      const newVal = newStats.get(tag) ?? {
-        rowCount: 0,
-        totalColumnCount: 0,
-        ndvSketches: {},
-        mcvSketches: {},
-      };
-
-      const rowCountDelta = newVal.rowCount - oldVal.rowCount;
-      const totalColumnCountDelta =
-        newVal.totalColumnCount - oldVal.totalColumnCount;
-
-      await this.updateTagStatsIncremental(
-        tag,
-        oldVal,
-        newVal,
-        rowCountDelta,
-        totalColumnCountDelta,
-      );
-    }
-  }
-
-  private async removePageTagStats(page: string): Promise<void> {
-    const pageStats: Array<{ tag: string; stats: PersistedPageTagStats }> = [];
-    for await (const { key, value } of this.ds.query<PersistedPageTagStats>({
-      prefix: [statsKey, "page", page],
-    })) {
-      pageStats.push({
-        tag: key[3] as string,
-        stats: value ?? {
-          rowCount: 0,
-          totalColumnCount: 0,
-          ndvSketches: {},
-          mcvSketches: {},
-        },
-      });
-    }
-
-    // Batch delete all page-level stats keys at once
-    if (pageStats.length > 0) {
-      await this.ds.batchDelete(
-        pageStats.map(({ tag }) => this.pageStatsKey(page, tag)),
-      );
-    }
-
-    // Each tag's merged stats update is internally batched now
-    for (const { tag, stats } of pageStats) {
-      await this.updateTagStatsIncremental(
-        tag,
-        stats,
-        undefined,
-        -stats.rowCount,
-        -stats.totalColumnCount,
-      );
-    }
-  }
-
-  /**
-   * Clears all keys for a given file
-   * @param file
-   */
-  public async clearFileIndex(file: string): Promise<void> {
-    const normalizedPage = this.normalizePageName(file);
-    await this.removePageTagStats(normalizedPage);
-
-    // console.log("Clearing index for", normalizedPage);
-    const allKeys: KvKey[] = [];
-    for await (const { key } of this.ds.query({
-      prefix: [pageKey, normalizedPage],
-    })) {
-      allKeys.push(key);
-      allKeys.push([indexKey, ...key.slice(2), normalizedPage]);
-    }
-    await this.ds.batchDelete(allKeys);
-  }
-
-  /**
-   * Clears the entire index
-   */
-  public async clearIndex(): Promise<void> {
-    this.clearAllStats();
-    const allKeys: KvKey[] = [];
-    for await (const { key } of this.ds.query({ prefix: [indexKey] })) {
-      allKeys.push(key);
-    }
-    for await (const { key } of this.ds.query({ prefix: [pageKey] })) {
-      allKeys.push(key);
-    }
-    for await (const { key } of this.ds.query({ prefix: [statsKey] })) {
-      allKeys.push(key);
-    }
-    for await (const { key } of this.ds.query({ prefix: [tagSketchKey] })) {
-      allKeys.push(key);
-    }
-    await this.ds.batchDelete(allKeys);
-    console.log("Deleted", allKeys.length, "keys from the index");
-  }
-
-  /**
-   * Indexes entities in the data store
-   */
-  public async indexObjects<T>(
-    page: string,
-    objects: ObjectValue<T>[],
-  ): Promise<void> {
-    const kvs = await this.processObjectsToKVs<T>(page, objects, false);
-    const stats = this.computeTagStatsFromKVs(kvs);
-
-    if (kvs.length > 0) {
-      await this.batchSet(page, kvs);
-      await this.applyPageTagStatsDelta(page, stats);
-      return;
-    }
-
-    await this.applyPageTagStatsDelta(page, stats);
-  }
-
-  /**
-   * Validate and transform objects, throws a ValidationError when it fails
-   * @param page
-   * @param objects
-   * @throw ValidationError
-   */
-  public async validateObjects<T>(page: string, objects: ObjectValue<T>[]) {
-    await this.processObjectsToKVs(page, objects, true);
-  }
+  // --- Validation / transform pipeline (unchanged logic) ---
 
   private async processObjectsToKVs<T>(
     page: string,
@@ -804,18 +624,15 @@ export class ObjectIndex {
       "tags",
       {},
     );
-    // Taking this iteration approach as new objects may be pushed into this array on the fly
     while (objects.length > 0) {
       const obj = objects.shift()!;
       if (!obj.tag) {
         console.error("Object has no tag", obj, "this shouldn't happen");
         continue;
       }
-      // Index as all the tag + any additional tags specified
       const allTags = [obj.tag, ...(obj.tags || [])];
       for (const tag of allTags) {
         const tagDefinition = tagDefinitions[tag];
-        // Validate object based on schema if required
         if (
           tagDefinition?.schema &&
           (tagDefinition?.mustValidate || throwOnValidationErrors)
@@ -835,7 +652,6 @@ export class ObjectIndex {
             }
           }
         }
-        // Validate object based on validate callback if required
         if (
           tagDefinition?.validate &&
           (tagDefinition?.mustValidate || throwOnValidationErrors)
@@ -855,7 +671,6 @@ export class ObjectIndex {
             }
           }
         }
-        // Transform object
         if (tagDefinition?.transform) {
           let newObjects;
           try {
@@ -865,23 +680,16 @@ export class ObjectIndex {
           }
 
           if (!newObjects) {
-            // null value returned, just index as usual
             kvs.push({
               key: [tag, this.cleanKey(obj.ref, page)],
               value: obj,
             });
-            if (obj && typeof obj === "object") {
-              this.trackObject(tag, obj as Record<string, any>);
-            }
             continue;
           }
 
           if (!Array.isArray(newObjects)) {
-            // Probably returned single object, let's normalize
             newObjects = [newObjects];
           }
-          // A transform function _must_ either return an empty list of objects to index, or return at least one object with the same ref
-          // If this doesn't happen, we may end up in an infinite loop.
           let foundAssignedRef = false;
           for (const newObj of newObjects) {
             if (!newObj.ref) {
@@ -892,17 +700,12 @@ export class ObjectIndex {
               continue;
             }
             if (newObj.ref === obj.ref) {
-              // Got the same object back here, let's just index it without further processing
               kvs.push({
                 key: [tag, this.cleanKey(newObj.ref, page)],
                 value: newObj,
               });
-              if (newObj && typeof newObj === "object") {
-                this.trackObject(tag, newObj as Record<string, any>);
-              }
               foundAssignedRef = true;
             } else {
-              // Some other object
               objects.push(newObj);
             }
           }
@@ -912,62 +715,13 @@ export class ObjectIndex {
             );
           }
         } else {
-          // Just insert it directly
           kvs.push({
             key: [tag, this.cleanKey(obj.ref, page)],
             value: obj,
           });
-          if (obj && typeof obj === "object") {
-            this.trackObject(tag, obj as Record<string, any>);
-          }
         }
       }
     }
     return kvs;
-  }
-
-  // Finding 2: deleteObject now correctly passes mcvSketches
-  async deleteObject(page: string, tag: string, ref: string): Promise<void> {
-    await this.batchDelete(page, [[tag, this.cleanKey(ref, page)]]);
-    const oldStats = await this.getPersistedPageTagStats(page, tag);
-    const newStats: PersistedPageTagStats = {
-      rowCount: Math.max(0, oldStats.rowCount - 1),
-      totalColumnCount: oldStats.totalColumnCount,
-      ndvSketches: oldStats.ndvSketches ?? {},
-      mcvSketches: oldStats.mcvSketches ?? {},
-    };
-
-    const rowCountDelta = newStats.rowCount - oldStats.rowCount;
-    const totalColumnCountDelta =
-      newStats.totalColumnCount - oldStats.totalColumnCount;
-
-    if (rowCountDelta !== 0 || totalColumnCountDelta !== 0) {
-      await this.setPersistedPageTagStats(page, tag, newStats);
-      await this.updateTagStatsIncremental(
-        tag,
-        oldStats,
-        newStats,
-        rowCountDelta,
-        totalColumnCountDelta,
-      );
-    }
-  }
-
-  private trackObject(tag: string, obj: Record<string, any>): void {
-    let tracker = this.tagStats.get(tag);
-    if (!tracker) {
-      tracker = new StatsTracker();
-      this.tagStats.set(tag, tracker);
-    }
-    tracker.index(obj, tag);
-  }
-
-  getTagStats(tag: string): CollectionStats | undefined {
-    return this.tagStats.get(tag)?.getStats();
-  }
-
-  private clearAllStats(): void {
-    for (const t of this.tagStats.values()) t.clear();
-    this.tagStats.clear();
   }
 }
