@@ -62,6 +62,11 @@ export type StatsSource =
   | "computed-empty"
   | "unknown-default";
 
+export type CollectionExecutionCapabilities = {
+  predicatePushdown?: "none" | "basic" | "bitmap-basic";
+  scanKind?: "materialized" | "kv-scan" | "index-scan";
+};
+
 // Collection statistics for the cost-based planner
 export type CollectionStats = {
   rowCount: number;
@@ -69,6 +74,7 @@ export type CollectionStats = {
   avgColumnCount?: number;
   statsSource?: StatsSource;
   mcv?: Map<string, MCVList>;
+  executionCapabilities?: CollectionExecutionCapabilities;
 };
 
 export interface LuaQueryCollection {
@@ -347,6 +353,10 @@ export function computeStatsFromArray(
       ndv,
       avgColumnCount: 0,
       statsSource: "computed-empty",
+executionCapabilities: {
+  predicatePushdown: "none",
+  scanKind: "materialized",
+},
     };
   }
 
@@ -382,6 +392,10 @@ export function computeStatsFromArray(
       ndv,
       avgColumnCount,
       statsSource: "computed-exact-small",
+executionCapabilities: {
+  predicatePushdown: "none",
+  scanKind: "materialized",
+},
     };
   }
 
@@ -1319,6 +1333,10 @@ export class DataStoreQueryCollection implements LuaQueryCollection {
       rowCount,
       ndv: new Map(),
       statsSource: rowCount === 0 ? "computed-empty" : "unknown-default",
+      executionCapabilities: {
+        predicatePushdown: "none",
+        scanKind: "kv-scan",
+      },
     };
   }
 }

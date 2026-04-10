@@ -209,6 +209,8 @@ export type ExplainNode = {
     rightNdv: number;
   };
   statsSource?: string;
+  executionScanKind?: string;
+  predicatePushdown?: string;
 };
 
 export type ExplainOptions = {
@@ -968,9 +970,11 @@ function orderSources(
       );
 
       const candidateWidth = clampWidth(estimatedWidth(candidate));
+      const candidatePenalty = executionScanPenalty(candidate);
       const cost =
         joinedRows *
         estimatedRows(candidate) *
+        candidatePenalty *
         (getWidthWeight(config) * clampWidth(joinedWidth) +
           getCandidateWidthWeight(config) * candidateWidth);
 
@@ -1025,6 +1029,22 @@ function orderSources(
   }
 
   return ordered;
+}
+
+function executionScanPenalty(source: JoinSource): number {
+  const caps = source.stats?.executionCapabilities;
+  if (!caps) return 1.0;
+
+  if (caps.predicatePushdown === "bitmap-basic") {
+    return 0.6;
+  }
+  if (caps.scanKind === "index-scan" && caps.predicatePushdown === "none") {
+    return 2.0;
+  }
+  if (caps.scanKind === "kv-scan") {
+    return 1.4;
+  }
+  return 1.0;
 }
 
 // 11. Physical operator selection
@@ -2128,6 +2148,8 @@ export function explainJoinTree(
       estimatedWidth: width,
       filterExpr: pushedFilterExprBySource?.get(tree.source.name),
       statsSource: tree.source.stats?.statsSource,
+      executionScanKind: tree.source.stats?.executionCapabilities?.scanKind,
+      predicatePushdown: tree.source.stats?.executionCapabilities?.predicatePushdown,
       children: [],
     };
   }
@@ -3027,6 +3049,14 @@ function formatNode(
       lines.push(`${detailPad}Join Hint: ${node.hintUsed}`);
     }
 
+    if (node.executionScanKind) {
+      lines.push(`${detailPad}Execution Scan: ${node.executionScanKind}`);
+    }
+
+    if (node.predicatePushdown) {
+      lines.push(`${detailPad}Predicate Pushdown: ${node.predicatePushdown}`);
+    }
+
     if (node.statsSource) {
       lines.push(`${detailPad}Stats: ${node.statsSource}`);
     }
@@ -3064,6 +3094,13 @@ function formatNode(
       lines.push(`${detailPad}MCV: suppressed by stats provenance${suffix}`);
     } else if (node.mcvFallback === "no-mcv") {
       lines.push(`${detailPad}MCV: not available`);
+    }
+
+    if (
+      node.statsSource === "persisted-complete" &&
+      node.predicatePushdown === "none"
+    ) {
+      lines.push(`${detailPad}Planner Note: exact stats, but scan is not predicate-pushed`);
     }
   }
 

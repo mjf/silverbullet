@@ -959,6 +959,19 @@ async function buildExplainQueryShapeWithOverrides(
   return explainQuery;
 }
 
+function unknownDefaultStats(): CollectionStats {
+  return {
+    rowCount: 100,
+    ndv: new Map(),
+    avgColumnCount: 5,
+    statsSource: "unknown-default",
+    executionCapabilities: {
+      predicatePushdown: "none",
+      scanKind: "kv-scan",
+    },
+  };
+}
+
 function normalizeProvidedStats(stats: CollectionStats): CollectionStats {
   if (stats.statsSource) {
     return stats;
@@ -972,8 +985,8 @@ function normalizeProvidedStats(stats: CollectionStats): CollectionStats {
 
 async function getStatsForValue(
   val: LuaValue,
-  env: LuaEnv,
-  sf: LuaStackFrame,
+  _env: LuaEnv,
+  _sf: LuaStackFrame,
 ): Promise<CollectionStats> {
   if (
     val &&
@@ -993,8 +1006,7 @@ async function getStatsForValue(
     "query" in val &&
     typeof (val as any).query === "function"
   ) {
-    const items = await (val as any).query({}, env, sf);
-    return computeStatsFromArray(items);
+    return unknownDefaultStats();
   }
 
   if (Array.isArray(val)) {
@@ -1497,6 +1509,10 @@ export function evalExpression(
               src.stats = {
                 ...filteredStats,
                 statsSource: "recomputed-filtered-exact",
+                executionCapabilities: {
+                  ...(src.stats?.executionCapabilities ?? {}),
+                  scanKind: "materialized",
+                },
               };
               // Originally persisted, but re-computed after pushed filter
               materializedOverrides.set(src.name, filtered);

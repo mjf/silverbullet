@@ -159,6 +159,10 @@ export class ObjectIndex {
             ndv: new Map(),
             avgColumnCount: 0,
             statsSource: "computed-empty",
+            executionCapabilities: {
+              predicatePushdown: "none",
+              scanKind: "index-scan",
+            },
           };
         }
         const rowCount = self.bitmapIndex.getRowCount(tagId);
@@ -186,11 +190,15 @@ export class ObjectIndex {
         return {
           rowCount,
           ndv,
-          avgColumnCount: ndv.size,
+          avgColumnCount: undefined,
           mcv: mcv.size > 0 ? mcv : undefined,
           statsSource: indexComplete
             ? "persisted-complete"
             : "persisted-partial",
+          executionCapabilities: {
+            predicatePushdown: "none",
+            scanKind: "index-scan",
+          },
         };
       },
     };
