@@ -743,21 +743,22 @@ export class ObjectIndex {
     tagName: string,
     objectIds: number[],
   ): Promise<ObjectValue<any>[]> {
-    const tagId = this.bitmapIndex.getDictionary().tryEncode(tagName);
-    if (tagId === undefined || objectIds.length === 0) {
+    if (objectIds.length === 0) {
       return [];
     }
 
     const results: ObjectValue<any>[] = [];
     for (const objectId of objectIds) {
-      const encoded = await this.ds.get(
-        this.bitmapIndex.objectStorageKey(tagId, objectId),
-      );
+      const encoded = await this.ds.get<EncodedObject>([
+        indexKey,
+        tagName,
+        String(objectId),
+      ]);
       if (!encoded) {
         continue;
       }
       const decoded = this.bitmapIndex.decodeObject(
-        encoded as any,
+        encoded,
       ) as ObjectValue<any>;
       results.push(this.enrichValue(tagName, decoded));
     }
