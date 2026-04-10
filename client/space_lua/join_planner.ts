@@ -194,6 +194,13 @@ export type ExplainNode = {
   offsetCount?: number;
   children: ExplainNode[];
 
+  // Executable wrapper metadata
+  whereExpr?: LuaExpression;
+  havingExpr?: LuaExpression;
+  orderBySpec?: { expr: LuaExpression; desc: boolean }[];
+  groupBySpec?: { expr: LuaExpression; alias?: string }[];
+  distinctSpec?: boolean;
+
   selectivity?: number;
   ndvSource?:
     | "roaring-bitmap index"
@@ -1256,7 +1263,7 @@ function normalizeEquiPredicateForJoin(
   }
 
   throw new Error(
-    `Equi-predicate does not match join sides: left={${[...leftNames].join(",")}} right=${rightName} pred=${equiPred.leftSource}.${equiPred.leftColumn}==${equiPred.rightSource}.${equiPred.rightColumn}`,
+    `Equi-predicate does not match join sides: left={${[...leftNames].join(",")}} right=${rightName}`,
   );
 }
 
@@ -2311,6 +2318,7 @@ export function wrapPlanWithQueryOps(
         estimatedRows: Math.max(1, Math.round(root.estimatedRows * 0.5)),
         estimatedWidth: root.estimatedWidth,
         filterExpr: exprToString(residual),
+        whereExpr: residual,
         statsSource: root.statsSource,
         children: [root],
       };
@@ -2335,6 +2343,7 @@ export function wrapPlanWithQueryOps(
       estimatedRows: estimatedGroupRows,
       estimatedWidth: root.estimatedWidth,
       sortKeys: keys,
+      groupBySpec: query.groupBy,
       statsSource: root.statsSource,
       children: [root],
     };
@@ -2348,6 +2357,7 @@ export function wrapPlanWithQueryOps(
       estimatedRows: Math.max(1, Math.round(root.estimatedRows * 0.5)),
       estimatedWidth: root.estimatedWidth,
       filterExpr: exprToString(query.having),
+      havingExpr: query.having,
       statsSource: root.statsSource,
       children: [root],
     };
@@ -2360,6 +2370,7 @@ export function wrapPlanWithQueryOps(
       estimatedCost: root.estimatedCost,
       estimatedRows: Math.max(1, Math.round(root.estimatedRows * 0.8)),
       estimatedWidth: root.estimatedWidth,
+      distinctSpec: true,
       statsSource: root.statsSource,
       children: [root],
     };
@@ -2379,6 +2390,7 @@ export function wrapPlanWithQueryOps(
       estimatedRows: root.estimatedRows,
       estimatedWidth: root.estimatedWidth,
       sortKeys: keys,
+      orderBySpec: query.orderBy,
       statsSource: root.statsSource,
       children: [root],
     };
@@ -2726,6 +2738,325 @@ function estimateGroupRowsFromNdv(
 
 // 21. Explain analyze execution
 
+type ExplainWrapperExecutor = (
+  node: ExplainNode,
+  inputRows: LuaTable[],
+  env: LuaEnv,
+  sf: LuaStackFrame,
+  opts: ExplainOptions,
+) => Promise<LuaTable[]>;
+
+function wrapperExecElapsed(
+  t0: number,
+  opts: ExplainOptions,
+): number | undefined {
+  if (!opts.timing) return undefined;
+  return Math.round((performance.now() - t0) * 1000) / 1000;
+}
+
+function cloneRows(rows: LuaTable[]): LuaTable[] {
+  return rows.map((r) => cloneRow(r));
+}
+
+function valueIdentity(v: any): string {
+  if (v === null || v === undefined) return "nil";
+  if (typeof v === "string") return `s:${v}`;
+  if (typeof v === "number") return Object.is(v, -0) ? "n:-0" : `n:${v}`;
+  if (typeof v === "boolean") return v ? "b:true" : "b:false";
+  if (v instanceof LuaTable) {
+    const parts: string[] = [];
+    for (const k of luaKeys(v)) {
+      parts.push(`${String(k)}=${valueIdentity(v.rawGet(k))}`);
+    }
+    parts.sort();
+    return `t:{${parts.join(",")}}`;
+  }
+  if (Array.isArray(v)) {
+    return `a:[${v.map(valueIdentity).join(",")}]`;
+  }
+  if (typeof v === "object") {
+    const parts = Object.keys(v).sort().map((k) =>
+      `${k}=${valueIdentity(v[k])}`
+    );
+    return `o:{${parts.join(",")}}`;
+  }
+  return String(v);
+}
+
+function rowIdentity(row: LuaTable): string {
+  const parts: string[] = [];
+  for (const k of luaKeys(row)) {
+    parts.push(`${String(k)}=${valueIdentity(row.rawGet(k))}`);
+  }
+  parts.sort();
+  return parts.join("|");
+}
+
+async function evalExprAgainstRow(
+  expr: LuaExpression,
+  row: LuaTable,
+  env: LuaEnv,
+  sf: LuaStackFrame,
+): Promise<any> {
+  const rowEnv = new LuaEnv(env);
+  for (const k of luaKeys(row)) {
+    rowEnv.setLocal(String(k), row.rawGet(k));
+  }
+  return await evalExpression(expr, rowEnv, sf);
+}
+
+const executeFilterWrapper: ExplainWrapperExecutor = async (
+  node,
+  inputRows,
+  env,
+  sf,
+  opts,
+) => {
+  const t0 = opts.timing ? performance.now() : 0;
+  const expr = node.havingExpr ?? node.whereExpr;
+
+  if (!expr) {
+    node.actualRows = inputRows.length;
+    node.actualLoops = 1;
+    const elapsed = wrapperExecElapsed(t0, opts);
+    if (elapsed !== undefined) {
+      node.actualStartupTimeMs = elapsed;
+      node.actualTimeMs = elapsed;
+    }
+    return inputRows;
+  }
+
+  const out: LuaTable[] = [];
+  for (const row of inputRows) {
+    const val = await evalExprAgainstRow(expr, row, env, sf);
+    if (luaTruthy(val)) {
+      out.push(row);
+    }
+  }
+
+  node.actualRows = out.length;
+  node.actualLoops = 1;
+  node.rowsRemovedByFilter = Math.max(0, inputRows.length - out.length);
+
+  const elapsed = wrapperExecElapsed(t0, opts);
+  if (elapsed !== undefined) {
+    node.actualStartupTimeMs = elapsed;
+    node.actualTimeMs = elapsed;
+  }
+  return out;
+};
+
+const executeUniqueWrapper: ExplainWrapperExecutor = async (
+  node,
+  inputRows,
+  _env,
+  _sf,
+  opts,
+) => {
+  const t0 = opts.timing ? performance.now() : 0;
+  const seen = new Set<string>();
+  const out: LuaTable[] = [];
+  for (const row of inputRows) {
+    const key = rowIdentity(row);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(row);
+  }
+  node.actualRows = out.length;
+  node.actualLoops = 1;
+  const elapsed = wrapperExecElapsed(t0, opts);
+  if (elapsed !== undefined) {
+    node.actualStartupTimeMs = elapsed;
+    node.actualTimeMs = elapsed;
+  }
+  return out;
+};
+
+const executeLimitWrapper: ExplainWrapperExecutor = async (
+  node,
+  inputRows,
+  _env,
+  _sf,
+  opts,
+) => {
+  const t0 = opts.timing ? performance.now() : 0;
+  const offset = node.offsetCount ?? 0;
+  const limit = node.limitCount ?? inputRows.length;
+  const out = inputRows.slice(offset, offset + limit);
+  node.actualRows = out.length;
+  node.actualLoops = 1;
+  const elapsed = wrapperExecElapsed(t0, opts);
+  if (elapsed !== undefined) {
+    node.actualStartupTimeMs = elapsed;
+    node.actualTimeMs = elapsed;
+  }
+  return out;
+};
+
+const executeSortWrapper: ExplainWrapperExecutor = async (
+  node,
+  inputRows,
+  env,
+  sf,
+  opts,
+) => {
+  const t0 = opts.timing ? performance.now() : 0;
+  const orderBy = node.orderBySpec;
+
+  if (!orderBy || orderBy.length === 0) {
+    node.actualRows = inputRows.length;
+    node.actualLoops = 1;
+    node.memoryRows = inputRows.length;
+    const elapsed = wrapperExecElapsed(t0, opts);
+    if (elapsed !== undefined) {
+      node.actualStartupTimeMs = elapsed;
+      node.actualTimeMs = elapsed;
+    }
+    return inputRows;
+  }
+
+  const decorated: { row: LuaTable; keys: any[] }[] = [];
+  for (const row of inputRows) {
+    const keys: any[] = [];
+    for (const spec of orderBy) {
+      keys.push(await evalExprAgainstRow(spec.expr, row, env, sf));
+    }
+    decorated.push({ row, keys });
+  }
+
+  decorated.sort((a, b) => {
+    for (let i = 0; i < orderBy.length; i++) {
+      const av = sortKey(a.keys[i]);
+      const bv = sortKey(b.keys[i]);
+      const cmp = compareSortKeys(av, bv);
+      if (cmp !== 0) {
+        return orderBy[i].desc ? -cmp : cmp;
+      }
+    }
+    return 0;
+  });
+
+  const out = decorated.map((d) => d.row);
+  node.actualRows = out.length;
+  node.actualLoops = 1;
+  node.memoryRows = inputRows.length;
+  const elapsed = wrapperExecElapsed(t0, opts);
+  if (elapsed !== undefined) {
+    node.actualStartupTimeMs = elapsed;
+    node.actualTimeMs = elapsed;
+  }
+  return out;
+};
+
+const executeGroupAggregateWrapper: ExplainWrapperExecutor = async (
+  node,
+  inputRows,
+  env,
+  sf,
+  opts,
+) => {
+  const t0 = opts.timing ? performance.now() : 0;
+  const groupBy = node.groupBySpec;
+
+  if (!groupBy || groupBy.length === 0) {
+    node.actualRows = inputRows.length;
+    node.actualLoops = 1;
+    const elapsed = wrapperExecElapsed(t0, opts);
+    if (elapsed !== undefined) {
+      node.actualStartupTimeMs = elapsed;
+      node.actualTimeMs = elapsed;
+    }
+    return inputRows;
+  }
+
+  const groups = new Map<string, LuaTable>();
+  for (const row of inputRows) {
+    const keyParts: string[] = [];
+    const outRow = new LuaTable();
+
+    for (const spec of groupBy) {
+      const v = await evalExprAgainstRow(spec.expr, row, env, sf);
+      keyParts.push(valueIdentity(v));
+      if (spec.alias) {
+        void outRow.rawSet(spec.alias, v);
+      }
+    }
+
+    const key = keyParts.join("|");
+    if (!groups.has(key)) {
+      groups.set(key, outRow);
+    }
+  }
+
+  const out = [...groups.values()];
+  node.actualRows = out.length;
+  node.actualLoops = 1;
+  const elapsed = wrapperExecElapsed(t0, opts);
+  if (elapsed !== undefined) {
+    node.actualStartupTimeMs = elapsed;
+    node.actualTimeMs = elapsed;
+  }
+  return out;
+};
+
+function getWrapperExecutor(
+  node: ExplainNode,
+): ExplainWrapperExecutor | undefined {
+  switch (node.nodeType) {
+    case "Filter":
+      return executeFilterWrapper;
+    case "Unique":
+      return executeUniqueWrapper;
+    case "Limit":
+      return executeLimitWrapper;
+    case "Sort":
+      return executeSortWrapper;
+    case "GroupAggregate":
+      return executeGroupAggregateWrapper;
+    default:
+      return undefined;
+  }
+}
+
+export async function executeExplainWrappers(
+  node: ExplainNode,
+  rows: LuaTable[],
+  env: LuaEnv,
+  sf: LuaStackFrame,
+  opts: ExplainOptions,
+): Promise<LuaTable[]> {
+  if (node.children.length === 0) {
+    node.actualRows = rows.length;
+    node.actualLoops = 1;
+    if (opts.timing) {
+      node.actualStartupTimeMs = 0;
+      node.actualTimeMs = 0;
+    }
+    return rows;
+  }
+
+  const childRows = await executeExplainWrappers(
+    node.children[0],
+    cloneRows(rows),
+    env,
+    sf,
+    opts,
+  );
+
+  const exec = getWrapperExecutor(node);
+  if (!exec) {
+    node.actualRows = childRows.length;
+    node.actualLoops = 1;
+    if (opts.timing) {
+      node.actualStartupTimeMs = 0;
+      node.actualTimeMs = 0;
+    }
+    return childRows;
+  }
+
+  return exec(node, childRows, env, sf, opts);
+}
+
 export async function executeAndInstrument(
   tree: JoinNode,
   plan: ExplainNode,
@@ -2826,98 +3157,6 @@ export async function executeAndInstrument(
   }
 
   return joinResult;
-}
-
-function estimateRowsRemoved(inputRows: number, outputRows: number): number {
-  return Math.max(0, inputRows - outputRows);
-}
-
-async function executeFilterNodeExact(
-  node: ExplainNode,
-  rows: LuaTable[],
-): Promise<LuaTable[]> {
-  const outputRows = Math.min(rows.length, node.estimatedRows);
-  node.actualRows = outputRows;
-  node.actualLoops = 1;
-  node.rowsRemovedByFilter = estimateRowsRemoved(rows.length, outputRows);
-  return rows.slice(0, outputRows);
-}
-
-async function executeUniqueNodeExact(
-  node: ExplainNode,
-  rows: LuaTable[],
-): Promise<LuaTable[]> {
-  const outputRows = Math.min(rows.length, node.estimatedRows);
-  node.actualRows = outputRows;
-  node.actualLoops = 1;
-  return rows.slice(0, outputRows);
-}
-
-async function executeLimitNodeExact(
-  node: ExplainNode,
-  rows: LuaTable[],
-): Promise<LuaTable[]> {
-  const offset = node.offsetCount ?? 0;
-  const limit = node.limitCount ?? rows.length;
-  const out = rows.slice(offset, offset + limit);
-  node.actualRows = out.length;
-  node.actualLoops = 1;
-  return out;
-}
-
-async function executeSortNodeExact(
-  node: ExplainNode,
-  rows: LuaTable[],
-): Promise<LuaTable[]> {
-  node.actualRows = rows.length;
-  node.actualLoops = 1;
-  node.memoryRows = rows.length;
-  return rows;
-}
-
-async function executeGroupAggregateNodeExact(
-  node: ExplainNode,
-  rows: LuaTable[],
-): Promise<LuaTable[]> {
-  const outputRows = Math.min(rows.length, node.estimatedRows);
-  node.actualRows = outputRows;
-  node.actualLoops = 1;
-  return rows.slice(0, outputRows);
-}
-
-export async function executeExplainWrappersExact(
-  node: ExplainNode,
-  rows: LuaTable[],
-  _opts: ExplainOptions,
-): Promise<LuaTable[]> {
-  if (node.children.length === 0) {
-    node.actualRows = rows.length;
-    node.actualLoops = 1;
-    return rows;
-  }
-
-  const childRows = await executeExplainWrappersExact(
-    node.children[0],
-    rows,
-    _opts,
-  );
-
-  switch (node.nodeType) {
-    case "Filter":
-      return executeFilterNodeExact(node, childRows);
-    case "Unique":
-      return executeUniqueNodeExact(node, childRows);
-    case "Limit":
-      return executeLimitNodeExact(node, childRows);
-    case "Sort":
-      return executeSortNodeExact(node, childRows);
-    case "GroupAggregate":
-      return executeGroupAggregateNodeExact(node, childRows);
-    default:
-      node.actualRows = childRows.length;
-      node.actualLoops = 1;
-      return childRows;
-  }
 }
 
 // 22. Explain formatting
@@ -3094,13 +3333,6 @@ function formatNode(
       lines.push(`${detailPad}MCV: suppressed by stats provenance${suffix}`);
     } else if (node.mcvFallback === "no-mcv") {
       lines.push(`${detailPad}MCV: not available`);
-    }
-
-    if (
-      node.statsSource === "persisted-complete" &&
-      node.predicatePushdown === "none"
-    ) {
-      lines.push(`${detailPad}Planner Note: exact stats, but scan is not predicate-pushed`);
     }
   }
 

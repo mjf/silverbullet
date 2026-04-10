@@ -46,6 +46,7 @@ import {
   type ExplainOptions,
   type ExplainResult,
   executeAndInstrument,
+  executeExplainWrappers,
   executeJoinTree,
   explainJoinTree,
   exprToString,
@@ -825,72 +826,6 @@ function unwrapToJoinPlan(node: ExplainNode): ExplainNode {
   return node;
 }
 
-/**
- * After executeAndInstrument fills actuals on join/scan nodes,
- * copy them upward to wrapper nodes (Filter, Sort, Limit, GroupAggregate, Unique).
- * Used as a fallback when exact wrapper execution is not available.
- */
-function propagateActuals(node: ExplainNode, opts: ExplainOptions): void {
-  if (node.children.length === 0) return;
-
-  for (const child of node.children) {
-    propagateActuals(child, opts);
-  }
-
-  const child = node.children[0];
-  if (child.actualRows === undefined) return;
-
-  const copyTiming = () => {
-    if (!opts.timing) return;
-    if (child.actualStartupTimeMs !== undefined) {
-      node.actualStartupTimeMs = child.actualStartupTimeMs;
-    }
-    if (child.actualTimeMs !== undefined) {
-      node.actualTimeMs = child.actualTimeMs;
-    }
-  };
-
-  switch (node.nodeType) {
-    case "Filter": {
-      const inputRows = child.actualRows;
-      const outputRows = Math.min(inputRows, node.estimatedRows);
-      node.actualRows = outputRows;
-      node.actualLoops = 1;
-      node.rowsRemovedByFilter = Math.max(0, inputRows - outputRows);
-      copyTiming();
-      break;
-    }
-
-    case "Sort":
-      node.actualRows = child.actualRows;
-      node.actualLoops = 1;
-      node.memoryRows = child.actualRows;
-      copyTiming();
-      break;
-
-    case "GroupAggregate":
-      node.actualRows = Math.min(child.actualRows, node.estimatedRows);
-      node.actualLoops = 1;
-      copyTiming();
-      break;
-
-    case "Limit": {
-      const offset = node.offsetCount ?? 0;
-      const limit = node.limitCount ?? child.actualRows;
-      node.actualRows = Math.min(limit, Math.max(0, child.actualRows - offset));
-      node.actualLoops = 1;
-      copyTiming();
-      break;
-    }
-
-    case "Unique":
-      node.actualRows = Math.min(child.actualRows, node.estimatedRows);
-      node.actualLoops = 1;
-      copyTiming();
-      break;
-  }
-}
-
 async function buildExplainQueryShape(
   q: ReturnType<typeof asQueryExpr>,
   env: LuaEnv,
@@ -1087,28 +1022,31 @@ async function executeSingleSourceExplainAnalyze(
 ): Promise<any[]> {
   const t0 = opts.timing ? performance.now() : 0;
 
+  let baseRows: any[] | undefined;
   let baseRowCount: number;
   if (shouldTrustSingleSourceIndexRowCount(collection, sourceStats)) {
     const trusted = await collection.isTagIndexTrusted();
     if (trusted) {
       baseRowCount = sourceStats.rowCount;
     } else {
-      const baseRows = await collection.query(
+      const loadedBaseRows = await collection.query(
         {},
         env,
         sf,
         globalThis.client?.config,
       );
-      baseRowCount = baseRows.length;
+      baseRows = loadedBaseRows;
+      baseRowCount = loadedBaseRows.length;
     }
   } else {
-    const baseRows = await collection.query(
+    const loadedBaseRows = await collection.query(
       {},
       env,
       sf,
       globalThis.client?.config,
     );
-    baseRowCount = baseRows.length;
+    baseRows = loadedBaseRows;
+    baseRowCount = loadedBaseRows.length;
   }
 
   const finalRows = await collection.query(
@@ -1122,44 +1060,31 @@ async function executeSingleSourceExplainAnalyze(
   scanPlan.actualRows = baseRowCount;
   scanPlan.actualLoops = 1;
 
-  const annotate = (node: ExplainNode): void => {
-    for (const child of node.children) {
-      annotate(child);
-    }
+  if (opts.timing) {
+    const elapsed = Math.round((performance.now() - t0) * 1000) / 1000;
+    scanPlan.actualStartupTimeMs = elapsed;
+    scanPlan.actualTimeMs = elapsed;
+  }
 
-    switch (node.nodeType) {
-      case "Filter":
-        if (node.children.length > 0 && node.children[0] === scanPlan) {
-          node.actualRows = finalRows.length;
-          node.actualLoops = 1;
-          node.rowsRemovedByFilter = Math.max(0, baseRowCount - finalRows.length);
-        }
-        break;
-      case "Unique":
-      case "Sort":
-      case "Limit":
-      case "GroupAggregate":
-        node.actualRows = finalRows.length;
-        node.actualLoops = 1;
-        if (node.nodeType === "Sort") {
-          node.memoryRows = finalRows.length;
-        }
-        break;
-    }
-
-    if (opts.timing) {
-      const elapsed = Math.round((performance.now() - t0) * 1000) / 1000;
-      if (node.actualRows !== undefined) {
-        node.actualStartupTimeMs = elapsed;
-        node.actualTimeMs = elapsed;
-      }
-    }
-  };
-
-  annotate(plan);
+  const wrapperInputRows = baseRows ?? finalRows;
+  await executeExplainWrappers(
+    plan,
+    wrapperInputRows as any,
+    env,
+    sf,
+    opts,
+  );
 
   plan.actualRows = finalRows.length;
   plan.actualLoops = 1;
+
+  const directFilter =
+    plan.nodeType === "Filter" &&
+    plan.children.length > 0 &&
+    plan.children[0] === scanPlan;
+  if (directFilter) {
+    plan.rowsRemovedByFilter = Math.max(0, baseRowCount - finalRows.length);
+  }
 
   if (opts.timing) {
     const elapsed = Math.round((performance.now() - t0) * 1000) / 1000;
@@ -1729,7 +1654,7 @@ export function evalExpression(
             if (explainOpts?.analyze) {
               const execT0 = performance.now();
               const joinPlan = unwrapToJoinPlan(explainPlan!);
-              await executeAndInstrument(
+              const joinRows = await executeAndInstrument(
                 joinTree,
                 joinPlan,
                 env,
@@ -1738,7 +1663,13 @@ export function evalExpression(
                 plannerConfig,
                 materializedOverrides,
               );
-              propagateActuals(explainPlan!, explainOpts);
+              await executeExplainWrappers(
+                explainPlan!,
+                joinRows,
+                env,
+                sf,
+                explainOpts,
+              );
 
               const execEndT = performance.now();
               const result: ExplainResult = {
