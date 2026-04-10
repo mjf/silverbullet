@@ -41,7 +41,7 @@ const reverseKey = "ridx";
 const indexVersionKey = ["$indexVersion"];
 
 // Bump this every time a full reindex is needed
-const desiredIndexVersion = 12;
+const desiredIndexVersion = 13;
 
 type TagDefinition = {
   metatable?: any;
@@ -56,6 +56,84 @@ type TagDefinition = {
     | ObjectValue
     | null;
 };
+
+type BitmapPredicate =
+  | {
+      kind: "eq";
+      column: string;
+      value: string | number | boolean;
+    }
+  | {
+      kind: "neq";
+      column: string;
+      value: string | number | boolean;
+    };
+
+function literalValueFromExpr(expr: any): string | number | boolean | undefined {
+  switch (expr?.type) {
+    case "String":
+      return expr.value;
+    case "Number":
+      return expr.value;
+    case "Boolean":
+      return expr.value;
+    default:
+      return undefined;
+  }
+}
+
+function propertyNameForSourceExpr(
+  expr: any,
+  sourceName: string | undefined,
+): string | undefined {
+  if (!expr) return undefined;
+
+  if (expr.type === "PropertyAccess") {
+    if (expr.object?.type === "Variable") {
+      if (!sourceName || expr.object.name === sourceName) {
+        return expr.property;
+      }
+    }
+  }
+
+  if (!sourceName && expr.type === "Variable") {
+    return expr.name;
+  }
+
+  return undefined;
+}
+
+function extractBitmapPredicate(
+  expr: any,
+  sourceName: string | undefined,
+): BitmapPredicate | undefined {
+  if (!expr || expr.type !== "Binary") return undefined;
+
+  const leftCol = propertyNameForSourceExpr(expr.left, sourceName);
+  const rightCol = propertyNameForSourceExpr(expr.right, sourceName);
+  const leftLit = literalValueFromExpr(expr.left);
+  const rightLit = literalValueFromExpr(expr.right);
+
+  if (expr.operator === "==") {
+    if (leftCol && rightLit !== undefined) {
+      return { kind: "eq", column: leftCol, value: rightLit };
+    }
+    if (rightCol && leftLit !== undefined) {
+      return { kind: "eq", column: rightCol, value: leftLit };
+    }
+  }
+
+  if (expr.operator === "~=" || expr.operator === "!=") {
+    if (leftCol && rightLit !== undefined) {
+      return { kind: "neq", column: leftCol, value: rightLit };
+    }
+    if (rightCol && leftLit !== undefined) {
+      return { kind: "neq", column: rightCol, value: leftLit };
+    }
+  }
+
+  return undefined;
+}
 
 export class ObjectValidationError extends Error {
   constructor(
@@ -139,13 +217,31 @@ export class ObjectIndex {
         env: LuaEnv,
         sf: LuaStackFrame,
         config?: Config,
-      ): Promise<any[]> {
-        // Load all objects for this tag via KV prefix scan, decode, enrich
-        const results: any[] = [];
+      ): Promise<ObjectValue<any>[]> {
+        const bitmapPredicate = extractBitmapPredicate(
+          query.where,
+          query.objectVariable,
+        );
+
+        if (bitmapPredicate) {
+          const objectIds = self.bitmapMatchObjectIds(tagName, bitmapPredicate);
+          if (objectIds) {
+            const prefetched = await self.loadObjectsByObjectIds(
+              tagName,
+              objectIds,
+            );
+            return applyQuery(prefetched, query, env, sf, config);
+          }
+        }
+
+        // Fallback: full scan, decode, enrich, then query in memory
+        const results: ObjectValue<any>[] = [];
         for await (const { value } of self.ds.query({
           prefix: [indexKey, tagName],
         })) {
-          const decoded = self.bitmapIndex.decodeObject(value as EncodedObject);
+          const decoded = self.bitmapIndex.decodeObject(
+            value as EncodedObject,
+          ) as ObjectValue<any>;
           results.push(self.enrichValue(tagName, decoded));
         }
         return applyQuery(results, query, env, sf, config);
@@ -160,7 +256,7 @@ export class ObjectIndex {
             avgColumnCount: 0,
             statsSource: "computed-empty",
             executionCapabilities: {
-              predicatePushdown: "none",
+              predicatePushdown: "bitmap-basic",
               scanKind: "index-scan",
             },
           };
@@ -174,7 +270,6 @@ export class ObjectIndex {
           for (const [col, colMeta] of Object.entries(meta.columns)) {
             ndv.set(col, colMeta.ndv);
 
-            // Build MCVList from exact bitmap cardinalities
             const topValues = self.bitmapIndex.getColumnMCV(tagId, col);
             if (topValues.length > 0) {
               const list = new MCVList();
@@ -196,7 +291,7 @@ export class ObjectIndex {
             ? "persisted-complete"
             : "persisted-partial",
           executionCapabilities: {
-            predicatePushdown: "none",
+            predicatePushdown: "bitmap-basic",
             scanKind: "index-scan",
           },
         };
@@ -642,6 +737,72 @@ export class ObjectIndex {
     } else {
       return ref;
     }
+  }
+
+  private async loadObjectsByObjectIds(
+    tagName: string,
+    objectIds: number[],
+  ): Promise<ObjectValue<any>[]> {
+    const tagId = this.bitmapIndex.getDictionary().tryEncode(tagName);
+    if (tagId === undefined || objectIds.length === 0) {
+      return [];
+    }
+
+    const results: ObjectValue<any>[] = [];
+    for (const objectId of objectIds) {
+      const encoded = await this.ds.get(
+        this.bitmapIndex.objectStorageKey(tagId, objectId),
+      );
+      if (!encoded) {
+        continue;
+      }
+      const decoded = this.bitmapIndex.decodeObject(
+        encoded as any,
+      ) as ObjectValue<any>;
+      results.push(this.enrichValue(tagName, decoded));
+    }
+
+    return results;
+  }
+
+  private bitmapMatchObjectIds(
+    tagName: string,
+    predicate: BitmapPredicate,
+  ): number[] | undefined {
+    const dict = this.bitmapIndex.getDictionary();
+    const tagId = dict.tryEncode(tagName);
+    if (tagId === undefined) {
+      return [];
+    }
+
+    const valueId = dict.tryEncode(predicate.value);
+    if (valueId === undefined) {
+      return predicate.kind === "eq" ? [] : undefined;
+    }
+
+    if (predicate.kind === "eq") {
+      const bm = this.bitmapIndex.getBitmap(tagId, predicate.column, valueId);
+      return bm ? [...bm.toArray()].sort((a, b) => a - b) : [];
+    }
+
+    const bitmaps = this.bitmapIndex.getColumnBitmaps(tagId, predicate.column);
+    if (bitmaps.length === 0) {
+      return undefined;
+    }
+
+    const excluded = this.bitmapIndex.getBitmap(tagId, predicate.column, valueId);
+    const ids = new Set<number>();
+    for (const bm of bitmaps) {
+      for (const id of bm.toArray()) {
+        ids.add(id);
+      }
+    }
+    if (excluded) {
+      for (const id of excluded.toArray()) {
+        ids.delete(id);
+      }
+    }
+    return [...ids].sort((a, b) => a - b);
   }
 
   // --- Validation / transform pipeline (unchanged logic) ---

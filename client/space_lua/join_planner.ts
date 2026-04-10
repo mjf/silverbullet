@@ -3054,7 +3054,7 @@ function formatNode(
     }
 
     if (node.predicatePushdown) {
-      lines.push(`${detailPad}Predicate Pushdown: ${node.predicatePushdown}`);
+      lines.push(`${detailPad}Execution Capability: ${node.predicatePushdown}`);
     }
 
     if (node.statsSource) {
