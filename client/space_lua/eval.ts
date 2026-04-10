@@ -1022,7 +1022,6 @@ async function executeSingleSourceExplainAnalyze(
 ): Promise<any[]> {
   const t0 = opts.timing ? performance.now() : 0;
 
-  let baseRows: any[] | undefined;
   let baseRowCount: number;
   if (shouldTrustSingleSourceIndexRowCount(collection, sourceStats)) {
     const trusted = await collection.isTagIndexTrusted();
@@ -1035,7 +1034,6 @@ async function executeSingleSourceExplainAnalyze(
         sf,
         globalThis.client?.config,
       );
-      baseRows = loadedBaseRows;
       baseRowCount = loadedBaseRows.length;
     }
   } else {
@@ -1045,7 +1043,6 @@ async function executeSingleSourceExplainAnalyze(
       sf,
       globalThis.client?.config,
     );
-    baseRows = loadedBaseRows;
     baseRowCount = loadedBaseRows.length;
   }
 
@@ -1060,31 +1057,45 @@ async function executeSingleSourceExplainAnalyze(
   scanPlan.actualRows = baseRowCount;
   scanPlan.actualLoops = 1;
 
-  if (opts.timing) {
-    const elapsed = Math.round((performance.now() - t0) * 1000) / 1000;
-    scanPlan.actualStartupTimeMs = elapsed;
-    scanPlan.actualTimeMs = elapsed;
-  }
+  const annotate = (node: ExplainNode): void => {
+    for (const child of node.children) {
+      annotate(child);
+    }
 
-  const wrapperInputRows = baseRows ?? finalRows;
-  await executeExplainWrappers(
-    plan,
-    wrapperInputRows as any,
-    env,
-    sf,
-    opts,
-  );
+    switch (node.nodeType) {
+      case "Filter":
+        if (node.children.length > 0) {
+          const childRows = node.children[0].actualRows ?? baseRowCount;
+          node.actualRows = finalRows.length;
+          node.actualLoops = 1;
+          node.rowsRemovedByFilter = Math.max(0, childRows - finalRows.length);
+        }
+        break;
+      case "Unique":
+      case "Sort":
+      case "Limit":
+      case "GroupAggregate":
+        node.actualRows = finalRows.length;
+        node.actualLoops = 1;
+        if (node.nodeType === "Sort") {
+          node.memoryRows = finalRows.length;
+        }
+        break;
+    }
+
+    if (opts.timing) {
+      const elapsed = Math.round((performance.now() - t0) * 1000) / 1000;
+      if (node.actualRows !== undefined) {
+        node.actualStartupTimeMs = elapsed;
+        node.actualTimeMs = elapsed;
+      }
+    }
+  };
+
+  annotate(plan);
 
   plan.actualRows = finalRows.length;
   plan.actualLoops = 1;
-
-  const directFilter =
-    plan.nodeType === "Filter" &&
-    plan.children.length > 0 &&
-    plan.children[0] === scanPlan;
-  if (directFilter) {
-    plan.rowsRemovedByFilter = Math.max(0, baseRowCount - finalRows.length);
-  }
 
   if (opts.timing) {
     const elapsed = Math.round((performance.now() - t0) * 1000) / 1000;
@@ -1093,6 +1104,48 @@ async function executeSingleSourceExplainAnalyze(
   }
 
   return finalRows;
+}
+
+function annotateExplainWrappersFromFinalRows(
+  plan: ExplainNode,
+  fallbackInputRows: number,
+  finalRows: number,
+  opts: ExplainOptions,
+  startedAtMs: number,
+): void {
+  const annotate = (node: ExplainNode): void => {
+    for (const child of node.children) {
+      annotate(child);
+    }
+
+    switch (node.nodeType) {
+      case "Filter": {
+        const childRows = node.children[0]?.actualRows ?? fallbackInputRows;
+        node.actualRows = finalRows;
+        node.actualLoops = 1;
+        node.rowsRemovedByFilter = Math.max(0, childRows - finalRows);
+        break;
+      }
+      case "Unique":
+      case "Sort":
+      case "Limit":
+      case "GroupAggregate":
+        node.actualRows = finalRows;
+        node.actualLoops = 1;
+        if (node.nodeType === "Sort") {
+          node.memoryRows = finalRows;
+        }
+        break;
+    }
+
+    if (opts.timing && node.actualRows !== undefined) {
+      const elapsed = Math.round((performance.now() - startedAtMs) * 1000) / 1000;
+      node.actualStartupTimeMs = elapsed;
+      node.actualTimeMs = elapsed;
+    }
+  };
+
+  annotate(plan);
 }
 
 async function materializeValueAsItems(
@@ -1663,12 +1716,92 @@ export function evalExpression(
                 plannerConfig,
                 materializedOverrides,
               );
+
               await executeExplainWrappers(
                 explainPlan!,
                 joinRows,
                 env,
                 sf,
                 explainOpts,
+              );
+
+              const joinedCollection = toCollection(joinRows);
+
+              const selectClause = q.clauses.find((c) => c.type === "Select");
+              const selectDistinct = selectClause?.distinct;
+
+              const analyzeQuery: LuaCollectionQuery = {
+                objectVariable: undefined,
+                distinct: selectDistinct !== false,
+              };
+
+              for (const clause of q.clauses) {
+                switch (clause.type) {
+                  case "Where": {
+                    if (residualWhere) {
+                      analyzeQuery.where = residualWhere;
+                    }
+                    break;
+                  }
+                  case "OrderBy": {
+                    analyzeQuery.orderBy = clause.orderBy.map((o) => ({
+                      expr: o.expression,
+                      desc: o.direction === "desc",
+                      nulls: o.nulls,
+                      using: o.using,
+                    }));
+                    break;
+                  }
+                  case "Select": {
+                    analyzeQuery.select = fieldsToExpression(clause.fields, clause.ctx);
+                    break;
+                  }
+                  case "Limit": {
+                    const limitVal = await evalExpression(clause.limit, env, sf);
+                    analyzeQuery.limit = Number(limitVal);
+                    if (clause.offset) {
+                      const offsetVal = await evalExpression(
+                        clause.offset,
+                        env,
+                        sf,
+                      );
+                      analyzeQuery.offset = Number(offsetVal);
+                    }
+                    break;
+                  }
+                  case "Offset": {
+                    const offsetVal = await evalExpression(
+                      clause.offset,
+                      env,
+                      sf,
+                    );
+                    analyzeQuery.offset = Number(offsetVal);
+                    break;
+                  }
+                  case "GroupBy": {
+                    analyzeQuery.groupBy = fieldsToGroupByEntries(clause.fields);
+                    break;
+                  }
+                  case "Having": {
+                    analyzeQuery.having = clause.expression;
+                    break;
+                  }
+                }
+              }
+
+              const finalRows = await joinedCollection.query(
+                analyzeQuery,
+                env,
+                sf,
+                globalThis.client?.config,
+              );
+
+              annotateExplainWrappersFromFinalRows(
+                explainPlan!,
+                joinRows.length,
+                finalRows.length,
+                explainOpts,
+                execT0,
               );
 
               const execEndT = performance.now();
