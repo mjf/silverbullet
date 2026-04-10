@@ -193,12 +193,12 @@ export type ExplainNode = {
   // Verbose: estimation provenance (join nodes only)
   selectivity?: number;
   ndvSource?:
-    "roaring-bitmap index" |
-    "half-xor heuristic" |
-    "row-count heuristic";
+    | "roaring-bitmap index"
+    | "half-xor heuristic"
+    | "row-count heuristic";
   mcvUsed?: boolean;
   mcvFallback?: "one-sided" | "no-mcv";
-  mcvKeys?: string[];
+  mcvKeyCount?: number;
   joinKeyNdv?: {
     left: string;
     leftNdv: number;
@@ -2131,9 +2131,7 @@ export function explainJoinTree(
     return {
       nodeType: isFnScan ? "FunctionScan" : "Scan",
       source: tree.source.name,
-      functionCall: isFnScan
-        ? exprToString(tree.source.expression)
-        : undefined,
+      functionCall: isFnScan ? exprToString(tree.source.expression) : undefined,
       hintUsed: tree.source.hint
         ? formatHintLabel(tree.source.hint)
         : undefined,
@@ -2170,7 +2168,6 @@ export function explainJoinTree(
       DEFAULT_SELECTIVITY,
     );
 
-  // Use shared cost model
   const { startupCost, totalCost } = computeJoinCost(
     tree.method,
     jt,
@@ -2190,12 +2187,12 @@ export function explainJoinTree(
 
   const width = leftPlan.estimatedWidth + rightPlan.estimatedWidth;
 
-  // Verbose: derive estimation provenance for join key
   let ndvSource: ExplainNode["ndvSource"];
   let mcvUsed = false;
   let leftHasMcv = false;
   let rightHasMcv = false;
   let joinKeyNdv: ExplainNode["joinKeyNdv"] | undefined;
+  let mcvKeyCount: number | undefined;
 
   if (tree.equiPred) {
     const ep = tree.equiPred;
@@ -2226,25 +2223,26 @@ export function explainJoinTree(
       ndvSource = "row-count heuristic";
     }
 
-    // Was MCV used?
-    const leftMcv = tree.estimatedMcv
-      ?.get(ep.leftSource)
-      ?.get(ep.leftColumn);
+    const leftMcv = tree.estimatedMcv?.get(ep.leftSource)?.get(ep.leftColumn);
     const rightMcv = rightStats?.mcv?.get(ep.rightColumn);
-    const leftMcvKeys = leftMcv ? leftMcv.topKeys(5) : [];
-    const rightMcvKeys = rightMcv ? rightMcv.topKeys(5) : [];
-    leftHasMcv = leftMcvKeys.length > 0;
-    rightHasMcv = rightMcvKeys.length > 0;
+
+    const leftTrackedKeys = leftMcv?.trackedSize() ?? 0;
+    const rightTrackedKeys = rightMcv?.trackedSize() ?? 0;
+
+    leftHasMcv = leftTrackedKeys > 0;
+    rightHasMcv = rightTrackedKeys > 0;
     mcvUsed = leftHasMcv && rightHasMcv;
 
-    // Join key NDVs
-    const lNdv = tree.estimatedNdv
-      ?.get(ep.leftSource)
-      ?.get(ep.leftColumn);
-    const rNdv = tree.estimatedNdv
-      ?.get(ep.rightSource)
-      ?.get(ep.rightColumn)
-      ?? rightStats?.ndv?.get(ep.rightColumn);
+    if (mcvUsed) {
+      mcvKeyCount = Math.min(leftTrackedKeys, rightTrackedKeys);
+    } else if (leftHasMcv || rightHasMcv) {
+      mcvKeyCount = Math.max(leftTrackedKeys, rightTrackedKeys);
+    }
+
+    const lNdv = tree.estimatedNdv?.get(ep.leftSource)?.get(ep.leftColumn);
+    const rNdv =
+      tree.estimatedNdv?.get(ep.rightSource)?.get(ep.rightColumn) ??
+      rightStats?.ndv?.get(ep.rightColumn);
 
     joinKeyNdv = {
       left: `${ep.leftSource}.${ep.leftColumn}`,
@@ -2252,6 +2250,15 @@ export function explainJoinTree(
       right: `${ep.rightSource}.${ep.rightColumn}`,
       rightNdv: rNdv ?? -1,
     };
+  }
+
+  let mcvFallback: ExplainNode["mcvFallback"];
+  if (mcvUsed) {
+    mcvFallback = undefined;
+  } else if (leftHasMcv || rightHasMcv) {
+    mcvFallback = "one-sided";
+  } else {
+    mcvFallback = "no-mcv";
   }
 
   return {
@@ -2267,17 +2274,8 @@ export function explainJoinTree(
     selectivity: tree.estimatedSelectivity,
     ndvSource,
     mcvUsed: mcvUsed || undefined,
-    mcvFallback: mcvUsed
-      ? undefined
-      : (leftHasMcv || rightHasMcv)
-        ? "one-sided"
-        : "no-mcv",
-    mcvKeys: (leftHasMcv || rightHasMcv)
-      ? [
-          ...(leftHasMcv ? [`${ep.leftSource}.${ep.leftColumn}: {${leftMcvKeys.join(", ")}}`] : []),
-          ...(rightHasMcv ? [`${ep.rightSource}.${ep.rightColumn}: {${rightMcvKeys.join(", ")}}`] : []),
-        ]
-      : undefined,
+    mcvFallback,
+    mcvKeyCount,
     joinKeyNdv,
     children: [leftPlan, rightPlan],
   };
@@ -3086,18 +3084,20 @@ function formatNode(
       const l = node.joinKeyNdv;
       const fmtNdv = (n: number) => (n < 0 ? "n/a" : String(n));
       lines.push(
-        `${detailPad}NDV: ${node.ndvSource}  (keys ${l.left}=${fmtNdv(l.leftNdv)} ${l.right}=${fmtNdv(l.rightNdv)})`,
+        `${detailPad}NDV: ${node.ndvSource}  (values ${l.left}=${fmtNdv(l.leftNdv)} ${l.right}=${fmtNdv(l.rightNdv)})`,
       );
     } else if (node.ndvSource) {
       lines.push(`${detailPad}NDV: ${node.ndvSource}`);
     }
 
     if (node.mcvUsed) {
-      const keyStr = node.mcvKeys ? `  (keys ${node.mcvKeys.join(" ")})` : "";
-      lines.push(`${detailPad}MCV: both sides${keyStr}`);
+      const suffix =
+        node.mcvKeyCount !== undefined ? `  (keys=${node.mcvKeyCount})` : "";
+      lines.push(`${detailPad}MCV: both sides${suffix}`);
     } else if (node.mcvFallback === "one-sided") {
-      const keyStr = node.mcvKeys ? `  (key ${node.mcvKeys.join(" ")})` : "";
-      lines.push(`${detailPad}MCV: single side${keyStr}`);
+      const suffix =
+        node.mcvKeyCount !== undefined ? `  (keys=${node.mcvKeyCount})` : "";
+      lines.push(`${detailPad}MCV: single side${suffix}`);
     } else if (node.mcvFallback === "no-mcv") {
       lines.push(`${detailPad}MCV: not available`);
     }
