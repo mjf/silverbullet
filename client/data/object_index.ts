@@ -224,7 +224,10 @@ export class ObjectIndex {
         );
 
         if (bitmapPredicate) {
-          const objectIds = self.bitmapMatchObjectIds(tagName, bitmapPredicate);
+          const objectIds = await self.bitmapMatchObjectIds(
+            tagName,
+            bitmapPredicate,
+          );
           if (objectIds) {
             const prefetched = await self.loadObjectsByObjectIds(
               tagName,
@@ -247,8 +250,14 @@ export class ObjectIndex {
         return applyQuery(results, query, env, sf, config);
       },
 
+      async isTagIndexTrusted(): Promise<boolean> {
+        return self.isTagIndexTrusted(tagName);
+      },
+
       async getStats(): Promise<CollectionStats> {
         const tagId = self.bitmapIndex.getDictionary().tryEncode(tagName);
+        const indexTrusted = await self.isTagIndexTrusted(tagName);
+
         if (tagId === undefined) {
           return {
             rowCount: 0,
@@ -256,7 +265,7 @@ export class ObjectIndex {
             avgColumnCount: 0,
             statsSource: "computed-empty",
             executionCapabilities: {
-              predicatePushdown: "bitmap-basic",
+              predicatePushdown: "none",
               scanKind: "index-scan",
             },
           };
@@ -291,7 +300,7 @@ export class ObjectIndex {
             ? "persisted-complete"
             : "persisted-partial",
           executionCapabilities: {
-            predicatePushdown: "bitmap-basic",
+            predicatePushdown: indexTrusted ? "bitmap-basic" : "none",
             scanKind: "index-scan",
           },
         };
@@ -739,6 +748,53 @@ export class ObjectIndex {
     }
   }
 
+  private async isBitmapPushdownTrusted(
+    tagName: string,
+    column: string,
+  ): Promise<boolean> {
+    const tagId = this.bitmapIndex.getDictionary().tryEncode(tagName);
+    if (tagId === undefined) {
+      return false;
+    }
+
+    const meta = this.bitmapIndex.getTagMetaById(tagId);
+    if (!meta) {
+      return false;
+    }
+
+    const columnMeta = meta.columns[column];
+    if (!columnMeta?.indexed) {
+      return false;
+    }
+
+    // Only trust bitmap pushdown when the persisted index is fully built
+    // and the indexing queue is currently drained.
+    if (!(await this.hasFullIndexCompleted())) {
+      return false;
+    }
+    if (!(await this.mq.isQueueEmpty("indexQueue"))) {
+      return false;
+    }
+
+    return true;
+  }
+
+  async isTagIndexTrusted(tagName: string): Promise<boolean> {
+    const tagId = this.bitmapIndex.getDictionary().tryEncode(tagName);
+    if (tagId === undefined) {
+      return false;
+    }
+
+    if (!(await this.hasFullIndexCompleted())) {
+      return false;
+    }
+    if (!(await this.mq.isQueueEmpty("indexQueue"))) {
+      return false;
+    }
+
+    return this.bitmapIndex.getTagMetaById(tagId) !== undefined;
+  }
+
   private async loadObjectsByObjectIds(
     tagName: string,
     objectIds: number[],
@@ -766,24 +822,37 @@ export class ObjectIndex {
     return results;
   }
 
-  private bitmapMatchObjectIds(
+  private async bitmapMatchObjectIds(
     tagName: string,
     predicate: BitmapPredicate,
-  ): number[] | undefined {
+  ): Promise<number[] | undefined> {
     const dict = this.bitmapIndex.getDictionary();
     const tagId = dict.tryEncode(tagName);
     if (tagId === undefined) {
       return [];
     }
 
-    const valueId = dict.tryEncode(predicate.value);
-    if (valueId === undefined) {
-      return predicate.kind === "eq" ? [] : undefined;
+    if (!(await this.isBitmapPushdownTrusted(tagName, predicate.column))) {
+      return undefined;
     }
 
+    const valueId = dict.tryEncode(predicate.value);
+
     if (predicate.kind === "eq") {
+      if (valueId === undefined) {
+        return undefined;
+      }
+
       const bm = this.bitmapIndex.getBitmap(tagId, predicate.column, valueId);
-      return bm ? [...bm.toArray()].sort((a, b) => a - b) : [];
+      if (!bm) {
+        return undefined;
+      }
+
+      return [...bm.toArray()].sort((a, b) => a - b);
+    }
+
+    if (valueId === undefined) {
+      return undefined;
     }
 
     const bitmaps = this.bitmapIndex.getColumnBitmaps(tagId, predicate.column);

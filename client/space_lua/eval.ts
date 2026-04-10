@@ -46,7 +46,6 @@ import {
   type ExplainOptions,
   type ExplainResult,
   executeAndInstrument,
-  executeExplainWrappersExact,
   executeJoinTree,
   explainJoinTree,
   exprToString,
@@ -1055,6 +1054,28 @@ function explainSingleSource(
   };
 }
 
+function shouldTrustSingleSourceIndexRowCount(
+  collection: any,
+  stats: CollectionStats | undefined,
+): collection is {
+  query: (
+    query: LuaCollectionQuery,
+    env: LuaEnv,
+    sf: LuaStackFrame,
+    config?: any,
+  ) => Promise<any[]>;
+  isTagIndexTrusted: () => Promise<boolean>;
+} {
+  return !!stats &&
+    stats.statsSource === "persisted-complete" &&
+    !!collection &&
+    typeof collection === "object" &&
+    "query" in collection &&
+    typeof (collection as any).query === "function" &&
+    "isTagIndexTrusted" in collection &&
+    typeof (collection as any).isTagIndexTrusted === "function";
+}
+
 async function executeSingleSourceExplainAnalyze(
   collection: any,
   query: LuaCollectionQuery,
@@ -1065,7 +1086,32 @@ async function executeSingleSourceExplainAnalyze(
   opts: ExplainOptions,
 ): Promise<any[]> {
   const t0 = opts.timing ? performance.now() : 0;
-  const rows = await collection.query(
+
+  let baseRowCount: number;
+  if (shouldTrustSingleSourceIndexRowCount(collection, sourceStats)) {
+    const trusted = await collection.isTagIndexTrusted();
+    if (trusted) {
+      baseRowCount = sourceStats.rowCount;
+    } else {
+      const baseRows = await collection.query(
+        {},
+        env,
+        sf,
+        globalThis.client?.config,
+      );
+      baseRowCount = baseRows.length;
+    }
+  } else {
+    const baseRows = await collection.query(
+      {},
+      env,
+      sf,
+      globalThis.client?.config,
+    );
+    baseRowCount = baseRows.length;
+  }
+
+  const finalRows = await collection.query(
     query,
     env,
     sf,
@@ -1073,20 +1119,47 @@ async function executeSingleSourceExplainAnalyze(
   );
 
   const scanPlan = unwrapToJoinPlan(plan);
-  scanPlan.actualRows = sourceStats.rowCount;
+  scanPlan.actualRows = baseRowCount;
   scanPlan.actualLoops = 1;
 
-  if (opts.timing) {
-    const elapsed = Math.round((performance.now() - t0) * 1000) / 1000;
-    scanPlan.actualStartupTimeMs = elapsed;
-    scanPlan.actualTimeMs = elapsed;
-  }
+  const annotate = (node: ExplainNode): void => {
+    for (const child of node.children) {
+      annotate(child);
+    }
 
-  await executeExplainWrappersExact(plan, rows as any, opts);
+    switch (node.nodeType) {
+      case "Filter":
+        if (node.children.length > 0 && node.children[0] === scanPlan) {
+          node.actualRows = finalRows.length;
+          node.actualLoops = 1;
+          node.rowsRemovedByFilter = Math.max(0, baseRowCount - finalRows.length);
+        }
+        break;
+      case "Unique":
+      case "Sort":
+      case "Limit":
+      case "GroupAggregate":
+        node.actualRows = finalRows.length;
+        node.actualLoops = 1;
+        if (node.nodeType === "Sort") {
+          node.memoryRows = finalRows.length;
+        }
+        break;
+    }
 
-  if (plan.actualRows === undefined) {
-    propagateActuals(plan, opts);
-  }
+    if (opts.timing) {
+      const elapsed = Math.round((performance.now() - t0) * 1000) / 1000;
+      if (node.actualRows !== undefined) {
+        node.actualStartupTimeMs = elapsed;
+        node.actualTimeMs = elapsed;
+      }
+    }
+  };
+
+  annotate(plan);
+
+  plan.actualRows = finalRows.length;
+  plan.actualLoops = 1;
 
   if (opts.timing) {
     const elapsed = Math.round((performance.now() - t0) * 1000) / 1000;
@@ -1094,7 +1167,7 @@ async function executeSingleSourceExplainAnalyze(
     plan.actualTimeMs = elapsed;
   }
 
-  return rows;
+  return finalRows;
 }
 
 async function materializeValueAsItems(

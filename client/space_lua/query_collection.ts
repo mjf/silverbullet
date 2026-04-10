@@ -91,6 +91,8 @@ export interface LuaQueryCollectionWithStats extends LuaQueryCollection {
     | CollectionStats
     | Promise<CollectionStats | undefined>
     | undefined;
+
+  isTagIndexTrusted?(): Promise<boolean> | boolean;
 }
 
 export class StatsTracker {
