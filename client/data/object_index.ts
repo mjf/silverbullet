@@ -154,7 +154,12 @@ export class ObjectIndex {
       async getStats(): Promise<CollectionStats> {
         const tagId = self.bitmapIndex.getDictionary().tryEncode(tagName);
         if (tagId === undefined) {
-          return { rowCount: 0, ndv: new Map(), avgColumnCount: 0 };
+          return {
+            rowCount: 0,
+            ndv: new Map(),
+            avgColumnCount: 0,
+            statsSource: "computed-empty",
+          };
         }
         const rowCount = self.bitmapIndex.getRowCount(tagId);
         const meta = self.bitmapIndex.getTagMetaById(tagId);
@@ -183,7 +188,9 @@ export class ObjectIndex {
           ndv,
           avgColumnCount: ndv.size,
           mcv: mcv.size > 0 ? mcv : undefined,
-          statsSource: indexComplete ? "persisted" : "partial",
+          statsSource: indexComplete
+            ? "persisted-complete"
+            : "persisted-partial",
         };
       },
     };

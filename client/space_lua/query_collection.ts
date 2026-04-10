@@ -37,12 +37,37 @@ import {
 } from "./runtime.ts";
 import { asyncMergeSort } from "./util.ts";
 
+/**
+ * Provenance / confidence class for collection statistics.
+ *
+ * The planner must not treat all stats equally:
+ * - persisted-complete: exact stats from a fully built persisted index
+ * - persisted-partial: exact-on-visible-subset stats from an incomplete index
+ * - computed-exact-small: exact stats computed from a small materialized source
+ * - computed-sketch-large: approximate NDV computed from a large materialized source
+ * - recomputed-filtered-exact: exact stats recomputed after pushdown filtering
+ * - source-provided-exact: exact stats supplied by a trusted custom source
+ * - source-provided-unknown: source supplied stats but without exactness guarantee
+ * - computed-empty: exact empty-source stats
+ * - unknown-default: conservative fallback with little or no information
+ */
+export type StatsSource =
+  | "persisted-complete"
+  | "persisted-partial"
+  | "computed-exact-small"
+  | "computed-sketch-large"
+  | "recomputed-filtered-exact"
+  | "source-provided-exact"
+  | "source-provided-unknown"
+  | "computed-empty"
+  | "unknown-default";
+
 // Collection statistics for the cost-based planner
 export type CollectionStats = {
   rowCount: number;
   ndv: Map<string, number>;
   avgColumnCount?: number;
-  statsSource?: "persisted" | "partial" | "computed" | "recomputed";
+  statsSource?: StatsSource;
   mcv?: Map<string, MCVList>;
 };
 
@@ -126,7 +151,15 @@ export class StatsTracker {
     }
     const avgColumnCount =
       this.rowCount > 0 ? Math.round(this.totalColumnCount / this.rowCount) : 0;
-    return { rowCount: this.rowCount, ndv, avgColumnCount, mcv };
+    return {
+      rowCount: this.rowCount,
+      ndv,
+      avgColumnCount,
+      mcv,
+      statsSource: this.rowCount === 0
+        ? "computed-empty"
+        : "computed-sketch-large",
+    };
   }
 
   getSerializedSketches(): Record<string, string> {
@@ -308,6 +341,15 @@ export function computeStatsFromArray(
   const ndv = new Map<string, number>();
   let totalColumnCount = 0;
 
+  if (items.length === 0) {
+    return {
+      rowCount: 0,
+      ndv,
+      avgColumnCount: 0,
+      statsSource: "computed-empty",
+    };
+  }
+
   if (items.length <= EXACT_THRESHOLD) {
     // Exact counting for small arrays
     const seen = new Map<string, Set<string>>();
@@ -329,39 +371,51 @@ export function computeStatsFromArray(
         }
       }
     }
-    for (const [k, s] of seen) ndv.set(k, s.size);
-  } else {
-    // Sketch-based for large arrays
-    const sketches = new Map<string, HalfXorSketch>();
-    for (const item of items) {
-      if (typeof item === "object" && item !== null) {
-        const keys =
-          item instanceof LuaTable ? luaKeys(item) : Object.keys(item);
-        totalColumnCount += keys.length;
-        for (const key of keys) {
-          if (typeof key !== "string") continue;
-          const val = item instanceof LuaTable ? item.rawGet(key) : item[key];
-          if (val === null || val === undefined) continue;
-          let sketch = sketches.get(key);
-          if (!sketch) {
-            sketch = new HalfXorSketch(sketchConfig);
-            sketches.set(key, sketch);
-          }
-          sketch.add(String(val));
-        }
-      }
+    for (const [k, s] of seen) {
+      ndv.set(k, s.size);
     }
-    for (const [k, sketch] of sketches) ndv.set(k, sketch.estimate());
+
+    const avgColumnCount = Math.round(totalColumnCount / items.length);
+
+    return {
+      rowCount: items.length,
+      ndv,
+      avgColumnCount,
+      statsSource: "computed-exact-small",
+    };
   }
 
-  const avgColumnCount =
-    items.length > 0 ? Math.round(totalColumnCount / items.length) : 0;
+  // Sketch-based for large arrays
+  const sketches = new Map<string, HalfXorSketch>();
+  for (const item of items) {
+    if (typeof item === "object" && item !== null) {
+      const keys =
+        item instanceof LuaTable ? luaKeys(item) : Object.keys(item);
+      totalColumnCount += keys.length;
+      for (const key of keys) {
+        if (typeof key !== "string") continue;
+        const val = item instanceof LuaTable ? item.rawGet(key) : item[key];
+        if (val === null || val === undefined) continue;
+        let sketch = sketches.get(key);
+        if (!sketch) {
+          sketch = new HalfXorSketch(sketchConfig);
+          sketches.set(key, sketch);
+        }
+        sketch.add(String(val));
+      }
+    }
+  }
+  for (const [k, sketch] of sketches) {
+    ndv.set(k, sketch.estimate());
+  }
+
+  const avgColumnCount = Math.round(totalColumnCount / items.length);
 
   return {
     rowCount: items.length,
     ndv,
     avgColumnCount,
-    statsSource: "computed",
+    statsSource: "computed-sketch-large",
   };
 }
 
@@ -874,7 +928,8 @@ export async function applyQuery(
     const filteredResults = [];
     for (const value of results) {
       const itemEnv = buildItemEnvLocal(query.objectVariable, value, env, sf);
-      if (await evalExpression(query.where, itemEnv, sf)) {
+      const whereResult = await evalExpression(query.where, itemEnv, sf);
+      if (luaTruthy(whereResult)) {
         filteredResults.push(value);
       }
     }
@@ -1014,7 +1069,7 @@ export async function applyQuery(
         const itemEnv = buildItemEnvLocal(query.objectVariable, value, env, sf);
         condResult = await evalExpression(query.having, itemEnv, sf);
       }
-      if (condResult) {
+      if (luaTruthy(condResult)) {
         filteredResults.push(value);
       }
     }
@@ -1260,6 +1315,10 @@ export class DataStoreQueryCollection implements LuaQueryCollection {
     const rowCount = await this.dataStore.kv.countQuery({
       prefix: this.prefix,
     });
-    return { rowCount, ndv: new Map() };
+    return {
+      rowCount,
+      ndv: new Map(),
+      statsSource: rowCount === 0 ? "computed-empty" : "unknown-default",
+    };
   }
 }

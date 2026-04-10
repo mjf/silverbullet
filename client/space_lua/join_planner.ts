@@ -6,7 +6,7 @@
  */
 import type { LuaExpression, LuaFunctionBody, LuaJoinHint } from "./ast.ts";
 import { evalExpression } from "./eval.ts";
-import type { CollectionStats } from "./query_collection.ts";
+import type { CollectionStats, StatsSource } from "./query_collection.ts";
 import {
   LuaEnv,
   LuaFunction,
@@ -121,6 +121,7 @@ export type JoinInner = {
   estimatedRows?: number;
   estimatedNdv?: Map<string, Map<string, number>>;
   estimatedMcv?: Map<string, Map<string, MCVList>>;
+  statsSource?: JoinStatsSummary;
 };
 
 // 4. Predicate types
@@ -150,6 +151,8 @@ export type OpStats = {
   endTimeMs: number;
   peakMemoryRows: number;
 };
+
+type JoinStatsSummary = "exact" | "approximate" | "partial" | "unknown";
 
 // 6. Explain types
 
@@ -190,14 +193,14 @@ export type ExplainNode = {
   limitCount?: number;
   offsetCount?: number;
   children: ExplainNode[];
-  // Verbose: estimation provenance (join nodes only)
+
   selectivity?: number;
   ndvSource?:
     | "roaring-bitmap index"
     | "half-xor heuristic"
     | "row-count heuristic";
   mcvUsed?: boolean;
-  mcvFallback?: "one-sided" | "no-mcv";
+  mcvFallback?: "one-sided" | "no-mcv" | "suppressed";
   mcvKeyCount?: number;
   joinKeyNdv?: {
     left: string;
@@ -205,6 +208,7 @@ export type ExplainNode = {
     right: string;
     rightNdv: number;
   };
+  statsSource?: string;
 };
 
 export type ExplainOptions = {
@@ -221,7 +225,69 @@ export type ExplainResult = {
   executionTimeMs?: number;
 };
 
-// 7. Cardinality and selectivity estimation
+// 7. Stats provenance helpers
+
+function isPartialStatsSource(source: StatsSource | undefined): boolean {
+  return source === "persisted-partial";
+}
+
+function isApproximateStatsSource(source: StatsSource | undefined): boolean {
+  return (
+    source === "computed-sketch-large" ||
+    source === "source-provided-unknown" ||
+    source === "unknown-default"
+  );
+}
+
+function summarizeJoinStatsSource(
+  left: StatsSource | undefined,
+  right: StatsSource | undefined,
+): JoinStatsSummary {
+  if (left === "persisted-partial" || right === "persisted-partial") {
+    return "partial";
+  }
+  if (
+    isApproximateStatsSource(left) ||
+    isApproximateStatsSource(right)
+  ) {
+    return "approximate";
+  }
+  if (left || right) {
+    return "exact";
+  }
+  return "unknown";
+}
+
+function shouldAvoidAggressiveReordering(
+  sources: JoinSource[],
+): boolean {
+  return sources.some((s) => isPartialStatsSource(s.stats?.statsSource));
+}
+
+function canUseMcvForPlanning(
+  leftSource: StatsSource | undefined,
+  rightSource: StatsSource | undefined,
+): boolean {
+  return (
+    leftSource === "persisted-complete" &&
+    rightSource === "persisted-complete"
+  );
+}
+
+function ndvConfidenceMultiplier(
+  leftSource: StatsSource | undefined,
+  rightSource: StatsSource | undefined,
+): number {
+  if (isPartialStatsSource(leftSource) || isPartialStatsSource(rightSource)) {
+    return 0.25;
+  }
+  if (isApproximateStatsSource(leftSource) || isApproximateStatsSource(rightSource)) {
+    return 0.5;
+  }
+  return 1.0;
+}
+
+// 8. Cardinality and selectivity estimation
 
 function estimatedRows(s: JoinSource): number {
   return s.stats?.rowCount ?? DEFAULT_ESTIMATED_ROWS;
@@ -254,10 +320,6 @@ function estimateJoinCardinality(
   }
 }
 
-/**
- * Estimate selectivity for range predicates.
- * Each matching range predicate reduces cardinality by DEFAULT_RANGE_SELECTIVITY.
- */
 function estimateRangeSelectivity(
   rangePredicates: RangePredicate[],
   leftNames: Set<string>,
@@ -275,11 +337,6 @@ function estimateRangeSelectivity(
   return sel;
 }
 
-/**
- * Extract per-source NDV maps from a join node.
- * For a leaf, returns a fresh copy of the source stats NDV keyed by source name.
- * For a join node, returns a fresh copy of the accumulated estimatedNdv.
- */
 function getNodeNdv(node: JoinNode): Map<string, Map<string, number>> {
   const copy = new Map<string, Map<string, number>>();
 
@@ -298,9 +355,6 @@ function getNodeNdv(node: JoinNode): Map<string, Map<string, number>> {
   return copy;
 }
 
-/**
- * Extract per-source MCV maps from a join node.
- */
 function getNodeMcv(
   node: JoinNode,
 ): Map<string, Map<string, MCVList>> | undefined {
@@ -313,108 +367,6 @@ function getNodeMcv(
   return node.estimatedMcv;
 }
 
-/**
- * Propagate MCV through a join. For inner joins with an equi-pred,
- * build an amplified MCV for the join key column reflecting post-join
- * row frequencies using setDirect for O(k) instead of O(product).
- * Semi/anti carry only the left side unchanged.
- */
-function propagateJoinMcv(
-  leftMcv: Map<string, Map<string, MCVList>> | undefined,
-  rightMcv: Map<string, MCVList> | undefined,
-  rightSourceName: string,
-  joinType: JoinType,
-  equiPred?: EquiPredicate,
-): Map<string, Map<string, MCVList>> | undefined {
-  if (!leftMcv && !rightMcv) return undefined;
-
-  const result = new Map<string, Map<string, MCVList>>();
-
-  // Copy left side
-  if (leftMcv) {
-    for (const [src, colMap] of leftMcv) {
-      const newColMap = new Map<string, MCVList>();
-      for (const [col, mcv] of colMap) {
-        // Deep copy via serialize/deserialize so we don't mutate originals
-        newColMap.set(col, MCVList.deserialize(mcv.serialize()));
-      }
-      result.set(src, newColMap);
-    }
-  }
-
-  // For inner joins with equi-pred, build an amplified MCV for the
-  // join key column reflecting post-join row frequencies.
-  if (joinType === "inner" && equiPred && leftMcv && rightMcv) {
-    const leftColMcv = result
-      .get(equiPred.leftSource)
-      ?.get(equiPred.leftColumn);
-    const rightColMcv = rightMcv.get(equiPred.rightColumn);
-
-    if (leftColMcv && rightColMcv) {
-      const amplified = new MCVList({ capacity: leftColMcv.capacity });
-
-      // Average count for an untracked value on each side
-      const leftTracked = leftColMcv.trackedRowCount();
-      const leftTotal = leftColMcv.totalCount();
-      const leftUntrackedNdv = Math.max(
-        1,
-        leftTotal - leftTracked > 0 ? leftTotal - leftTracked : 1,
-      );
-      const leftAvgUntracked =
-        leftTotal > leftTracked
-          ? (leftTotal - leftTracked) / leftUntrackedNdv
-          : 1;
-
-      const rightTracked = rightColMcv.trackedRowCount();
-      const rightTotal = rightColMcv.totalCount();
-      const rightUntrackedNdv = Math.max(
-        1,
-        rightTotal - rightTracked > 0 ? rightTotal - rightTracked : 1,
-      );
-      const rightAvgUntracked =
-        rightTotal > rightTracked
-          ? (rightTotal - rightTracked) / rightUntrackedNdv
-          : 1;
-
-      const seen = new Set<string>();
-
-      // From right MCV: these are the high-fanout keys on the right
-      rightColMcv.forEachEntry((value, rCount) => {
-        seen.add(value);
-        const leftCount = leftColMcv.getCount(value);
-        const effectiveLeft = leftCount > 0 ? leftCount : leftAvgUntracked;
-        const product = Math.round(effectiveLeft * rCount);
-        if (product > 0) {
-          amplified.setDirect(value, product);
-        }
-      });
-
-      // From left MCV: keys tracked on left but not right
-      leftColMcv.forEachEntry((value, lCount) => {
-        if (seen.has(value)) return;
-        const rightCount = rightColMcv.getCount(value);
-        const effectiveRight = rightCount > 0 ? rightCount : rightAvgUntracked;
-        const product = Math.round(lCount * effectiveRight);
-        if (product > 0) {
-          amplified.setDirect(value, product);
-        }
-      });
-
-      result.get(equiPred.leftSource)?.set(equiPred.leftColumn, amplified);
-    }
-  }
-
-  // Inner joins carry right side too
-  if (joinType === "inner" && rightMcv) {
-    result.set(rightSourceName, new Map(rightMcv));
-  }
-
-  return result.size > 0 ? result : undefined;
-}
-
-/**
- * Look up NDV for a source.column inside accumulated nested NDV state.
- */
 function getAccumulatedColumnNdv(
   ndv: Map<string, Map<string, number>> | undefined,
   source: string,
@@ -423,15 +375,6 @@ function getAccumulatedColumnNdv(
   return ndv?.get(source)?.get(column);
 }
 
-/**
- * Estimate average rows per distinct key on a source column.
- *
- * This is the key fanout quantity:
- *   rows-per-key = rowCount / ndv(column)
- *
- * If NDV is unavailable, fall back conservatively to 1 so we do not invent
- * fanout out of thin air. This keeps the estimator monotone and safe.
- */
 function estimateRowsPerKey(rowCount: number, ndv: number | undefined): number {
   if (ndv === undefined || ndv <= 0) {
     return 1;
@@ -439,14 +382,6 @@ function estimateRowsPerKey(rowCount: number, ndv: number | undefined): number {
   return Math.max(1, rowCount / Math.max(1, ndv));
 }
 
-/**
- * Estimate the fraction of left rows whose join key finds any match on the right.
- *
- * If the right has at least as many distinct keys as the left, we assume all
- * left keys can match. Otherwise only a rightNdv/leftNdv fraction can match.
- *
- * Missing NDV falls back conservatively to the legacy selectivity heuristic.
- */
 function estimateMatchedLeftFraction(
   leftNdv: number | undefined,
   rightNdv: number | undefined,
@@ -465,19 +400,6 @@ function estimateMatchedLeftFraction(
   return Math.min(1, candidateRows / Math.max(1, joinedRows, candidateRows));
 }
 
-/**
- * Estimate join-key fanout using accumulated left NDV and right leaf NDV.
- *
- * Returned quantities:
- * - matchedLeftFraction: fraction of left rows expected to find a match
- * - rightRowsPerKey: average multiplicity of matching right rows per key
- * - baseOutputRows: join rows before range selectivity is applied
- *
- * Semantics:
- * - inner: left rows that match are multiplied by right rows per key
- * - semi:  left rows are filtered by match fraction, never multiplied
- * - anti:  left rows are filtered by non-match fraction, never multiplied
- */
 function estimateJoinKeyFanout(
   leftNdv: number | undefined,
   rightNdv: number | undefined,
@@ -518,16 +440,6 @@ function estimateJoinKeyFanout(
   };
 }
 
-/**
- * Propagate NDV through a join, producing a merged NDV map that spans
- * all sources in the resulting join subtree.
- *
- * Rules:
- * - inner: output contains left and right sources
- * - semi/anti: output contains only left-side sources
- * - all NDVs are capped by joinedRows
- * - equi-joined key columns are reduced to min(leftNdv, rightNdv, joinedRows)
- */
 function propagateJoinNdv(
   leftNdv: Map<string, Map<string, number>>,
   rightLeafNdv: Map<string, number>,
@@ -560,8 +472,6 @@ function propagateJoinNdv(
       ?.get(equiPred.leftColumn);
     const rightColNdv = rightLeafNdv.get(equiPred.rightColumn);
 
-    // Always compute key NDV — use Infinity for missing sides so
-    // min() collapses to the known side or to joinedRows.
     const keyNdv = Math.max(
       1,
       Math.min(
@@ -585,6 +495,91 @@ function propagateJoinNdv(
   }
 
   return result;
+}
+
+function propagateJoinMcv(
+  leftMcv: Map<string, Map<string, MCVList>> | undefined,
+  rightMcv: Map<string, MCVList> | undefined,
+  rightSourceName: string,
+  joinType: JoinType,
+  equiPred?: EquiPredicate,
+): Map<string, Map<string, MCVList>> | undefined {
+  if (!leftMcv && !rightMcv) return undefined;
+
+  const result = new Map<string, Map<string, MCVList>>();
+
+  if (leftMcv) {
+    for (const [src, colMap] of leftMcv) {
+      const newColMap = new Map<string, MCVList>();
+      for (const [col, mcv] of colMap) {
+        newColMap.set(col, MCVList.deserialize(mcv.serialize()));
+      }
+      result.set(src, newColMap);
+    }
+  }
+
+  if (joinType === "inner" && equiPred && leftMcv && rightMcv) {
+    const leftColMcv = result
+      .get(equiPred.leftSource)
+      ?.get(equiPred.leftColumn);
+    const rightColMcv = rightMcv.get(equiPred.rightColumn);
+
+    if (leftColMcv && rightColMcv) {
+      const amplified = new MCVList({ capacity: leftColMcv.capacity });
+
+      const leftTracked = leftColMcv.trackedRowCount();
+      const leftTotal = leftColMcv.totalCount();
+      const leftUntrackedNdv = Math.max(
+        1,
+        leftTotal - leftTracked > 0 ? leftTotal - leftTracked : 1,
+      );
+      const leftAvgUntracked =
+        leftTotal > leftTracked
+          ? (leftTotal - leftTracked) / leftUntrackedNdv
+          : 1;
+
+      const rightTracked = rightColMcv.trackedRowCount();
+      const rightTotal = rightColMcv.totalCount();
+      const rightUntrackedNdv = Math.max(
+        1,
+        rightTotal - rightTracked > 0 ? rightTotal - rightTracked : 1,
+      );
+      const rightAvgUntracked =
+        rightTotal > rightTracked
+          ? (rightTotal - rightTracked) / rightUntrackedNdv
+          : 1;
+
+      const seen = new Set<string>();
+
+      rightColMcv.forEachEntry((value, rCount) => {
+        seen.add(value);
+        const leftCount = leftColMcv.getCount(value);
+        const effectiveLeft = leftCount > 0 ? leftCount : leftAvgUntracked;
+        const product = Math.round(effectiveLeft * rCount);
+        if (product > 0) {
+          amplified.setDirect(value, product);
+        }
+      });
+
+      leftColMcv.forEachEntry((value, lCount) => {
+        if (seen.has(value)) return;
+        const rightCount = rightColMcv.getCount(value);
+        const effectiveRight = rightCount > 0 ? rightCount : rightAvgUntracked;
+        const product = Math.round(lCount * effectiveRight);
+        if (product > 0) {
+          amplified.setDirect(value, product);
+        }
+      });
+
+      result.get(equiPred.leftSource)?.set(equiPred.leftColumn, amplified);
+    }
+  }
+
+  if (joinType === "inner" && rightMcv) {
+    result.set(rightSourceName, new Map(rightMcv));
+  }
+
+  return result.size > 0 ? result : undefined;
 }
 
 function collectSourceNames(node: JoinNode): Set<string> {
@@ -636,6 +631,7 @@ function estimateJoinWithCandidate(
   equiPreds?: EquiPredicate[],
   rangePreds?: RangePredicate[],
   joinType: JoinType = "inner",
+  leftStatsSource?: StatsSource,
 ): { selectivity: number; equiPred?: EquiPredicate; outputRows: number } {
   const equiPred = findEquiPredBetweenSets(
     joinedNames,
@@ -644,6 +640,7 @@ function estimateJoinWithCandidate(
   );
 
   const candidateRows = estimatedRows(candidate);
+  const rightStatsSource = candidate.stats?.statsSource;
 
   let outputRows: number;
   let equiSel: number;
@@ -656,25 +653,31 @@ function estimateJoinWithCandidate(
     );
     const observedRightNdv = candidate.stats?.ndv?.get(equiPred.rightColumn);
 
-    // Conservative inferred-NDV fallback when persisted stats are absent.
-    // Assume at most min(leftRows, rightRows) distinct keys on either side.
     const inferredLeftNdv = Math.max(1, Math.min(joinedRows, candidateRows));
-    // Assume about half of right-side rows are distinct (conservative)
     const inferredRightNdv = Math.max(
       1,
       Math.min(joinedRows, Math.ceil(candidateRows / 2)),
     );
 
+    const confidence = ndvConfidenceMultiplier(leftStatsSource, rightStatsSource);
+
     const leftNdv = observedLeftNdv ?? inferredLeftNdv;
     const rightNdv = observedRightNdv ?? inferredRightNdv;
 
-    // Try MCV-aware estimation first
+    const adjustedLeftNdv =
+      confidence < 1 ? Math.max(1, Math.round(leftNdv / confidence)) : leftNdv;
+    const adjustedRightNdv =
+      confidence < 1 ? Math.max(1, Math.round(rightNdv / confidence)) : rightNdv;
+
     const leftMcv = joinedMcv
       ?.get(equiPred.leftSource)
       ?.get(equiPred.leftColumn);
     const rightMcv = candidate.stats?.mcv?.get(equiPred.rightColumn);
 
+    const mcvAllowed = canUseMcvForPlanning(leftStatsSource, rightStatsSource);
+
     if (
+      mcvAllowed &&
       leftMcv &&
       rightMcv &&
       leftMcv.trackedSize() > 0 &&
@@ -685,8 +688,8 @@ function estimateJoinWithCandidate(
         rightMcv,
         joinedRows,
         candidateRows,
-        leftNdv,
-        rightNdv,
+        adjustedLeftNdv,
+        adjustedRightNdv,
       );
 
       switch (joinType) {
@@ -702,10 +705,9 @@ function estimateJoinWithCandidate(
           break;
       }
     } else {
-      // Fall back to NDV-only estimation
       const { baseOutputRows } = estimateJoinKeyFanout(
-        leftNdv,
-        rightNdv,
+        adjustedLeftNdv,
+        adjustedRightNdv,
         joinedRows,
         candidateRows,
         joinType,
@@ -741,17 +743,13 @@ function estimateJoinWithCandidate(
   return { selectivity: combinedSel, equiPred, outputRows };
 }
 
-// 8. Join cost model (shared by planner and EXPLAIN)
+// 9. Join cost model
 
 type JoinCost = {
   startupCost: number;
   totalCost: number;
 };
 
-/**
- * Compute join startup and total costs for a given physical operator.
- * Used by both the physical operator selector and EXPLAIN plan builder.
- */
 function computeJoinCost(
   method: "hash" | "loop" | "merge",
   joinType: JoinType,
@@ -784,7 +782,6 @@ function computeJoinCost(
     return { startupCost, totalCost };
   }
 
-  // Nested loop
   const startupCost = leftCost;
   const discount = joinType === "inner" ? 1.0 : 0.5;
   const totalCost =
@@ -792,7 +789,7 @@ function computeJoinCost(
   return { startupCost, totalCost };
 }
 
-// 9. Join tree construction
+// 10. Join tree construction
 
 export function buildJoinTree(
   sources: JoinSource[],
@@ -813,7 +810,6 @@ export function buildJoinTree(
     config,
   );
 
-  // Strip hint from driving table
   if (ordered[0].hint) {
     ordered[0] = { ...ordered[0], hint: undefined };
   }
@@ -823,6 +819,7 @@ export function buildJoinTree(
   let accWidth = estimatedWidth(ordered[0]);
   let accNdv = getNodeNdv(tree);
   let accMcv = getNodeMcv(tree);
+  let accStatsSource = ordered[0].stats?.statsSource;
 
   for (let i = 1; i < ordered.length; i++) {
     const right = ordered[i];
@@ -838,6 +835,7 @@ export function buildJoinTree(
       equiPreds,
       rangePreds,
       jt,
+      accStatsSource,
     );
 
     const method = selectPhysicalOperator(
@@ -866,6 +864,11 @@ export function buildJoinTree(
       equiPred,
     );
 
+    const joinStatsSource = summarizeJoinStatsSource(
+      accStatsSource,
+      right.stats?.statsSource,
+    );
+
     tree = {
       kind: "join",
       left: tree,
@@ -877,12 +880,20 @@ export function buildJoinTree(
       estimatedRows: outputRows,
       estimatedNdv: joinNdv,
       estimatedMcv: joinMcv,
+      statsSource: joinStatsSource,
     };
 
     accRows = outputRows;
     accWidth += estimatedWidth(right);
     accNdv = joinNdv;
     accMcv = joinMcv;
+    accStatsSource = joinStatsSource === "exact"
+      ? "persisted-complete"
+      : joinStatsSource === "partial"
+        ? "persisted-partial"
+        : joinStatsSource === "approximate"
+          ? "computed-sketch-large"
+          : undefined;
   }
 
   return tree;
@@ -905,20 +916,21 @@ function orderSources(
         byName.delete(n);
       }
     }
-    for (const s of byName.values()) ordered.push(s);
+    for (const s of byName.values()) {
+      ordered.push(s);
+    }
     return ordered;
   }
 
-  // Any explicit join hint is attached to a specific source position in the
-  // query and must remain there. Reordering hinted sources can change both
-  // semantics and predicate orientation.
   const hasExplicitJoinHint = sources.some((s) => !!s.hint);
   if (hasExplicitJoinHint) {
     return [...sources];
   }
 
-  // Greedy: start with smallest, then pick the cheapest source against the
-  // current joined set while carrying forward estimated NDV state.
+  if (shouldAvoidAggressiveReordering(sources)) {
+    return [...sources];
+  }
+
   const remaining = [...sources];
   remaining.sort((a, b) => estimatedRows(a) - estimatedRows(b));
 
@@ -928,6 +940,7 @@ function orderSources(
   let joinedWidth = estimatedWidth(ordered[0]);
   let joinedNdv = getNodeNdv({ kind: "leaf", source: ordered[0] });
   let joinedMcv = getNodeMcv({ kind: "leaf", source: ordered[0] });
+  let joinedStatsSource = ordered[0].stats?.statsSource;
 
   while (remaining.length > 0) {
     let bestIdx = 0;
@@ -936,6 +949,7 @@ function orderSources(
     let bestCandidateWidth = Infinity;
     let bestNextNdv = joinedNdv;
     let bestNextMcv = joinedMcv;
+    let bestNextStatsSource = joinedStatsSource;
 
     for (let i = 0; i < remaining.length; i++) {
       const candidate = remaining[i];
@@ -950,6 +964,7 @@ function orderSources(
         equiPreds,
         rangePreds,
         joinType,
+        joinedStatsSource,
       );
 
       const candidateWidth = clampWidth(estimatedWidth(candidate));
@@ -985,6 +1000,17 @@ function orderSources(
           joinType,
           equiPred,
         );
+        const nextSummary = summarizeJoinStatsSource(
+          joinedStatsSource,
+          candidate.stats?.statsSource,
+        );
+        bestNextStatsSource = nextSummary === "exact"
+          ? "persisted-complete"
+          : nextSummary === "partial"
+            ? "persisted-partial"
+            : nextSummary === "approximate"
+              ? "computed-sketch-large"
+              : undefined;
       }
     }
 
@@ -995,12 +1021,13 @@ function orderSources(
     joinedWidth += estimatedWidth(chosen);
     joinedNdv = bestNextNdv;
     joinedMcv = bestNextMcv;
+    joinedStatsSource = bestNextStatsSource;
   }
 
   return ordered;
 }
 
-// 10. Physical operator selection
+// 11. Physical operator selection
 
 function selectPhysicalOperator(
   leftRowCount: number,
@@ -1033,7 +1060,6 @@ function selectPhysicalOperator(
 
   if (rr <= getSmallTableThreshold(config)) return "loop";
 
-  // Use the shared cost model
   const hashCost = computeJoinCost(
     "hash",
     joinType,
@@ -1081,7 +1107,7 @@ function selectPhysicalOperator(
   return hashCost < nljCost ? "hash" : "loop";
 }
 
-// 11. Row helpers and materialization
+// 12. Row helpers and materialization
 
 async function cooperativeYield(): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, 0));
@@ -1118,7 +1144,7 @@ async function materializeSource(
     typeof val === "object" &&
     val !== null &&
     "query" in val &&
-    typeof val.query === "function"
+    typeof (val as any).query === "function"
   ) {
     return val.query({}, env, sf);
   }
@@ -1242,9 +1268,6 @@ function loopPredicateLeftArg(leftNode: JoinNode, row: LuaTable): LuaValue {
     return row.rawGet(leftNode.source.name);
   }
 
-  // For two-source joins the logical left side may still be represented as a
-  // single-binding row table. In that case, preserve existing Lua semantics
-  // for `loop using function(left, right)` by passing the bound item directly.
   const keys = [...luaKeys(row)];
   if (keys.length === 1) {
     return row.rawGet(keys[0]);
@@ -1253,9 +1276,7 @@ function loopPredicateLeftArg(leftNode: JoinNode, row: LuaTable): LuaValue {
   return row;
 }
 
-// 12. Join operators
-
-// Semi/Anti
+// 13. Join operators
 
 async function hashSemiAntiJoin(
   leftRows: LuaTable[],
@@ -1263,7 +1284,6 @@ async function hashSemiAntiJoin(
   joinType: "semi" | "anti",
   equiPred: EquiPredicate,
 ): Promise<LuaTable[]> {
-  // BUILD: existence set on right join key
   const buildSet = new Set<string>();
   for (const rItem of rightItems) {
     const val = extractField(rItem, equiPred.rightColumn);
@@ -1312,8 +1332,6 @@ async function nestedLoopSemiAntiJoin(
   }
   return results;
 }
-
-// Inner
 
 async function crossJoin(
   leftRows: LuaTable[],
@@ -1471,11 +1489,6 @@ async function predicateLoopJoin(
   return results;
 }
 
-/**
- * Sort-merge join. When an equi-predicate is available, uses the
- * equi-pred columns for key extraction. Otherwise falls back to
- * the first field of each row.
- */
 async function sortMergeJoin(
   leftRows: LuaTable[],
   rightItems: any[],
@@ -1487,7 +1500,6 @@ async function sortMergeJoin(
   const limit = getWatchdogLimit(config);
   const chunk = getYieldChunk(config);
 
-  // Key extractors
   const leftKeyFn = equiPred
     ? (row: LuaTable) => {
         const obj = row.rawGet(equiPred.leftSource);
@@ -1568,8 +1580,6 @@ async function sortMergeJoin(
   return results;
 }
 
-// Dispatch (routes to the correct operator)
-
 async function dispatchJoin(
   tree: JoinInner,
   leftRows: LuaTable[],
@@ -1586,7 +1596,6 @@ async function dispatchJoin(
     ? normalizeEquiPredicateForJoin(tree.equiPred, tree.left, rightSource)
     : undefined;
 
-  // Semi/Anti
   if (joinType === "semi" || joinType === "anti") {
     if (tree.method === "loop") {
       if (!predicate) {
@@ -1615,7 +1624,6 @@ async function dispatchJoin(
     );
   }
 
-  // Inner with using predicate
   if (tree.method === "loop" && predicate) {
     return predicateLoopJoin(
       leftRows,
@@ -1628,7 +1636,6 @@ async function dispatchJoin(
     );
   }
 
-  // Inner by method
   switch (tree.method) {
     case "hash":
       if (equiPred) {
@@ -1671,7 +1678,7 @@ async function dispatchJoin(
   return crossJoin(leftRows, rightItems, rightName, sf, config);
 }
 
-// 13. Join tree execution
+// 14. Join tree execution
 
 export async function executeJoinTree(
   tree: JoinNode,
@@ -1690,7 +1697,7 @@ export async function executeJoinTree(
   return dispatchJoin(tree, leftRows, rightItems, rightSource, env, sf, config);
 }
 
-// 14. Equi-predicate and range predicate extraction
+// 15. Predicate extraction
 
 export function extractEquiPredicates(
   expr: LuaExpression | undefined,
@@ -1727,9 +1734,6 @@ function collectEquiJoins(
   }
 }
 
-/**
- * Extract range predicates (`>`, `<`, `>=`, `<=`)
- */
 export function extractRangePredicates(
   expr: LuaExpression | undefined,
   sourceNames: Set<string>,
@@ -1801,26 +1805,13 @@ function parseGroupKeySourceColumn(
   return null;
 }
 
-// 15. Single-source filter pushdown
+// 16. Single-source filter pushdown
 
-/**
- * A filter that references exactly one source from the `from` clause.
- * Can be pushed down to filter that source before the join.
- */
 export type SingleSourceFilter = {
   sourceName: string;
   expression: LuaExpression;
 };
 
-/**
- * Extract single-source filter conjuncts from a `where` expression.
- *
- * We only push down filters that are syntactically safe:
- * - they reference exactly one source, and
- * - every source-dependent access is explicitly rooted at that source name.
- *
- * This conservative rule keeps pushdown semantics provable.
- */
 export function extractSingleSourceFilters(
   expr: LuaExpression | undefined,
   sourceNames: Set<string>,
@@ -1859,14 +1850,6 @@ export function extractSingleSourceFilters(
   return { pushed, residual };
 }
 
-/**
- * Returns true iff every source-dependent access in `expr` is explicitly rooted
- * at `targetSource`, and no other source name from the FROM-clause is used.
- *
- * This is stricter than merely checking that accesses are "explicitly rooted":
- * an expression like `p.name == t.page` is explicit, but it is not scoped to a
- * single source and therefore must never be pushed down.
- */
 function isExplicitlyScopedToSource(
   expr: LuaExpression,
   sourceNames: Set<string>,
@@ -1880,8 +1863,6 @@ function isExplicitlyScopedToSource(
       return true;
 
     case "Variable":
-      // Allow only the target source variable itself. Bare field names do not
-      // count as explicitly scoped and any other source variable is forbidden.
       return expr.name === targetSource;
 
     case "PropertyAccess":
@@ -1923,7 +1904,7 @@ function isExplicitlyScopedToSource(
       return (
         isExplicitlyScopedToSource(expr.prefix, sourceNames, targetSource) &&
         expr.args.every((arg) =>
-          isExplicitlyScopedToSource(arg, sourceNames, targetSource),
+          isExplicitlyScopedToSource(arg, sourceNames, targetSource)
         ) &&
         (!expr.orderBy ||
           expr.orderBy.every((ob) =>
@@ -1931,7 +1912,7 @@ function isExplicitlyScopedToSource(
               ob.expression,
               sourceNames,
               targetSource,
-            ),
+            )
           ))
       );
 
@@ -1945,7 +1926,7 @@ function isExplicitlyScopedToSource(
       return (
         isExplicitlyScopedToSource(expr.call, sourceNames, targetSource) &&
         expr.orderBy.every((ob) =>
-          isExplicitlyScopedToSource(ob.expression, sourceNames, targetSource),
+          isExplicitlyScopedToSource(ob.expression, sourceNames, targetSource)
         )
       );
 
@@ -1976,9 +1957,6 @@ function isExplicitlyScopedToSource(
   }
 }
 
-/**
- * Flatten an `and` chain into individual conjuncts
- */
 function flattenAnd(expr: LuaExpression): LuaExpression[] {
   if (expr.type === "Binary" && expr.operator === "and") {
     return [...flattenAnd(expr.left), ...flattenAnd(expr.right)];
@@ -1986,9 +1964,6 @@ function flattenAnd(expr: LuaExpression): LuaExpression[] {
   return [expr];
 }
 
-/**
- * Collect all source names referenced in an expression
- */
 function collectReferencedSources(
   expr: LuaExpression,
   sourceNames: Set<string>,
@@ -2039,15 +2014,11 @@ function walkExprForSources(
       walkExprForSources(expr.object, sourceNames, refs);
       walkExprForSources(expr.key, sourceNames, refs);
       break;
-    // Literals and nil reference no sources
     default:
       break;
   }
 }
 
-/**
- * Apply pushed-down filters to materialized source items
- */
 export async function applyPushedFilters(
   items: any[],
   sourceName: string,
@@ -2057,7 +2028,6 @@ export async function applyPushedFilters(
 ): Promise<any[]> {
   if (filters.length === 0) return items;
 
-  // Combine all filters for this source into a single `and` expression
   const relevant = filters.filter((f) => f.sourceName === sourceName);
   if (relevant.length === 0) return items;
 
@@ -2077,7 +2047,7 @@ export async function applyPushedFilters(
   return result;
 }
 
-// 16. Equi-predicate stripping for residual where
+// 17. Equi-predicate stripping
 
 export function stripUsedJoinPredicates(
   expr: LuaExpression | undefined,
@@ -2097,13 +2067,8 @@ function collectUsedEquiPredsFromJoinTree(node: JoinNode): EquiPredicate[] {
   return result;
 }
 
-// 17. Explain infrastructure
+// 18. Explain infrastructure
 
-// Helpers
-
-/**
- * Walk the join tree to find a leaf source by name.
- */
 function findLeafSource(
   node: JoinNode,
   sourceName: string,
@@ -2117,7 +2082,29 @@ function findLeafSource(
   );
 }
 
-// Plan construction
+function explainNdvSource(
+  leftSS: StatsSource | undefined,
+  rightSS: StatsSource | undefined,
+  hasObservedLeftNdv: boolean,
+  hasObservedRightNdv: boolean,
+): ExplainNode["ndvSource"] {
+  if (!(hasObservedLeftNdv || hasObservedRightNdv)) {
+    return "row-count heuristic";
+  }
+  if (
+    leftSS === "persisted-complete" ||
+    rightSS === "persisted-complete"
+  ) {
+    return "roaring-bitmap index";
+  }
+  if (
+    leftSS === "computed-sketch-large" ||
+    rightSS === "computed-sketch-large"
+  ) {
+    return "half-xor heuristic";
+  }
+  return "row-count heuristic";
+}
 
 export function explainJoinTree(
   tree: JoinNode,
@@ -2140,6 +2127,7 @@ export function explainJoinTree(
       estimatedRows: rows,
       estimatedWidth: width,
       filterExpr: pushedFilterExprBySource?.get(tree.source.name),
+      statsSource: tree.source.stats?.statsSource,
       children: [],
     };
   }
@@ -2193,6 +2181,7 @@ export function explainJoinTree(
   let rightHasMcv = false;
   let joinKeyNdv: ExplainNode["joinKeyNdv"] | undefined;
   let mcvKeyCount: number | undefined;
+  let mcvFallback: ExplainNode["mcvFallback"] = "no-mcv";
 
   if (tree.equiPred) {
     const ep = tree.equiPred;
@@ -2200,28 +2189,20 @@ export function explainJoinTree(
     const leftLeafSource = findLeafSource(tree.left, ep.leftSource);
     const rightStats = rightSource?.stats;
 
+    const leftSS = leftLeafSource?.stats?.statsSource;
+    const rightSS = rightStats?.statsSource;
+
     const hasObservedLeftNdv = tree.estimatedNdv
       ?.get(ep.leftSource)
-      ?.has(ep.leftColumn);
-    const hasObservedRightNdv = rightStats?.ndv?.has(ep.rightColumn);
+      ?.has(ep.leftColumn) ?? false;
+    const hasObservedRightNdv = rightStats?.ndv?.has(ep.rightColumn) ?? false;
 
-    if (hasObservedLeftNdv || hasObservedRightNdv) {
-      const leftSS = leftLeafSource?.stats?.statsSource;
-      const rightSS = rightStats?.statsSource;
-      const anyPersisted = leftSS === "persisted" || rightSS === "persisted";
-      const anySketch =
-        leftSS === "computed" ||
-        rightSS === "computed" ||
-        leftSS === "recomputed" ||
-        rightSS === "recomputed";
-      ndvSource = anyPersisted
-        ? "roaring-bitmap index"
-        : anySketch
-          ? "half-xor heuristic"
-          : "row-count heuristic";
-    } else {
-      ndvSource = "row-count heuristic";
-    }
+    ndvSource = explainNdvSource(
+      leftSS,
+      rightSS,
+      hasObservedLeftNdv,
+      hasObservedRightNdv,
+    );
 
     const leftMcv = tree.estimatedMcv?.get(ep.leftSource)?.get(ep.leftColumn);
     const rightMcv = rightStats?.mcv?.get(ep.rightColumn);
@@ -2231,12 +2212,18 @@ export function explainJoinTree(
 
     leftHasMcv = leftTrackedKeys > 0;
     rightHasMcv = rightTrackedKeys > 0;
-    mcvUsed = leftHasMcv && rightHasMcv;
+
+    const mcvAllowed = canUseMcvForPlanning(leftSS, rightSS);
+    mcvUsed = mcvAllowed && leftHasMcv && rightHasMcv;
 
     if (mcvUsed) {
       mcvKeyCount = Math.min(leftTrackedKeys, rightTrackedKeys);
+      mcvFallback = "no-mcv";
     } else if (leftHasMcv || rightHasMcv) {
       mcvKeyCount = Math.max(leftTrackedKeys, rightTrackedKeys);
+      mcvFallback = mcvAllowed ? "one-sided" : "suppressed";
+    } else {
+      mcvFallback = "no-mcv";
     }
 
     const lNdv = tree.estimatedNdv?.get(ep.leftSource)?.get(ep.leftColumn);
@@ -2250,15 +2237,8 @@ export function explainJoinTree(
       right: `${ep.rightSource}.${ep.rightColumn}`,
       rightNdv: rNdv ?? -1,
     };
-  }
-
-  let mcvFallback: ExplainNode["mcvFallback"];
-  if (mcvUsed) {
-    mcvFallback = undefined;
-  } else if (leftHasMcv || rightHasMcv) {
-    mcvFallback = "one-sided";
   } else {
-    mcvFallback = "no-mcv";
+    ndvSource = "row-count heuristic";
   }
 
   return {
@@ -2277,14 +2257,11 @@ export function explainJoinTree(
     mcvFallback,
     mcvKeyCount,
     joinKeyNdv,
+    statsSource: tree.statsSource,
     children: [leftPlan, rightPlan],
   };
 }
 
-/**
- * Wrap a join plan with `Sort`/`Limit`/`GroupAggregate` nodes based on
- * the query clauses
- */
 export function wrapPlanWithQueryOps(
   plan: ExplainNode,
   query: {
@@ -2312,6 +2289,7 @@ export function wrapPlanWithQueryOps(
         estimatedRows: Math.max(1, Math.round(root.estimatedRows * 0.5)),
         estimatedWidth: root.estimatedWidth,
         filterExpr: exprToString(residual),
+        statsSource: root.statsSource,
         children: [root],
       };
     }
@@ -2335,6 +2313,7 @@ export function wrapPlanWithQueryOps(
       estimatedRows: estimatedGroupRows,
       estimatedWidth: root.estimatedWidth,
       sortKeys: keys,
+      statsSource: root.statsSource,
       children: [root],
     };
   }
@@ -2347,6 +2326,7 @@ export function wrapPlanWithQueryOps(
       estimatedRows: Math.max(1, Math.round(root.estimatedRows * 0.5)),
       estimatedWidth: root.estimatedWidth,
       filterExpr: exprToString(query.having),
+      statsSource: root.statsSource,
       children: [root],
     };
   }
@@ -2358,6 +2338,7 @@ export function wrapPlanWithQueryOps(
       estimatedCost: root.estimatedCost,
       estimatedRows: Math.max(1, Math.round(root.estimatedRows * 0.8)),
       estimatedWidth: root.estimatedWidth,
+      statsSource: root.statsSource,
       children: [root],
     };
   }
@@ -2376,6 +2357,7 @@ export function wrapPlanWithQueryOps(
       estimatedRows: root.estimatedRows,
       estimatedWidth: root.estimatedWidth,
       sortKeys: keys,
+      statsSource: root.statsSource,
       children: [root],
     };
   }
@@ -2397,6 +2379,7 @@ export function wrapPlanWithQueryOps(
       estimatedWidth: root.estimatedWidth,
       limitCount: query.limit,
       offsetCount: query.offset,
+      statsSource: root.statsSource,
       children: [root],
     };
   }
@@ -2404,7 +2387,7 @@ export function wrapPlanWithQueryOps(
   return root;
 }
 
-// Helpers
+// 19. Restricted-source validation
 
 type RestrictedSourceRef = {
   source: string;
@@ -2568,7 +2551,6 @@ export function validatePostJoinSourceReferences(
     }
   };
 
-  // Residual WHERE only. Join predicates have already been consumed separately.
   check(query.where);
 
   if (query.groupBy) {
@@ -2586,6 +2568,8 @@ export function validatePostJoinSourceReferences(
     }
   }
 }
+
+// 20. Expression / explain helpers
 
 function formatHintLabel(hint: LuaJoinHint): string {
   const parts: string[] = [];
@@ -2702,7 +2686,6 @@ function estimateGroupRowsFromNdv(
       return undefined;
     }
 
-    // Prefer post-join accumulated NDV over raw leaf source stats
     const accNdv = accumulatedNdv?.get(ref.source)?.get(ref.column);
     const leafNdv = sourceStats?.get(ref.source)?.ndv?.get(ref.column);
     const ndv = accNdv ?? leafNdv;
@@ -2719,7 +2702,7 @@ function estimateGroupRowsFromNdv(
   return Math.max(1, Math.min(inputRows, Math.round(combinedNdv)));
 }
 
-// 18. Explain analyze execution
+// 21. Explain analyze execution
 
 export async function executeAndInstrument(
   tree: JoinNode,
@@ -2745,7 +2728,6 @@ export async function executeAndInstrument(
     return rows;
   }
 
-  // Recurse left
   const leftRows = await executeAndInstrument(
     tree.left,
     plan.children[0],
@@ -2756,7 +2738,6 @@ export async function executeAndInstrument(
     overrides,
   );
 
-  // Recurse right (materialize)
   const rightSource = (tree.right as JoinLeaf).source;
   const rightT0 = opts.analyze && opts.timing ? performance.now() : 0;
   const rightItems = await materializeSource(rightSource, env, sf, overrides);
@@ -2769,10 +2750,8 @@ export async function executeAndInstrument(
     plan.children[1].actualTimeMs = rightElapsed;
   }
 
-  // Startup time = everything up to this point (child materialization)
   const joinT0 = opts.analyze && opts.timing ? performance.now() : 0;
 
-  // Execute join operator
   const joinResult = await dispatchJoin(
     tree,
     leftRows,
@@ -2789,7 +2768,6 @@ export async function executeAndInstrument(
   if (tree.method === "hash") {
     plan.memoryRows = rightItems.length;
 
-    // Count distinct hash buckets by re-hashing the build side
     if (tree.equiPred) {
       const ep = normalizeEquiPredicateForJoin(
         tree.equiPred,
@@ -2810,9 +2788,6 @@ export async function executeAndInstrument(
     plan.children[1].actualLoops = leftRows.length;
   }
 
-  // Rows removed by join filter: cross-product minus output.
-  // For NLJ without equi-pred this is the true predicate-filtered count.
-  // For NLJ with equi-pred it shows how many comparisons were rejected.
   if (tree.method === "loop") {
     const crossProduct = leftRows.length * rightItems.length;
     const removed = crossProduct - joinResult.length;
@@ -2888,15 +2863,10 @@ async function executeGroupAggregateNodeExact(
   return rows.slice(0, outputRows);
 }
 
-/**
- * Execute explain wrapper nodes after the scan/join subtree has produced rows.
- * This does not replace the real query engine for normal execution.
- * It is only used by EXPLAIN ANALYZE to populate actual node stats coherently.
- */
 export async function executeExplainWrappersExact(
   node: ExplainNode,
   rows: LuaTable[],
-  opts: ExplainOptions,
+  _opts: ExplainOptions,
 ): Promise<LuaTable[]> {
   if (node.children.length === 0) {
     node.actualRows = rows.length;
@@ -2907,7 +2877,7 @@ export async function executeExplainWrappersExact(
   const childRows = await executeExplainWrappersExact(
     node.children[0],
     rows,
-    opts,
+    _opts,
   );
 
   switch (node.nodeType) {
@@ -2928,7 +2898,7 @@ export async function executeExplainWrappersExact(
   }
 }
 
-// 19. Explain output formatting
+// 22. Explain formatting
 
 export function formatExplainOutput(
   result: ExplainResult,
@@ -2943,10 +2913,8 @@ export function formatExplainOutput(
     }
   }
 
-  // Indent all content lines by one space
   const indented = lines.map((l) => ` ${l}`);
 
-  // Header and separator sized to widest line, capped
   const maxWidth = Math.min(
     120,
     Math.max("QUERY PLAN".length, ...indented.map((l) => l.length)),
@@ -2972,7 +2940,6 @@ function formatNode(
   const prefix = isRoot ? "" : "->  ";
   const label = formatNodeLabel(node);
 
-  // Cost block
   let estBlock = "";
   if (opts.costs) {
     const s = (node.startupCost ?? 0).toFixed(2);
@@ -2980,7 +2947,6 @@ function formatNode(
     estBlock = `  (cost=${s}..${t} rows=${node.estimatedRows} width=${node.estimatedWidth})`;
   }
 
-  // Actual block
   let actBlock = "";
   if (opts.analyze && node.actualRows !== undefined) {
     let timeStr = "";
@@ -2994,12 +2960,8 @@ function formatNode(
 
   lines.push(`${pad}${prefix}${label}${estBlock}${actBlock}`);
 
-  // Detail lines
   const detailPad = pad + (isRoot ? "  " : "      ");
 
-  // === Always shown (matches PostgreSQL default output) ===
-
-  // Join condition
   if (node.equiPred) {
     const condLabel =
       node.method === "hash"
@@ -3013,14 +2975,12 @@ function formatNode(
     );
   }
 
-  // Sort / Group keys
   if (node.sortKeys) {
     const keyLabel =
       node.nodeType === "GroupAggregate" ? "Group Key" : "Sort Key";
     lines.push(`${detailPad}${keyLabel}: ${node.sortKeys.join(", ")}`);
   }
 
-  // Limit / Offset
   if (node.limitCount !== undefined) {
     lines.push(`${detailPad}Count: ${node.limitCount}`);
   }
@@ -3028,7 +2988,6 @@ function formatNode(
     lines.push(`${detailPad}Offset: ${node.offsetCount}`);
   }
 
-  // Filter expression and rows removed by filter
   if (node.filterExpr) {
     lines.push(`${detailPad}Filter: ${node.filterExpr}`);
   }
@@ -3042,7 +3001,6 @@ function formatNode(
     );
   }
 
-  // Rows removed by join filter (NLJ)
   if (
     opts.analyze &&
     node.rowsRemovedByJoinFilter !== undefined &&
@@ -3053,7 +3011,6 @@ function formatNode(
     );
   }
 
-  // Memory and hash buckets
   if (node.memoryRows !== undefined) {
     lines.push(`${detailPad}Memory: ${node.memoryRows} rows`);
   }
@@ -3061,7 +3018,6 @@ function formatNode(
     lines.push(`${detailPad}Hash Buckets: ${node.hashBuckets}`);
   }
 
-  // === Verbose only ===
   if (opts.verbose) {
     if (node.functionCall) {
       lines.push(`${detailPad}Function Call: ${node.functionCall}`);
@@ -3069,6 +3025,10 @@ function formatNode(
 
     if (node.hintUsed) {
       lines.push(`${detailPad}Join Hint: ${node.hintUsed}`);
+    }
+
+    if (node.statsSource) {
+      lines.push(`${detailPad}Stats: ${node.statsSource}`);
     }
 
     if (node.selectivity !== undefined) {
@@ -3098,12 +3058,15 @@ function formatNode(
       const suffix =
         node.mcvKeyCount !== undefined ? `  (keys=${node.mcvKeyCount})` : "";
       lines.push(`${detailPad}MCV: single side${suffix}`);
+    } else if (node.mcvFallback === "suppressed") {
+      const suffix =
+        node.mcvKeyCount !== undefined ? `  (keys=${node.mcvKeyCount})` : "";
+      lines.push(`${detailPad}MCV: suppressed by stats provenance${suffix}`);
     } else if (node.mcvFallback === "no-mcv") {
       lines.push(`${detailPad}MCV: not available`);
     }
   }
 
-  // Children
   for (const child of node.children) {
     formatNode(child, opts, indent + (isRoot ? 2 : 6), lines);
   }

@@ -959,6 +959,17 @@ async function buildExplainQueryShapeWithOverrides(
   return explainQuery;
 }
 
+function normalizeProvidedStats(stats: CollectionStats): CollectionStats {
+  if (stats.statsSource) {
+    return stats;
+  }
+
+  return {
+    ...stats,
+    statsSource: "source-provided-unknown",
+  };
+}
+
 async function getStatsForValue(
   val: LuaValue,
   env: LuaEnv,
@@ -972,7 +983,7 @@ async function getStatsForValue(
   ) {
     const stats = await (val as any).getStats();
     if (stats) {
-      return stats;
+      return normalizeProvidedStats(stats);
     }
   }
 
@@ -1404,7 +1415,7 @@ export function evalExpression(
               ) {
                 const stats = await val.getStats();
                 if (stats) {
-                  src.stats = stats;
+                  src.stats = normalizeProvidedStats(stats);
                 }
               } else if (Array.isArray(val)) {
                 src.stats = computeStatsFromArray(val);
@@ -1412,7 +1423,9 @@ export function evalExpression(
                 const len = val.length;
                 if (len > 0) {
                   const arr: any[] = [];
-                  for (let i = 1; i <= len; i++) arr.push(val.rawGet(i));
+                  for (let i = 1; i <= len; i++) {
+                    arr.push(val.rawGet(i));
+                  }
                   src.stats = computeStatsFromArray(arr);
                 } else if (!val.empty()) {
                   src.stats = computeStatsFromArray([val]);
@@ -1480,7 +1493,11 @@ export function evalExpression(
                 sf,
               );
 
-              src.stats = computeStatsFromArray(filtered);
+              const filteredStats = computeStatsFromArray(filtered);
+              src.stats = {
+                ...filteredStats,
+                statsSource: "recomputed-filtered-exact",
+              };
               // Originally persisted, but re-computed after pushed filter
               materializedOverrides.set(src.name, filtered);
             }
