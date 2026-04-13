@@ -823,6 +823,39 @@ export class ObjectIndex {
     return this.ds.get(indexVersionKey);
   }
 
+  async loadPersistedBitmapState(): Promise<void> {
+    this.bitmapIndex.clear();
+
+    const dictSnapshot = await this.ds.get(["$dict"]);
+    if (dictSnapshot) {
+      this.bitmapIndex.loadDictionary(dictSnapshot);
+    }
+
+    for await (const { key, value } of this.ds.query({
+      prefix: ["m"],
+    })) {
+      const tagId = Number(key[1]);
+      if (Number.isFinite(tagId)) {
+        this.bitmapIndex.loadTagMeta(tagId, value as any);
+      }
+    }
+
+    for await (const { key, value } of this.ds.query<Uint8Array>({
+      prefix: ["b"],
+    })) {
+      const tagId = Number(key[1]);
+      const column = String(key[2]);
+      const valueId = Number(key[3]);
+      if (
+        Number.isFinite(tagId) &&
+        Number.isFinite(valueId) &&
+        value instanceof Uint8Array
+      ) {
+        this.bitmapIndex.loadBitmap(tagId, column, valueId, value);
+      }
+    }
+  }
+
   async awaitIndexQueueDrain(): Promise<void> {
     await this.mq.awaitEmptyQueue("indexQueue");
   }

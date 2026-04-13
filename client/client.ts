@@ -175,6 +175,7 @@ export class Client {
       this.eventHook,
       this.mq,
     );
+    await this.objectIndex.loadPersistedBitmapState();
 
     // Instantiate a PlugOS system
     this.clientSystem = new ClientSystem(
@@ -187,6 +188,7 @@ export class Client {
     );
 
     this.initSpace();
+    await this.objectIndex.ensureFullIndex(this.space);
 
     this.ui = new MainUI(this);
     this.ui.render(this.parent);
