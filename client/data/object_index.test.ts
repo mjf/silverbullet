@@ -5,6 +5,7 @@ import { MemoryKvPrimitives } from "./memory_kv_primitives.ts";
 import { DataStoreMQ } from "./mq.datastore.ts";
 import { EventHook } from "../plugos/hooks/event.ts";
 import { Config } from "../config.ts";
+import { LuaEnv, LuaStackFrame } from "../space_lua/runtime.ts";
 
 // --- Test helpers ---
 
@@ -297,6 +298,3 @@ describe("ObjectIndex cleanKey", () => {
     expect(index.cleanKey("other@42", "MyPage")).toBe("other@42");
   });
 });
-
-// Import Lua runtime for query tests
-import { LuaEnv, LuaStackFrame } from "../space_lua/runtime.ts";

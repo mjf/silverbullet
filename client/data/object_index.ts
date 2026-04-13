@@ -294,7 +294,9 @@ export class ObjectIndex {
         return {
           rowCount,
           ndv,
-          avgColumnCount: undefined,
+          avgColumnCount: rowCount > 0 && meta
+            ? Math.round(meta.totalColumnCount / rowCount)
+            : 0,
           mcv: mcv.size > 0 ? mcv : undefined,
           statsSource: indexComplete
             ? "persisted-complete"

@@ -85,6 +85,16 @@ describe("BitmapIndex encoding", () => {
     expect(Array.isArray(encoded._enc)).toBe(true);
     expect(encoded._enc).toContain("name");
   });
+
+  test("dictionary size cap disables new encodings", () => {
+    const idx = makeIndex({ maxDictionarySize: 1 });
+    const encoded1 = idx.encodeObject({ a: "first" });
+    const encoded2 = idx.encodeObject({ b: "second" });
+
+    expect(encoded1._enc).toContain("a");
+    expect(encoded2._enc).not.toContain("b");
+    expect(encoded2.b).toBe("second");
+  });
 });
 
 // --- Decoding ---
@@ -247,6 +257,27 @@ describe("BitmapIndex tag metadata", () => {
     // were bitmap-indexed before the threshold kicked in
     expect(meta.columns.name.ndv).toBe(2); // A, B (C was not indexed)
   });
+
+  test("totalColumnCount tracks adds", () => {
+    const idx = makeIndex();
+    addObject(idx, "item", { page: "P1", name: "A", done: false });
+    addObject(idx, "item", { page: "P2", name: "B" });
+
+    const { meta } = idx.getTagMeta("item");
+    expect(meta.totalColumnCount).toBe(5);
+  });
+
+  test("totalColumnCount tracks removes", () => {
+    const idx = makeIndex();
+    const o1 = addObject(idx, "item", { page: "P1", name: "A", done: false });
+    addObject(idx, "item", { page: "P2", name: "B" });
+
+    const { meta } = idx.getTagMeta("item");
+    expect(meta.totalColumnCount).toBe(5);
+
+    idx.unindexObject(o1.tagId, o1.objectId, o1.encoded, meta);
+    expect(meta.totalColumnCount).toBe(2);
+  });
 });
 
 // --- Selectivity threshold ---
@@ -257,6 +288,7 @@ describe("BitmapIndex selectivity thresholds", () => {
     const meta: TagMeta = {
       count: 10,
       nextObjectId: 10,
+      totalColumnCount: 10,
       columns: { page: { ndv: 10, indexed: true } },
     };
     // ndv/count = 1.0 > 0.5 but page is always indexed
@@ -272,6 +304,7 @@ describe("BitmapIndex selectivity thresholds", () => {
     const meta: TagMeta = {
       count: 10,
       nextObjectId: 10,
+      totalColumnCount: 10,
       columns: { ref: { ndv: 8, indexed: true } },
     };
     // ndv/count = 0.8 > 0.5
@@ -287,6 +320,7 @@ describe("BitmapIndex selectivity thresholds", () => {
     const meta: TagMeta = {
       count: 100,
       nextObjectId: 100,
+      totalColumnCount: 100,
       columns: { state: { ndv: 3, indexed: true } },
     };
     // ndv/count = 0.03 < 0.5
@@ -301,6 +335,7 @@ describe("BitmapIndex selectivity thresholds", () => {
     const meta: TagMeta = {
       count: 10,
       nextObjectId: 10,
+      totalColumnCount: 10,
       columns: { state: { ndv: 2, indexed: true } },
     };
     expect(idx.shouldIndexColumn("state", meta)).toBe(false);
@@ -333,6 +368,16 @@ describe("BitmapIndex flush", () => {
     // Should have meta entry
     const metaWrites = writes.filter((w) => w.key[0] === "m");
     expect(metaWrites.length).toBe(1);
+  });
+
+  test("flush persists totalColumnCount in meta", () => {
+    const idx = makeIndex();
+    addObject(idx, "item", { name: "A", page: "P1", done: false });
+
+    const { writes } = idx.flushToKVs();
+    const metaWrite = writes.find((w) => w.key[0] === "m");
+    expect(metaWrite).toBeDefined();
+    expect((metaWrite!.value as TagMeta).totalColumnCount).toBe(3);
   });
 
   test("flush clears dirty state", () => {
@@ -388,11 +433,13 @@ describe("BitmapIndex load", () => {
     const meta: TagMeta = {
       count: 42,
       nextObjectId: 100,
+      totalColumnCount: 84,
       columns: { page: { ndv: 5, indexed: true } },
     };
     idx.loadTagMeta(7, meta);
     expect(idx.getRowCount(7)).toBe(42);
     expect(idx.getColumnNDV(7, "page")).toBe(5);
+    expect(idx.getTagMetaById(7)?.totalColumnCount).toBe(84);
   });
 
   test("loadBitmap restores bitmap state", () => {

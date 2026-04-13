@@ -63,11 +63,12 @@ export type ColumnMeta = {
 export type TagMeta = {
   count: number;
   nextObjectId: number;
+  totalColumnCount: number;
   columns: Record<string, ColumnMeta>;
 };
 
 function emptyTagMeta(): TagMeta {
-  return { count: 0, nextObjectId: 0, columns: {} };
+  return { count: 0, nextObjectId: 0, totalColumnCount: 0, columns: {} };
 }
 
 // --- Encoded object ---
@@ -318,8 +319,11 @@ export class BitmapIndex {
     encoded: EncodedObject,
     meta: TagMeta,
   ): void {
+    let objectColumnCount = 0;
+
     for (const [key, value] of Object.entries(encoded)) {
       if (key === "_enc") continue;
+      objectColumnCount++;
       if (!this.shouldIndexColumn(key, meta)) continue;
 
       if (!meta.columns[key]) {
@@ -344,6 +348,8 @@ export class BitmapIndex {
         if (wasEmpty) meta.columns[key].ndv++;
       }
     }
+
+    meta.totalColumnCount += objectColumnCount;
     this.dirtyMeta.add(tagId);
   }
 
@@ -356,8 +362,11 @@ export class BitmapIndex {
     encoded: EncodedObject,
     meta: TagMeta,
   ): void {
+    let objectColumnCount = 0;
+
     for (const [key, value] of Object.entries(encoded)) {
       if (key === "_enc") continue;
+      objectColumnCount++;
       if (!meta.columns[key]?.indexed) continue;
 
       if (Array.isArray(value)) {
@@ -391,6 +400,8 @@ export class BitmapIndex {
         }
       }
     }
+
+    meta.totalColumnCount = Math.max(0, meta.totalColumnCount - objectColumnCount);
     meta.count = Math.max(0, meta.count - 1);
     this.dirtyMeta.add(tagId);
   }
