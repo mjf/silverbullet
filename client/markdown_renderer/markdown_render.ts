@@ -30,6 +30,7 @@ export type MarkdownRenderOptions = {
   shortWikiLinks?: boolean;
   // When defined, use to inline images as data: urls
   translateUrls?: (url: string, type: "link" | "image") => string;
+  resolveTagHref?: (tagName: string) => string;
   expand?: true;
 };
 
@@ -336,12 +337,14 @@ function render(t: ParseTree, options: MarkdownRenderOptions = {}): Tag | null {
     }
     case "Hashtag": {
       const tagText: string = t.children![0].text!;
-      const link = TagConstants.tagPrefix + extractHashtag(tagText);
+      const tagName = extractHashtag(tagText);
+      const link = options.resolveTagHref?.(tagName) ??
+        TagConstants.tagPrefix + tagName;
       return {
         name: "a",
         attrs: {
           class: "hashtag sb-hashtag",
-          "data-tag-name": extractHashtag(tagText),
+          "data-tag-name": tagName,
           href: `/${encodePageURI(link)}`,
           "data-ref": link,
         },
@@ -417,11 +420,17 @@ function render(t: ParseTree, options: MarkdownRenderOptions = {}): Tag | null {
           },
         ],
       };
-    case "TableCell":
+    case "TableCell": {
+      const cellHasHtml = t.children!.some((c) => c.type === "HTMLTag");
       return {
         name: "td",
-        body: cleanTags(mapRender(t.children!)),
+        body: cleanTags(
+          cellHasHtml
+            ? groupInlineHtml(t.children!, options, posPreservingRender)
+            : mapRender(t.children!),
+        ),
       };
+    }
     case "TableRow": {
       const table = t.parent;
       const header = table?.children?.find((c) => c.type === "TableHeader");
@@ -573,6 +582,19 @@ function render(t: ParseTree, options: MarkdownRenderOptions = {}): Tag | null {
         body: renderToText(t),
       };
 
+    // Structured HTMLBlock from the custom parser: flat sequence of
+    // HTMLOpenTag / HTMLCloseTag / HTMLSelfClosingTag + inline content.
+    // We rebuild nesting via a stack, similar to groupInlineHtml.
+    case "HTMLBlock":
+      return renderHtmlBlock(t.children ?? [], options);
+
+    // Tag markers inside HTMLBlock — should not appear outside of it,
+    // but handle gracefully.
+    case "HTMLOpenTag":
+    case "HTMLCloseTag":
+    case "HTMLSelfClosingTag":
+      return renderToText(t);
+
     // Unmatched HTMLTag nodes render as literal text (matched ones are
     // handled at the Paragraph level by groupInlineHtml)
     case "HTMLTag":
@@ -597,6 +619,101 @@ function render(t: ParseTree, options: MarkdownRenderOptions = {}): Tag | null {
   function mapRender(children: ParseTree[]) {
     return children.map((t) => posPreservingRender(t, options));
   }
+}
+
+/**
+ * Render a structured HTMLBlock's children into nested Tag elements.
+ *
+ * Walks the flat sequence of HTMLOpenTag / HTMLCloseTag /
+ * HTMLSelfClosingTag and inline content nodes, using a stack to
+ * rebuild proper nesting.
+ */
+function renderHtmlBlock(
+  children: ParseTree[],
+  options: MarkdownRenderOptions,
+): Tag {
+  // Stack entry: tag info + accumulated child tags
+  const stack: {
+    name: string;
+    attrs: Record<string, string> | undefined;
+    body: Tag[];
+  }[] = [];
+
+  // Root container collects top-level elements
+  const root: Tag[] = [];
+
+  function currentBody(): Tag[] {
+    return stack.length > 0 ? stack[stack.length - 1].body : root;
+  }
+
+  for (const child of children) {
+    switch (child.type) {
+      case "HTMLOpenTag": {
+        const text = renderToText(child);
+        const parsed = parseHtmlTag(text);
+        if (parsed) {
+          stack.push({
+            name: parsed.tagName,
+            attrs: Object.keys(parsed.parsedAttrs).length > 0
+              ? parsed.parsedAttrs
+              : undefined,
+            body: [],
+          });
+        } else {
+          // Unparseable open tag — render as text
+          currentBody().push(text);
+        }
+        break;
+      }
+      case "HTMLCloseTag": {
+        if (stack.length > 0) {
+          const top = stack.pop()!;
+          currentBody().push({
+            name: top.name,
+            attrs: top.attrs,
+            body: top.body,
+          });
+        }
+        // If stack is empty, silently drop unmatched close tag
+        break;
+      }
+      case "HTMLSelfClosingTag": {
+        const text = renderToText(child);
+        // Emit as raw HTML to preserve the self-closing form (e.g. <br />)
+        currentBody().push({
+          name: RawHtml,
+          body: text,
+        });
+        break;
+      }
+      default: {
+        // Inline content — render via the normal markdown renderer
+        const rendered = posPreservingRender(child, options);
+        if (rendered !== null) {
+          currentBody().push(rendered);
+        }
+        break;
+      }
+    }
+  }
+
+  // Flush any unclosed tags (shouldn't happen with well-formed HTML)
+  while (stack.length > 0) {
+    const top = stack.pop()!;
+    currentBody().push({
+      name: top.name,
+      attrs: top.attrs,
+      body: top.body,
+    });
+  }
+
+  if (root.length === 1) {
+    return root[0];
+  }
+  return {
+    name: Fragment,
+    body: root,
+  };
 }
 
 type RenderFn = (
