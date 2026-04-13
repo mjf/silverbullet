@@ -1120,28 +1120,39 @@ function annotateExplainWrappersFromFinalRows(
       annotate(child);
     }
 
+    let touched = false;
+
     switch (node.nodeType) {
       case "Filter": {
         const childRows = node.children[0]?.actualRows ?? fallbackInputRows;
         node.actualRows = finalRows;
         node.actualLoops = 1;
         node.rowsRemovedByFilter = Math.max(0, childRows - finalRows);
+        touched = true;
         break;
       }
       case "Unique":
+        node.actualRows = finalRows;
+        node.actualLoops = 1;
+        touched = true;
+        break;
       case "Sort":
+        node.actualRows = finalRows;
+        node.actualLoops = 1;
+        node.memoryRows = finalRows;
+        touched = true;
+        break;
       case "Limit":
       case "GroupAggregate":
         node.actualRows = finalRows;
         node.actualLoops = 1;
-        if (node.nodeType === "Sort") {
-          node.memoryRows = finalRows;
-        }
+        touched = true;
         break;
     }
 
-    if (opts.timing && node.actualRows !== undefined) {
-      const elapsed = Math.round((performance.now() - startedAtMs) * 1000) / 1000;
+    if (touched && opts.timing) {
+      const elapsed =
+        Math.round((performance.now() - startedAtMs) * 1000) / 1000;
       node.actualStartupTimeMs = elapsed;
       node.actualTimeMs = elapsed;
     }
