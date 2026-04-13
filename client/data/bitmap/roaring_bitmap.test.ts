@@ -1,7 +1,7 @@
 import { describe, expect, test } from "vitest";
 import { RoaringBitmap } from "./roaring_bitmap.ts";
 
-// --- Helpers ---
+// Helpers
 
 function fromArray(values: number[]): RoaringBitmap {
   const bm = new RoaringBitmap();
@@ -40,7 +40,7 @@ function mulberry32(seed: number) {
   };
 }
 
-// --- Basic operations ---
+// Basic operations
 
 describe("RoaringBitmap basic operations", () => {
   test("empty bitmap", () => {
@@ -87,7 +87,7 @@ describe("RoaringBitmap basic operations", () => {
   });
 });
 
-// --- ArrayContainer ---
+// ArrayContainer
 
 describe("ArrayContainer specifics", () => {
   test("sorted order after random insertions", () => {
@@ -112,7 +112,7 @@ describe("ArrayContainer specifics", () => {
   });
 });
 
-// --- BitmapContainer (promotion/demotion) ---
+// BitmapContainer (promotion/demotion)
 
 describe("BitmapContainer promotion/demotion", () => {
   test("promote at 4096 boundary", () => {
@@ -143,7 +143,7 @@ describe("BitmapContainer promotion/demotion", () => {
   });
 });
 
-// --- RunContainer ---
+// RunContainer
 
 describe("RunContainer specifics", () => {
   test("dense sequential range stored efficiently", () => {
@@ -179,7 +179,7 @@ describe("RunContainer specifics", () => {
   });
 });
 
-// --- Cross-container set operations ---
+// Cross-container set operations
 
 describe("Set operations: and", () => {
   test("Array ∩ Array — overlapping", () => {
@@ -319,7 +319,7 @@ describe("Set operations: andNot", () => {
   });
 });
 
-// --- Multi-MSB-key operations ---
+// Multi-MSB-key operations
 
 describe("Multi-MSB-key", () => {
   test("values in different MSB buckets", () => {
@@ -350,7 +350,7 @@ describe("Multi-MSB-key", () => {
   });
 });
 
-// --- Serialization ---
+// Serialization
 
 describe("Serialization roundtrip", () => {
   test("empty bitmap", () => {
@@ -403,7 +403,7 @@ describe("Serialization roundtrip", () => {
   });
 });
 
-// --- Edge cases ---
+// Edge cases
 
 describe("Edge cases", () => {
   test("value 0", () => {
@@ -436,7 +436,7 @@ describe("Edge cases", () => {
     expect(bm.toArray()).toEqual([0x10000]);
   });
 
-  test("promotion boundary 4095→4096", () => {
+  test("promotion boundary 4095->4096", () => {
     const bm = new RoaringBitmap();
     for (let i = 0; i < 4095; i++) bm.add(i);
     expect(bm.cardinality()).toBe(4095);
@@ -445,7 +445,7 @@ describe("Edge cases", () => {
     expect(bm.has(4095)).toBe(true);
   });
 
-  test("demotion boundary 4096→4095", () => {
+  test("demotion boundary 4096->4095", () => {
     const bm = new RoaringBitmap();
     for (let i = 0; i < 4096; i++) bm.add(i);
     bm.remove(0);
@@ -461,7 +461,7 @@ describe("Edge cases", () => {
   });
 });
 
-// --- Property-based correctness ---
+// Property-based correctness
 
 describe("Property-based correctness", () => {
   const rng = mulberry32(123);
@@ -506,12 +506,10 @@ describe("Property-based correctness", () => {
     const bmA = fromArray(a);
     const bmB = fromArray(b);
 
-    // |A ∩ B| + |A \ B| == |A|
     const andCard = RoaringBitmap.and(bmA, bmB).cardinality();
     const diffCard = RoaringBitmap.andNot(bmA, bmB).cardinality();
     expect(andCard + diffCard).toBe(bmA.cardinality());
 
-    // |A ∪ B| == |A| + |B| - |A ∩ B|
     const orCard = RoaringBitmap.or(bmA, bmB).cardinality();
     expect(orCard).toBe(bmA.cardinality() + bmB.cardinality() - andCard);
   });

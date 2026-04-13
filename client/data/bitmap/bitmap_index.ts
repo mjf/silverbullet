@@ -1,16 +1,16 @@
 /**
- * Bitmap Index layer for SilverBullet.
- *
  * Manages per-tag, per-column bitmap indices backed by RoaringBitmaps.
- * Uses the Dictionary for value→ID mapping.
+ * Uses the Dictionary for value to ID mapping.
  *
  * Storage keys (in the underlying KV store):
- *   b\0{tagId}\0{columnName}\0{valueId} → serialized RoaringBitmap
- *   m\0{tagId}                          → TagMeta
- *   $dict                               → DictionarySnapshot
+ *
+ * - `b\0{tagId}\0{columnName}\0{valueId}` -> serialized `RoaringBitmap`
+ * - `m\0{tagId}` -> `TagMeta`
+ * - `$dict` -> `DictionarySnapshot`
  *
  * Object keys remain per-tag:
- *   o\0{tagId}\0{objectId}              → encoded object
+ *
+ * - `o\0{tagId}\0{objectId}` -> encoded object
  */
 
 import { RoaringBitmap } from "./roaring_bitmap.ts";
@@ -21,13 +21,13 @@ import {
 } from "./dictionary.ts";
 import type { KV, KvKey } from "../../../plug-api/types/datastore.ts";
 
-// --- Storage key prefixes ---
+// Storage key prefixes
 const BITMAP_PREFIX = "b";
 const META_PREFIX = "m";
 const OBJECT_PREFIX = "o";
 const DICT_KEY: KvKey = ["$dict"];
 
-// --- Configuration ---
+// Configuration
 
 export type BitmapIndexConfig = {
   /** Max selectivity (NDV/rowCount) for bitmap indexing. Default: 0.5 */
@@ -53,7 +53,7 @@ const DEFAULT_CONFIG: BitmapIndexConfig = {
   alwaysIndexColumns: ["page", "tag"],
 };
 
-// --- Tag metadata ---
+// Tag metadata
 
 export type ColumnMeta = {
   ndv: number;
@@ -71,10 +71,11 @@ function emptyTagMeta(): TagMeta {
   return { count: 0, nextObjectId: 0, totalColumnCount: 0, columns: {} };
 }
 
-// --- Encoded object ---
+// Encoded object
 
 /**
- * An encoded object has dictionary IDs where the original had short strings.
+ * An encoded object has dictionary IDs.
+ *
  * Non-encoded fields (long strings, numbers, booleans, arrays, objects)
  * are stored as-is.
  *
@@ -86,14 +87,14 @@ export type EncodedObject = {
   [key: string]: unknown;
 };
 
-// --- BitmapIndex ---
+// BitmapIndex
 
 export class BitmapIndex {
   private dict: Dictionary;
   private config: BitmapIndexConfig;
   // In-memory cache of tag metadata
   private metaCache: Map<number, TagMeta> = new Map();
-  // In-memory cache of bitmaps: `${tagId}\0${column}\0${valueId}` → bitmap
+  // In-memory cache of bitmaps: `${tagId}\0${column}\0${valueId}` -> bitmap
   private bitmapCache: Map<string, RoaringBitmap> = new Map();
   // Track dirty bitmaps for batch flush
   private dirtyBitmaps: Set<string> = new Set();
@@ -112,7 +113,7 @@ export class BitmapIndex {
     return this.config;
   }
 
-  // --- Encoding ---
+  // Encoding
 
   /**
    * Determine if a field value should be dictionary-encoded.
@@ -192,7 +193,7 @@ export class BitmapIndex {
     return result;
   }
 
-  // --- Bitmap operations ---
+  // Bitmap operations
 
   private bitmapCacheKey(
     tagId: number,
@@ -401,7 +402,10 @@ export class BitmapIndex {
       }
     }
 
-    meta.totalColumnCount = Math.max(0, meta.totalColumnCount - objectColumnCount);
+    meta.totalColumnCount = Math.max(
+      0,
+      meta.totalColumnCount - objectColumnCount,
+    );
     meta.count = Math.max(0, meta.count - 1);
     this.dirtyMeta.add(tagId);
   }
@@ -434,7 +438,7 @@ export class BitmapIndex {
     }
   }
 
-  // --- Stats (derived from bitmaps — exact, no sketches) ---
+  // Stats (derived from bitmaps — exact, no sketches)
 
   /**
    * Get exact NDV for a column.
@@ -479,7 +483,7 @@ export class BitmapIndex {
     return this.metaCache.get(tagId)?.count ?? 0;
   }
 
-  // --- Persistence helpers ---
+  // Persistence helpers
 
   /**
    * Collect all dirty data as KV writes for a batch flush.

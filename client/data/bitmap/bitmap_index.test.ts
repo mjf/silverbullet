@@ -6,7 +6,7 @@ import {
   type TagMeta,
 } from "./bitmap_index.ts";
 
-// --- Helpers ---
+// Helpers
 
 function makeIndex(config?: Partial<BitmapIndexConfig>) {
   return new BitmapIndex({
@@ -32,7 +32,7 @@ function addObject(
   return { tagId, objectId, encoded };
 }
 
-// --- Encoding ---
+// Encoding
 
 describe("BitmapIndex encoding", () => {
   test("short strings are dictionary-encoded", () => {
@@ -47,7 +47,7 @@ describe("BitmapIndex encoding", () => {
   test("numbers are not dictionary-encoded", () => {
     const idx = makeIndex();
     const encoded = idx.encodeObject({ pos: 42, level: 3 });
-    // Numbers go through canonicalize which is ≤256 bytes, so they ARE encoded
+    // Numbers are encoded
     expect(encoded._enc).toContain("pos");
     expect(typeof encoded.pos).toBe("number"); // dict ID, also a number
   });
@@ -97,7 +97,7 @@ describe("BitmapIndex encoding", () => {
   });
 });
 
-// --- Decoding ---
+// Decoding
 
 describe("BitmapIndex decoding", () => {
   test("roundtrip string fields", () => {
@@ -135,7 +135,7 @@ describe("BitmapIndex decoding", () => {
   });
 });
 
-// --- Bitmap indexing ---
+// Bitmap indexing
 
 describe("BitmapIndex bitmap operations", () => {
   test("index single object creates bitmaps", () => {
@@ -217,7 +217,7 @@ describe("BitmapIndex bitmap operations", () => {
   });
 });
 
-// --- Tag metadata ---
+// Tag metadata
 
 describe("BitmapIndex tag metadata", () => {
   test("count tracks adds and removes", () => {
@@ -254,7 +254,7 @@ describe("BitmapIndex tag metadata", () => {
 
     expect(meta.columns.page.ndv).toBe(2); // P1, P2
     // name has high selectivity (NDV/count > 0.5), so only first 2 values
-    // were bitmap-indexed before the threshold kicked in
+    // were bitmap-indexed
     expect(meta.columns.name.ndv).toBe(2); // A, B (C was not indexed)
   });
 
@@ -280,7 +280,7 @@ describe("BitmapIndex tag metadata", () => {
   });
 });
 
-// --- Selectivity threshold ---
+// Selectivity threshold
 
 describe("BitmapIndex selectivity thresholds", () => {
   test("alwaysIndexColumns are always indexed", () => {
@@ -342,7 +342,7 @@ describe("BitmapIndex selectivity thresholds", () => {
   });
 });
 
-// --- Flush to KV ---
+// Flush to KV
 
 describe("BitmapIndex flush", () => {
   test("flush produces writes for dirty data", () => {
@@ -413,7 +413,7 @@ describe("BitmapIndex flush", () => {
   });
 });
 
-// --- Load from persistence ---
+// Load from persistence
 
 describe("BitmapIndex load", () => {
   test("loadDictionary restores encoding", () => {
@@ -458,7 +458,7 @@ describe("BitmapIndex load", () => {
   });
 });
 
-// --- Clear ---
+// Clear
 
 describe("BitmapIndex clear", () => {
   test("clear resets all state", () => {
@@ -471,7 +471,7 @@ describe("BitmapIndex clear", () => {
   });
 });
 
-// --- Integration: multi-tag ---
+// Integration: multi-tag
 
 describe("BitmapIndex multi-tag", () => {
   test("different tags have independent object IDs", () => {

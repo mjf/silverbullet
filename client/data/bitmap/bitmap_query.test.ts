@@ -6,7 +6,7 @@ import type {
   LuaBinaryExpression,
 } from "../../space_lua/ast.ts";
 
-// --- Helpers ---
+// Helpers
 
 function makeIndex(): BitmapIndex {
   return new BitmapIndex({
@@ -61,7 +61,7 @@ function paren(expr: LuaExpression): LuaExpression {
   return { type: "Parenthesized", expression: expr, ctx: {} };
 }
 
-// --- Simple equality ---
+// Simple equality
 
 describe("bitmap_query: equality pre-filter", () => {
   test("i.page == 'P1' narrows to matching IDs", () => {
@@ -116,10 +116,10 @@ describe("bitmap_query: equality pre-filter", () => {
   });
 });
 
-// --- AND chains ---
+// AND chains
 
 describe("bitmap_query: AND conjunction", () => {
-  test("two equalities ANDed → intersection", () => {
+  test("two equalities ANDed -> intersection", () => {
     const idx = makeIndex();
     addObject(idx, "item", { page: "P1", status: "open" });
     addObject(idx, "item", { page: "P1", status: "closed" });
@@ -185,7 +185,7 @@ describe("bitmap_query: AND conjunction", () => {
   });
 });
 
-// --- Inequality ---
+// Inequality
 
 describe("bitmap_query: inequality", () => {
   test("column ~= literal excludes matching rows", () => {
@@ -216,7 +216,7 @@ describe("bitmap_query: inequality", () => {
   });
 });
 
-// --- OR: cannot pre-filter ---
+// OR: cannot pre-filter
 
 describe("bitmap_query: OR is not pre-filtered", () => {
   test("OR returns null (full scan needed)", () => {
@@ -232,14 +232,13 @@ describe("bitmap_query: OR is not pre-filtered", () => {
       binOp("==", propAccess("i", "page"), lit("P2")),
     );
 
-    // OR at the top level → can't safely pre-filter (would need union, but
-    // Lua's `or` has short-circuit semantics we must preserve)
+    // OR at the top level -> can't safely pre-filter (would need union)
     const result = analyzeBitmapPrefilter(expr, tagId, "i", idx);
     expect(result).toBeNull();
   });
 });
 
-// --- Unsupported patterns return null ---
+// Unsupported patterns return null
 
 describe("bitmap_query: unsupported patterns", () => {
   test("range comparison returns null", () => {
@@ -289,7 +288,7 @@ describe("bitmap_query: unsupported patterns", () => {
   });
 });
 
-// --- Edge cases ---
+// Edge cases
 
 describe("bitmap_query: edge cases", () => {
   test("empty index returns empty bitmap", () => {

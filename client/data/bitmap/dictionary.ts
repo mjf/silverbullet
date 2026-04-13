@@ -10,10 +10,7 @@ const PREFIX_NUMBER = 2;
 const PREFIX_STRING = 3;
 const PREFIX_COMPLEX = 4;
 
-/**
- * Produce a deterministic string key for any JS value.
- * Values that are === equal produce identical keys.
- */
+// Produce a deterministic string key for any JS value.
 export function canonicalize(value: unknown): string {
   if (value === null || value === undefined) {
     return String.fromCharCode(PREFIX_NULL);
@@ -33,7 +30,7 @@ export function canonicalize(value: unknown): string {
 
 /**
  * Deterministic number encoding that preserves sort order for common cases.
- * Uses IEEE 754 hex for exact roundtrip; special-cases NaN/±Infinity.
+ * Uses IEEE 754 hex for exact roundtrip; special-cases NaN/+-Infinity.
  */
 function numToKey(n: number): string {
   if (Object.is(n, -0)) return "-0";
@@ -66,14 +63,14 @@ function stableStringify(value: unknown): string {
 }
 
 export type DictionarySnapshot = {
-  entries: [string, number][]; // canonical → id
+  entries: [string, number][]; // canonical -> id
   nextId: number;
 };
 
 export class Dictionary {
   private forward: Map<string, number>;
-  private reverse: string[]; // id → canonical key
-  private original: Map<string, unknown>; // canonical key → original value
+  private reverse: string[]; // id -> canonical key
+  private original: Map<string, unknown>; // canonical key -> original value
   private _nextId: number;
   private _dirty: boolean;
 
@@ -97,7 +94,7 @@ export class Dictionary {
 
   /**
    * Get or assign an integer ID for a value.
-   * Returns the existing ID if already known.
+   * Returns the existing ID if known.
    */
   encode(value: unknown): number {
     const key = canonicalize(value);
@@ -122,7 +119,6 @@ export class Dictionary {
 
   /**
    * Decode an ID back to the canonical key string.
-   * For structural decode back to original value, use decodeValue().
    */
   decode(id: number): string | undefined {
     return this.reverse[id];

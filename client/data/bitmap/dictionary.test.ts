@@ -1,7 +1,7 @@
 import { describe, expect, test } from "vitest";
 import { Dictionary, canonicalize } from "./dictionary.ts";
 
-// --- canonicalize ---
+// Canonicalize
 
 describe("canonicalize", () => {
   test("null and undefined produce same key", () => {
@@ -61,7 +61,7 @@ describe("canonicalize", () => {
   });
 });
 
-// --- Dictionary encode/decode ---
+// Dictionary encode/decode
 
 describe("Dictionary encode/decode", () => {
   test("first encode returns 0", () => {
@@ -157,7 +157,7 @@ describe("Dictionary encode/decode", () => {
   });
 });
 
-// --- Dirty tracking ---
+// Dirty tracking
 
 describe("Dictionary dirty tracking", () => {
   test("new dictionary is not dirty", () => {
@@ -187,7 +187,7 @@ describe("Dictionary dirty tracking", () => {
   });
 });
 
-// --- Snapshot persistence ---
+// Snapshot persistence
 
 describe("Dictionary snapshot", () => {
   test("empty snapshot roundtrip", () => {
@@ -231,7 +231,7 @@ describe("Dictionary snapshot", () => {
     const d = new Dictionary();
     const id = d.encode("hello");
     const d2 = new Dictionary(d.toSnapshot());
-    // Original not cached after restore, but decodeCanonical reconstructs it
+    // Original not cached after restore, but decode reconstructs it
     expect(d2.decodeValue(id)).toBe("hello");
   });
 
@@ -248,7 +248,7 @@ describe("Dictionary snapshot", () => {
   });
 });
 
-// --- Capacity / stress ---
+// Capacity
 
 describe("Dictionary capacity", () => {
   test("10000 unique strings", () => {

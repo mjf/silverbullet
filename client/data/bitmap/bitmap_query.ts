@@ -1,24 +1,19 @@
 /**
- * Bitmap Predicate Analyzer for SilverBullet.
+ * Bitmap Predicate Analyzer.
  *
- * Performs STATIC analysis of Lua WHERE expressions (no evaluation) to
+ * Performs static analysis of LIQ where expressions (no evaluation) to
  * extract simple equality predicates resolvable by bitmap index lookup.
  *
  * The result is a set of candidate object IDs that MIGHT match.
- * The full Lua WHERE expression is ALWAYS evaluated afterwards — bitmaps
+ * The full LIQ where expression is always evaluated afterwards — bitmaps
  * only narrow the KV scan, they never replace Lua evaluation.
  *
- * This follows the same pattern as:
- *   - extractEquiPredicates() in join_planner.ts (AST walk, no eval)
- *   - evalExpressionWithAggregates() in query_collection.ts (AST-aware
- *     interception that falls through to evalExpression for non-aggregate nodes)
- *
  * Supported patterns (conjuncts of AND chains):
- *   - column == literal     → single bitmap lookup
- *   - literal == column     → (reversed operands)
- *   - column ~= literal     → all-column-bitmaps MINUS literal's bitmap
  *
- * OR branches and complex expressions are left to Lua evaluation.
+ * - column == literal -> single bitmap lookup
+ * - literal == column -> (reversed operands)
+ * - column ~= literal -> all-column-bitmaps minus literal's bitmap
+ *
  * The analyzer is conservative: when in doubt, it does NOT filter.
  */
 
@@ -38,21 +33,22 @@ import type { BitmapIndex } from "./bitmap_index.ts";
 export type BitmapPrefilterResult = {
   /** Object IDs that might match (superset of true results). */
   candidateIds: RoaringBitmap;
-  /** Columns resolved via bitmap (for EXPLAIN). */
+  /** Columns resolved via bitmap (for explain). */
   resolvedColumns: string[];
 };
 
 /**
- * Analyze a WHERE expression to extract a bitmap pre-filter.
+ * Analyze a where expression to extract a bitmap pre-filter.
  *
  * Returns null if no predicates could be resolved (caller does full scan).
  * When non-null, caller should:
- *   1. Fetch only objects whose IDs are in candidateIds
- *   2. STILL evaluate the full WHERE expression on each fetched object
+ *
+ * 1. Fetch only objects whose IDs are in candidateIds
+ * 2. Still evaluate the full where expression on each fetched object
  *
  * @param expr - The WHERE clause AST
  * @param tagId - Numeric tag ID for bitmap lookups
- * @param objectVariable - The query's object variable (e.g. "i" in `from i = ...`)
+ * @param objectVariable - The query's object variable
  * @param bitmapIndex - The bitmap index instance
  */
 export function analyzeBitmapPrefilter(
@@ -95,7 +91,7 @@ export function analyzeBitmapPrefilter(
   };
 }
 
-// --- Internal ---
+// Internal
 
 type AnalysisContext = {
   tagId: number;
@@ -106,14 +102,12 @@ type AnalysisContext = {
 
 /**
  * Flatten `and` chains into individual conjuncts.
- * Mirrors join_planner.ts:flattenAnd exactly.
  */
 function flattenAnd(expr: LuaExpression): LuaExpression[] {
   if (expr.type === "Binary" && expr.operator === "and") {
     const bin = expr as LuaBinaryExpression;
     return [...flattenAnd(bin.left), ...flattenAnd(bin.right)];
   }
-  // Unwrap parenthesized
   if (expr.type === "Parenthesized") {
     return flattenAnd((expr as { expression: LuaExpression }).expression);
   }
@@ -139,12 +133,12 @@ function resolveConjunct(
     return resolveInequality(bin, ctx);
   }
 
-  // Other operators (>, <, >=, <=, ..) → can't resolve via equality bitmaps
+  // Other operators (>, <, >=, <=, ..) -> can't resolve via equality bitmaps
   return null;
 }
 
 /**
- * column == literal → lookup the bitmap for that value
+ * column == literal -> lookup the bitmap for that value
  */
 function resolveEquality(
   expr: LuaBinaryExpression,
@@ -161,7 +155,7 @@ function resolveEquality(
   const valueId = dict.tryEncode(value);
 
   if (valueId === undefined) {
-    // Value not in dictionary → no objects can match
+    // Value not in dictionary -> no objects can match
     ctx.resolvedColumns.push(column);
     return new RoaringBitmap();
   }
@@ -177,11 +171,8 @@ function resolveEquality(
 }
 
 /**
- * column ~= literal → all objects with this column MINUS objects with this value.
- *
- * Conservative: we return ALL column bitmaps unioned, minus the literal's bitmap.
- * This is a superset (objects without the column at all are excluded, but that's
- * still safe since Lua eval handles the full semantics).
+ * column ~= literal -> all objects with this column minus objects with
+ * this value.
  */
 function resolveInequality(
   expr: LuaBinaryExpression,
@@ -206,7 +197,7 @@ function resolveInequality(
   const dict = ctx.bitmapIndex.getDictionary();
   const valueId = dict.tryEncode(value);
   if (valueId === undefined) {
-    // Value not in dictionary → nothing to exclude
+    // Value not in dictionary -> nothing to exclude
     ctx.resolvedColumns.push(column);
     return allObjects;
   }
@@ -221,7 +212,7 @@ function resolveInequality(
   return RoaringBitmap.andNot(allObjects, valueBitmap);
 }
 
-// --- AST pattern matching (no evaluation) ---
+// AST pattern matching (no eval)
 
 type ColumnLiteralPair = {
   column: string;
@@ -244,10 +235,6 @@ function extractColumnAndLiteral(
 
 /**
  * Extract column name from AST node.
- * Matches patterns used in join_planner.ts:parseSourceColumn.
- *
- * - PropertyAccess: `i.page` → "page" (when i == objectVariable)
- * - Variable: `page` → "page" (when no objectVariable, i.e. unqualified query)
  */
 function extractColumnName(
   expr: LuaExpression,
@@ -265,7 +252,6 @@ function extractColumnName(
   }
 
   if (expr.type === "Variable") {
-    // Bare variable → column only when no objectVariable (unqualified access)
     if (!ctx.objectVariable) {
       return (expr as LuaVariable).name;
     }
@@ -277,7 +263,6 @@ function extractColumnName(
 
 /**
  * Extract a literal JS value from an AST node.
- * No evaluation — only recognizes constant literals.
  */
 function extractLiteral(expr: LuaExpression): unknown | undefined {
   switch (expr.type) {
@@ -290,6 +275,6 @@ function extractLiteral(expr: LuaExpression): unknown | undefined {
     case "Nil":
       return null;
     default:
-      return undefined; // Not a literal → skip
+      return undefined; // Not a literal -> skip
   }
 }
