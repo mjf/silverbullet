@@ -984,6 +984,9 @@ function explainSingleSource(
     estimatedCost: rows,
     estimatedRows: rows,
     estimatedWidth: width,
+    statsSource: stats?.statsSource,
+    executionScanKind: stats?.executionCapabilities?.scanKind,
+    predicatePushdown: stats?.executionCapabilities?.predicatePushdown,
     children: [],
   };
 }
@@ -1010,209 +1013,6 @@ function shouldTrustSingleSourceIndexRowCount(
     typeof (collection as any).isTagIndexTrusted === "function";
 }
 
-type ExplainWrapperStage =
-  | {
-      kind: "where";
-      node: ExplainNode;
-      expr: LuaExpression;
-    }
-  | {
-      kind: "groupBy";
-      node: ExplainNode;
-      fields: LuaGroupByEntry[];
-    }
-  | {
-      kind: "having";
-      node: ExplainNode;
-      expr: LuaExpression;
-    }
-  | {
-      kind: "distinct";
-      node: ExplainNode;
-    }
-  | {
-      kind: "orderBy";
-      node: ExplainNode;
-      orderBy: NonNullable<LuaCollectionQuery["orderBy"]>;
-    }
-  | {
-      kind: "limit";
-      node: ExplainNode;
-      limit?: number;
-      offset?: number;
-    };
-
-function collectExplainWrapperStages(
-  plan: ExplainNode,
-): ExplainWrapperStage[] {
-  const stages: ExplainWrapperStage[] = [];
-
-  const visit = (node: ExplainNode): void => {
-    if (node.children.length > 0) {
-      visit(node.children[0]);
-    }
-
-    switch (node.nodeType) {
-      case "Filter":
-        if (node.havingExpr) {
-          stages.push({
-            kind: "having",
-            node,
-            expr: node.havingExpr,
-          });
-        } else if (node.whereExpr) {
-          stages.push({
-            kind: "where",
-            node,
-            expr: node.whereExpr,
-          });
-        }
-        break;
-      case "GroupAggregate":
-        if (node.groupBySpec && node.groupBySpec.length > 0) {
-          stages.push({
-            kind: "groupBy",
-            node,
-            fields: node.groupBySpec.map((g) => ({
-              expr: g.expr,
-              alias: g.alias,
-            })),
-          });
-        }
-        break;
-      case "Unique":
-        stages.push({
-          kind: "distinct",
-          node,
-        });
-        break;
-      case "Sort":
-        if (node.orderBySpec && node.orderBySpec.length > 0) {
-          stages.push({
-            kind: "orderBy",
-            node,
-            orderBy: node.orderBySpec.map((o) => ({
-              expr: o.expr,
-              desc: o.desc,
-            })),
-          });
-        }
-        break;
-      case "Limit":
-        stages.push({
-          kind: "limit",
-          node,
-          limit: node.limitCount,
-          offset: node.offsetCount,
-        });
-        break;
-    }
-  };
-
-  visit(plan);
-  return stages;
-}
-
-async function executeExplainWrapperStages(
-  inputRows: any[],
-  stages: ExplainWrapperStage[],
-  selectExpr: LuaExpression | undefined,
-  objectVariable: string | undefined,
-  env: LuaEnv,
-  sf: LuaStackFrame,
-  opts: ExplainOptions,
-  execStartedAt: number,
-): Promise<any[]> {
-  let currentRows = inputRows;
-
-  for (const stage of stages) {
-    const stageInputRows = currentRows.length;
-    const stageT0 = performance.now();
-
-    const collection = toCollection(currentRows);
-    const query: LuaCollectionQuery = {
-      objectVariable,
-      distinct: false,
-    };
-
-    switch (stage.kind) {
-      case "where":
-        query.where = stage.expr;
-        if (selectExpr) {
-          query.select = selectExpr;
-        }
-        break;
-
-      case "groupBy":
-        query.groupBy = stage.fields;
-        if (selectExpr) {
-          query.select = selectExpr;
-        }
-        break;
-
-      case "having":
-        query.having = stage.expr;
-        if (selectExpr) {
-          query.select = selectExpr;
-        }
-        break;
-
-      case "distinct":
-        query.distinct = true;
-        if (selectExpr) {
-          query.select = selectExpr;
-        }
-        break;
-
-      case "orderBy":
-        query.orderBy = stage.orderBy;
-        if (selectExpr) {
-          query.select = selectExpr;
-        }
-        break;
-
-      case "limit":
-        query.limit = stage.limit;
-        query.offset = stage.offset;
-        if (selectExpr) {
-          query.select = selectExpr;
-        }
-        break;
-    }
-
-    currentRows = await collection.query(
-      query,
-      env,
-      sf,
-      globalThis.client?.config,
-    );
-
-    const stageEndT = performance.now();
-    stage.node.actualRows = currentRows.length;
-    stage.node.actualLoops = 1;
-
-    if (stage.kind === "where" || stage.kind === "having") {
-      stage.node.rowsRemovedByFilter = Math.max(
-        0,
-        stageInputRows - currentRows.length,
-      );
-    }
-
-    if (stage.kind === "orderBy") {
-      stage.node.memoryRows = stageInputRows;
-    }
-
-    if (opts.timing) {
-      stage.node.actualStartupTimeMs =
-        Math.round((stageT0 - execStartedAt) * 1000) / 1000;
-      stage.node.actualTimeMs =
-        Math.round((stageEndT - execStartedAt) * 1000) / 1000;
-    }
-  }
-
-  return currentRows;
-}
-
 async function executeSingleSourceExplainAnalyze(
   collection: any,
   query: LuaCollectionQuery,
@@ -1222,68 +1022,132 @@ async function executeSingleSourceExplainAnalyze(
   sf: LuaStackFrame,
   opts: ExplainOptions,
 ): Promise<any[]> {
-  const execStartedAt = performance.now();
+  const t0 = opts.timing ? performance.now() : 0;
 
-  let baseRows: any[];
+  let baseRowCount: number;
   if (shouldTrustSingleSourceIndexRowCount(collection, sourceStats)) {
     const trusted = await collection.isTagIndexTrusted();
     if (trusted) {
-      baseRows = await collection.query(
-        {},
-        env,
-        sf,
-        globalThis.client?.config,
-      );
+      baseRowCount = sourceStats.rowCount;
     } else {
-      baseRows = await collection.query(
+      const loadedBaseRows = await collection.query(
         {},
         env,
         sf,
         globalThis.client?.config,
       );
+      baseRowCount = loadedBaseRows.length;
     }
   } else {
-    baseRows = await collection.query(
+    const loadedBaseRows = await collection.query(
       {},
       env,
       sf,
       globalThis.client?.config,
     );
+    baseRowCount = loadedBaseRows.length;
   }
 
-  const scanPlan = unwrapToJoinPlan(plan);
-  scanPlan.actualRows = baseRows.length;
-  scanPlan.actualLoops = 1;
-
-  if (opts.timing) {
-    const now = performance.now();
-    scanPlan.actualStartupTimeMs = 0;
-    scanPlan.actualTimeMs =
-      Math.round((now - execStartedAt) * 1000) / 1000;
-  }
-
-  const stages = collectExplainWrapperStages(plan);
-  const finalRows = await executeExplainWrapperStages(
-    baseRows,
-    stages,
-    query.select,
-    query.objectVariable,
+  const finalRows = await collection.query(
+    query,
     env,
     sf,
-    opts,
-    execStartedAt,
+    globalThis.client?.config,
   );
+
+  const scanPlan = unwrapToJoinPlan(plan);
+  scanPlan.actualRows = baseRowCount;
+  scanPlan.actualLoops = 1;
+
+  const annotate = (node: ExplainNode): void => {
+    for (const child of node.children) {
+      annotate(child);
+    }
+
+    switch (node.nodeType) {
+      case "Filter":
+        if (node.children.length > 0) {
+          const childRows = node.children[0].actualRows ?? baseRowCount;
+          node.actualRows = finalRows.length;
+          node.actualLoops = 1;
+          node.rowsRemovedByFilter = Math.max(0, childRows - finalRows.length);
+        }
+        break;
+      case "Unique":
+      case "Sort":
+      case "Limit":
+      case "GroupAggregate":
+        node.actualRows = finalRows.length;
+        node.actualLoops = 1;
+        if (node.nodeType === "Sort") {
+          node.memoryRows = finalRows.length;
+        }
+        break;
+    }
+
+    if (opts.timing) {
+      const elapsed = Math.round((performance.now() - t0) * 1000) / 1000;
+      if (node.actualRows !== undefined) {
+        node.actualStartupTimeMs = elapsed;
+        node.actualTimeMs = elapsed;
+      }
+    }
+  };
+
+  annotate(plan);
 
   plan.actualRows = finalRows.length;
   plan.actualLoops = 1;
 
   if (opts.timing) {
-    const total = Math.round((performance.now() - execStartedAt) * 1000) / 1000;
-    plan.actualStartupTimeMs = 0;
-    plan.actualTimeMs = total;
+    const elapsed = Math.round((performance.now() - t0) * 1000) / 1000;
+    plan.actualStartupTimeMs = elapsed;
+    plan.actualTimeMs = elapsed;
   }
 
   return finalRows;
+}
+
+function annotateExplainWrappersFromFinalRows(
+  plan: ExplainNode,
+  fallbackInputRows: number,
+  finalRows: number,
+  opts: ExplainOptions,
+  startedAtMs: number,
+): void {
+  const annotate = (node: ExplainNode): void => {
+    for (const child of node.children) {
+      annotate(child);
+    }
+
+    switch (node.nodeType) {
+      case "Filter": {
+        const childRows = node.children[0]?.actualRows ?? fallbackInputRows;
+        node.actualRows = finalRows;
+        node.actualLoops = 1;
+        node.rowsRemovedByFilter = Math.max(0, childRows - finalRows);
+        break;
+      }
+      case "Unique":
+      case "Sort":
+      case "Limit":
+      case "GroupAggregate":
+        node.actualRows = finalRows;
+        node.actualLoops = 1;
+        if (node.nodeType === "Sort") {
+          node.memoryRows = finalRows;
+        }
+        break;
+    }
+
+    if (opts.timing && node.actualRows !== undefined) {
+      const elapsed = Math.round((performance.now() - startedAtMs) * 1000) / 1000;
+      node.actualStartupTimeMs = elapsed;
+      node.actualTimeMs = elapsed;
+    }
+  };
+
+  annotate(plan);
 }
 
 async function materializeValueAsItems(
@@ -1855,29 +1719,83 @@ export function evalExpression(
                 materializedOverrides,
               );
 
-              const analyzeStages = collectExplainWrapperStages(explainPlan!);
+              const joinedCollection = toCollection(joinRows);
+              const selectClause = q.clauses.find((c) => c.type === "Select");
+              const selectDistinct = selectClause?.distinct;
 
-              let selectExpr: LuaExpression | undefined;
+              const analyzeQuery: LuaCollectionQuery = {
+                objectVariable: undefined,
+                distinct: selectDistinct !== false,
+              };
+
               for (const clause of q.clauses) {
-                if (clause.type === "Select") {
-                  selectExpr = fieldsToExpression(clause.fields, clause.ctx);
-                  break;
+                switch (clause.type) {
+                  case "Where": {
+                    if (residualWhere) {
+                      analyzeQuery.where = residualWhere;
+                    }
+                    break;
+                  }
+                  case "OrderBy": {
+                    analyzeQuery.orderBy = clause.orderBy.map((o) => ({
+                      expr: o.expression,
+                      desc: o.direction === "desc",
+                      nulls: o.nulls,
+                      using: o.using,
+                    }));
+                    break;
+                  }
+                  case "Select": {
+                    analyzeQuery.select = fieldsToExpression(clause.fields, clause.ctx);
+                    break;
+                  }
+                  case "Limit": {
+                    const limitVal = await evalExpression(clause.limit, env, sf);
+                    analyzeQuery.limit = Number(limitVal);
+                    if (clause.offset) {
+                      const offsetVal = await evalExpression(
+                        clause.offset,
+                        env,
+                        sf,
+                      );
+                      analyzeQuery.offset = Number(offsetVal);
+                    }
+                    break;
+                  }
+                  case "Offset": {
+                    const offsetVal = await evalExpression(
+                      clause.offset,
+                      env,
+                      sf,
+                    );
+                    analyzeQuery.offset = Number(offsetVal);
+                    break;
+                  }
+                  case "GroupBy": {
+                    analyzeQuery.groupBy = fieldsToGroupByEntries(clause.fields);
+                    break;
+                  }
+                  case "Having": {
+                    analyzeQuery.having = clause.expression;
+                    break;
+                  }
                 }
               }
 
-              const finalRows = await executeExplainWrapperStages(
-                joinRows,
-                analyzeStages,
-                selectExpr,
-                undefined,
+              const finalRows = await joinedCollection.query(
+                analyzeQuery,
                 env,
                 sf,
-                explainOpts,
-		execT0,
+                globalThis.client?.config,
               );
 
-              explainPlan!.actualRows = finalRows.length;
-              explainPlan!.actualLoops = 1;
+              annotateExplainWrappersFromFinalRows(
+                explainPlan!,
+                joinRows.length,
+                finalRows.length,
+                explainOpts,
+                execT0,
+              );
 
               const execEndT = performance.now();
               const result: ExplainResult = {

@@ -187,6 +187,7 @@ export type ExplainNode = {
   hashBuckets?: number;
   rowsRemovedByFilter?: number;
   rowsRemovedByJoinFilter?: number;
+  rowsRemovedByUnique?: number;
   equiPred?: EquiPredicate;
   filterExpr?: string;
   sortKeys?: string[];
@@ -194,7 +195,7 @@ export type ExplainNode = {
   offsetCount?: number;
   children: ExplainNode[];
 
-  // Executable wrapper metadata
+  // Wrapper plan metadata
   whereExpr?: LuaExpression;
   havingExpr?: LuaExpression;
   orderBySpec?: { expr: LuaExpression; desc: boolean }[];
@@ -2738,163 +2739,6 @@ function estimateGroupRowsFromNdv(
 
 // 21. Explain analyze execution
 
-type ExplainWrapperExecutor = (
-  node: ExplainNode,
-  inputRows: LuaTable[],
-  opts: ExplainOptions,
-) => Promise<LuaTable[]>;
-
-function wrapperExecElapsed(
-  t0: number,
-  opts: ExplainOptions,
-): number | undefined {
-  if (!opts.timing) return undefined;
-  return Math.round((performance.now() - t0) * 1000) / 1000;
-}
-
-const executeFilterWrapper: ExplainWrapperExecutor = async (
-  node,
-  inputRows,
-  opts,
-) => {
-  const t0 = opts.timing ? performance.now() : 0;
-  node.actualRows = inputRows.length;
-  node.actualLoops = 1;
-  node.rowsRemovedByFilter = 0;
-  const elapsed = wrapperExecElapsed(t0, opts);
-  if (elapsed !== undefined) {
-    node.actualStartupTimeMs = elapsed;
-    node.actualTimeMs = elapsed;
-  }
-  return inputRows;
-};
-
-const executeUniqueWrapper: ExplainWrapperExecutor = async (
-  node,
-  inputRows,
-  opts,
-) => {
-  const t0 = opts.timing ? performance.now() : 0;
-  node.actualRows = inputRows.length;
-  node.actualLoops = 1;
-  const elapsed = wrapperExecElapsed(t0, opts);
-  if (elapsed !== undefined) {
-    node.actualStartupTimeMs = elapsed;
-    node.actualTimeMs = elapsed;
-  }
-  return inputRows;
-};
-
-const executeLimitWrapper: ExplainWrapperExecutor = async (
-  node,
-  inputRows,
-  opts,
-) => {
-  const t0 = opts.timing ? performance.now() : 0;
-  const offset = node.offsetCount ?? 0;
-  const limit = node.limitCount ?? inputRows.length;
-  const out = inputRows.slice(offset, offset + limit);
-  node.actualRows = out.length;
-  node.actualLoops = 1;
-  const elapsed = wrapperExecElapsed(t0, opts);
-  if (elapsed !== undefined) {
-    node.actualStartupTimeMs = elapsed;
-    node.actualTimeMs = elapsed;
-  }
-  return out;
-};
-
-const executeSortWrapper: ExplainWrapperExecutor = async (
-  node,
-  inputRows,
-  opts,
-) => {
-  const t0 = opts.timing ? performance.now() : 0;
-  node.actualRows = inputRows.length;
-  node.actualLoops = 1;
-  node.memoryRows = inputRows.length;
-  const elapsed = wrapperExecElapsed(t0, opts);
-  if (elapsed !== undefined) {
-    node.actualStartupTimeMs = elapsed;
-    node.actualTimeMs = elapsed;
-  }
-  return inputRows;
-};
-
-const executeGroupAggregateWrapper: ExplainWrapperExecutor = async (
-  node,
-  inputRows,
-  opts,
-) => {
-  const t0 = opts.timing ? performance.now() : 0;
-  node.actualRows = inputRows.length;
-  node.actualLoops = 1;
-  const elapsed = wrapperExecElapsed(t0, opts);
-  if (elapsed !== undefined) {
-    node.actualStartupTimeMs = elapsed;
-    node.actualTimeMs = elapsed;
-  }
-  return inputRows;
-};
-
-function getWrapperExecutor(
-  node: ExplainNode,
-): ExplainWrapperExecutor | undefined {
-  switch (node.nodeType) {
-    case "Filter":
-      return executeFilterWrapper;
-    case "Unique":
-      return executeUniqueWrapper;
-    case "Limit":
-      return executeLimitWrapper;
-    case "Sort":
-      return executeSortWrapper;
-    case "GroupAggregate":
-      return executeGroupAggregateWrapper;
-    default:
-      return undefined;
-  }
-}
-
-export async function executeExplainWrappers(
-  node: ExplainNode,
-  rows: LuaTable[],
-  _env: LuaEnv,
-  _sf: LuaStackFrame,
-  opts: ExplainOptions,
-): Promise<LuaTable[]> {
-  if (node.children.length === 0) {
-    node.actualRows = rows.length;
-    node.actualLoops = 1;
-    if (opts.timing) {
-      node.actualStartupTimeMs = 0;
-      node.actualTimeMs = 0;
-    }
-    return rows;
-  }
-
-  const childRows = await executeExplainWrappers(
-    node.children[0],
-    rows,
-    _env,
-    _sf,
-    opts,
-  );
-
-  const exec = getWrapperExecutor(node);
-  if (!exec) {
-    node.actualRows = childRows.length;
-    node.actualLoops = 1;
-    if (opts.timing) {
-      node.actualStartupTimeMs = 0;
-      node.actualTimeMs = 0;
-    }
-    return childRows;
-  }
-
-  return exec(node, childRows, opts);
-}
-
 export async function executeAndInstrument(
   tree: JoinNode,
   plan: ExplainNode,
@@ -3110,9 +2954,20 @@ function formatNode(
     );
   }
 
+  if (
+    opts.analyze &&
+    node.rowsRemovedByUnique !== undefined &&
+    node.rowsRemovedByUnique > 0
+  ) {
+    lines.push(
+      `${detailPad}Rows Removed by Unique: ${node.rowsRemovedByUnique}`,
+    );
+  }
+
   if (node.memoryRows !== undefined) {
     lines.push(`${detailPad}Memory: ${node.memoryRows} rows`);
   }
+
   if (node.hashBuckets !== undefined) {
     lines.push(`${detailPad}Hash Buckets: ${node.hashBuckets}`);
   }
