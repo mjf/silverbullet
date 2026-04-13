@@ -785,14 +785,18 @@ export class ObjectIndex {
         desiredIndexVersion,
       );
       await this.reindexSpace(space);
-      void this.eventHook.dispatchEvent("editor:reloadState");
     }
   }
 
   async reindexSpace(space: Space) {
+    await this.markFullIndexInComplete();
+
+    // Let any already-running incremental indexing settle first so we do not
+    // clear the index while old queue work is still in flight.
+    await this.mq.awaitEmptyQueue("indexQueue");
+
     console.log("Clearing page index...");
     await this.clearIndex();
-    await this.markFullIndexInComplete();
 
     const files = await space.deduplicatedFileList();
 
@@ -804,6 +808,7 @@ export class ObjectIndex {
     );
     await this.mq.awaitEmptyQueue("indexQueue");
     await this.markFullIndexComplete();
+    void this.eventHook.dispatchEvent("editor:reloadState");
     console.log("Full index completed after", Date.now() - startTime, "ms");
   }
 
