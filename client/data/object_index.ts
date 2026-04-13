@@ -311,6 +311,96 @@ export class ObjectIndex {
     };
   }
 
+  // Query stats
+
+  async stats(tagName?: string): Promise<LuaQueryCollection> {
+    const tags: string[] = [];
+
+    if (tagName) {
+      tags.push(tagName);
+    } else {
+      for (const tagId of this.bitmapIndex.allTagIds()) {
+        const decoded = this.bitmapIndex.getDictionary().decodeValue(tagId);
+        if (typeof decoded === "string") {
+          tags.push(decoded);
+        }
+      }
+      tags.sort();
+    }
+
+    const rows: Record<string, any>[] = [];
+    const indexComplete = await this.hasFullIndexCompleted();
+
+    for (const tag of tags) {
+      const tagId = this.bitmapIndex.getDictionary().tryEncode(tag);
+      const indexTrusted = await this.isTagIndexTrusted(tag);
+
+      if (tagId === undefined) {
+        rows.push({
+          tag,
+          column: null,
+          rowCount: 0,
+          avgColumnCount: 0,
+          ndv: null,
+          indexed: null,
+          statsSource: "computed-empty",
+          predicatePushdown: "none",
+          scanKind: "index-scan",
+          trackedMcvValues: 0,
+        });
+        continue;
+      }
+
+      const meta = this.bitmapIndex.getTagMetaById(tagId);
+      const rowCount = this.bitmapIndex.getRowCount(tagId);
+      const avgColumnCount =
+        rowCount > 0 && meta ? Math.round(meta.totalColumnCount / rowCount) : 0;
+      const statsSource = indexComplete
+        ? "persisted-complete"
+        : "persisted-partial";
+      const predicatePushdown = indexTrusted ? "bitmap-basic" : "none";
+      const scanKind = "index-scan";
+
+      if (!meta || Object.keys(meta.columns).length === 0) {
+        rows.push({
+          tag,
+          column: null,
+          rowCount,
+          avgColumnCount,
+          ndv: null,
+          indexed: null,
+          statsSource,
+          predicatePushdown,
+          scanKind,
+          trackedMcvValues: 0,
+        });
+        continue;
+      }
+
+      const columns = Object.keys(meta.columns).sort();
+      for (const column of columns) {
+        const colMeta = meta.columns[column];
+        const trackedMcvValues = this.bitmapIndex.getColumnMCV(tagId, column)
+          .length;
+
+        rows.push({
+          tag,
+          column,
+          rowCount,
+          avgColumnCount,
+          ndv: colMeta.ndv,
+          indexed: colMeta.indexed,
+          statsSource,
+          predicatePushdown,
+          scanKind,
+          trackedMcvValues,
+        });
+      }
+    }
+
+    return new ArrayQueryCollection(rows);
+  }
+
   contentPages(): LuaQueryCollection {
     return this.filteredTag(
       "page",

@@ -20,6 +20,12 @@ export function indexSyscalls(
     "index.tag": (_ctx, tagName: string): LuaQueryCollection => {
       return objectIndex.tag(tagName);
     },
+    "index.stats": async (
+      _ctx,
+      tagName?: string,
+    ): Promise<LuaQueryCollection> => {
+      return objectIndex.stats(tagName);
+    },
     "index.aggregates": (_ctx): LuaQueryCollection => {
       return objectIndex.aggregates();
     },
