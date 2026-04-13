@@ -769,22 +769,25 @@ export class ObjectIndex {
   async ensureFullIndex(space: Space) {
     const currentIndexVersion = await this.getCurrentIndexVersion();
 
-    if (!currentIndexVersion) {
-      console.log("No index version found, assuming fresh install");
-      return;
-    }
-
     if (
-      currentIndexVersion < desiredIndexVersion &&
-      (await this.mq.isQueueEmpty("indexQueue"))
+      currentIndexVersion === undefined ||
+      currentIndexVersion === null ||
+      currentIndexVersion < desiredIndexVersion
     ) {
-      console.info(
-        "[index]",
-        "Performing a full space reindex, this could take a while...",
-        currentIndexVersion,
-        desiredIndexVersion,
-      );
-      await this.reindexSpace(space);
+      if (await this.mq.isQueueEmpty("indexQueue")) {
+        console.info(
+          "[index]",
+          "Performing a full space reindex, this could take a while...",
+          currentIndexVersion,
+          desiredIndexVersion,
+        );
+        await this.reindexSpace(space);
+      } else {
+        console.info(
+          "[index]",
+          "Index incomplete, waiting for existing index queue work to settle before full reindex",
+        );
+      }
     }
   }
 
