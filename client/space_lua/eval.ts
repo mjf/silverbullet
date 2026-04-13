@@ -78,6 +78,8 @@ import {
   type CollectionStats,
   type LuaCollectionQuery,
   type LuaGroupByEntry,
+  type QueryInstrumentation,
+  type QueryStageStat,
   toCollection,
 } from "./query_collection.ts";
 import { isPromise, rpAll, rpThen } from "./rp.ts";
@@ -825,6 +827,95 @@ function unwrapToJoinPlan(node: ExplainNode): ExplainNode {
   return node;
 }
 
+function collectExplainWrapperNodes(plan: ExplainNode): ExplainNode[] {
+  const nodes: ExplainNode[] = [];
+
+  const visit = (node: ExplainNode): void => {
+    if (node.children.length > 0) {
+      visit(node.children[0]);
+    }
+
+    switch (node.nodeType) {
+      case "Filter":
+      case "GroupAggregate":
+      case "Unique":
+      case "Sort":
+      case "Limit":
+        nodes.push(node);
+        break;
+    }
+  };
+
+  visit(plan);
+  return nodes;
+}
+
+function wrapperNodeStageName(node: ExplainNode): QueryStageStat["stage"] | null {
+  switch (node.nodeType) {
+    case "Filter":
+      return node.havingExpr ? "having" : node.whereExpr ? "where" : null;
+    case "GroupAggregate":
+      return "groupBy";
+    case "Unique":
+      return "distinct";
+    case "Sort":
+      return "orderBy";
+    case "Limit":
+      return "limit";
+    default:
+      return null;
+  }
+}
+
+// Wrapper-node stats are matched in execution order.  This relies on
+// `wrapPlanWithQueryOps` and `applyQuery` emitting operators in the same
+// logical pipeline order:
+// where -> group by -> having -> distinct -> order by -> limit.
+function annotateExplainWrappersFromStageStats(
+  plan: ExplainNode,
+  stageStats: QueryStageStat[],
+  execStartedAt: number,
+  opts: ExplainOptions,
+): void {
+  const wrapperNodes = collectExplainWrapperNodes(plan);
+  const used = new Set<number>();
+
+  for (const node of wrapperNodes) {
+    const wantedStage = wrapperNodeStageName(node);
+    if (!wantedStage) continue;
+
+    const statIdx = stageStats.findIndex(
+      (s, i) => !used.has(i) && s.stage === wantedStage,
+    );
+    if (statIdx === -1) continue;
+
+    used.add(statIdx);
+    const stat = stageStats[statIdx];
+
+    node.actualRows = stat.outputRows;
+    node.actualLoops = 1;
+
+    if (wantedStage === "where" || wantedStage === "having") {
+      node.rowsRemovedByFilter = stat.rowsRemoved;
+    }
+
+    if (wantedStage === "distinct") {
+      node.rowsRemovedByUnique = stat.rowsRemoved;
+    }
+
+    if (wantedStage === "orderBy") {
+      node.memoryRows = stat.memoryRows ?? stat.inputRows;
+    }
+
+    if (opts.timing) {
+      node.actualStartupTimeMs =
+        Math.round((stat.startTimeMs - execStartedAt) * 1000) / 1000;
+      node.actualTimeMs =
+        Math.round((stat.endTimeMs - execStartedAt) * 1000) / 1000;
+    }
+  }
+}
+
 async function buildExplainQueryShape(
   q: ReturnType<typeof asQueryExpr>,
   env: LuaEnv,
@@ -1022,7 +1113,7 @@ async function executeSingleSourceExplainAnalyze(
   sf: LuaStackFrame,
   opts: ExplainOptions,
 ): Promise<any[]> {
-  const t0 = opts.timing ? performance.now() : 0;
+  const t0 = performance.now();
 
   let baseRowCount: number;
   if (shouldTrustSingleSourceIndexRowCount(collection, sourceStats)) {
@@ -1048,117 +1139,43 @@ async function executeSingleSourceExplainAnalyze(
     baseRowCount = loadedBaseRows.length;
   }
 
+  const stageStats: QueryStageStat[] = [];
+  const instrumentation: QueryInstrumentation = {
+    onStage: (stat) => {
+      stageStats.push(stat);
+    },
+  };
+
   const finalRows = await collection.query(
     query,
     env,
     sf,
     globalThis.client?.config,
+    instrumentation,
   );
 
   const scanPlan = unwrapToJoinPlan(plan);
   scanPlan.actualRows = baseRowCount;
   scanPlan.actualLoops = 1;
 
-  const annotate = (node: ExplainNode): void => {
-    for (const child of node.children) {
-      annotate(child);
-    }
+  if (opts.timing) {
+    const elapsed = Math.round((performance.now() - t0) * 1000) / 1000;
+    scanPlan.actualStartupTimeMs = 0;
+    scanPlan.actualTimeMs = elapsed;
+  }
 
-    switch (node.nodeType) {
-      case "Filter":
-        if (node.children.length > 0) {
-          const childRows = node.children[0].actualRows ?? baseRowCount;
-          node.actualRows = finalRows.length;
-          node.actualLoops = 1;
-          node.rowsRemovedByFilter = Math.max(0, childRows - finalRows.length);
-        }
-        break;
-      case "Unique":
-      case "Sort":
-      case "Limit":
-      case "GroupAggregate":
-        node.actualRows = finalRows.length;
-        node.actualLoops = 1;
-        if (node.nodeType === "Sort") {
-          node.memoryRows = finalRows.length;
-        }
-        break;
-    }
-
-    if (opts.timing) {
-      const elapsed = Math.round((performance.now() - t0) * 1000) / 1000;
-      if (node.actualRows !== undefined) {
-        node.actualStartupTimeMs = elapsed;
-        node.actualTimeMs = elapsed;
-      }
-    }
-  };
-
-  annotate(plan);
+  annotateExplainWrappersFromStageStats(plan, stageStats, t0, opts);
 
   plan.actualRows = finalRows.length;
   plan.actualLoops = 1;
 
   if (opts.timing) {
     const elapsed = Math.round((performance.now() - t0) * 1000) / 1000;
-    plan.actualStartupTimeMs = elapsed;
+    plan.actualStartupTimeMs = 0;
     plan.actualTimeMs = elapsed;
   }
 
   return finalRows;
-}
-
-function annotateExplainWrappersFromFinalRows(
-  plan: ExplainNode,
-  fallbackInputRows: number,
-  finalRows: number,
-  opts: ExplainOptions,
-  startedAtMs: number,
-): void {
-  const annotate = (node: ExplainNode): void => {
-    for (const child of node.children) {
-      annotate(child);
-    }
-
-    let touched = false;
-
-    switch (node.nodeType) {
-      case "Filter": {
-        const childRows = node.children[0]?.actualRows ?? fallbackInputRows;
-        node.actualRows = finalRows;
-        node.actualLoops = 1;
-        node.rowsRemovedByFilter = Math.max(0, childRows - finalRows);
-        touched = true;
-        break;
-      }
-      case "Unique":
-        node.actualRows = finalRows;
-        node.actualLoops = 1;
-        touched = true;
-        break;
-      case "Sort":
-        node.actualRows = finalRows;
-        node.actualLoops = 1;
-        node.memoryRows = finalRows;
-        touched = true;
-        break;
-      case "Limit":
-      case "GroupAggregate":
-        node.actualRows = finalRows;
-        node.actualLoops = 1;
-        touched = true;
-        break;
-    }
-
-    if (touched && opts.timing) {
-      const elapsed =
-        Math.round((performance.now() - startedAtMs) * 1000) / 1000;
-      node.actualStartupTimeMs = elapsed;
-      node.actualTimeMs = elapsed;
-    }
-  };
-
-  annotate(plan);
 }
 
 async function materializeValueAsItems(
@@ -1793,19 +1810,29 @@ export function evalExpression(
                 }
               }
 
+              const stageStats: QueryStageStat[] = [];
+              const instrumentation: QueryInstrumentation = {
+                onStage: (stat) => {
+                  stageStats.push(stat);
+                },
+              };
+
               const finalRows = await joinedCollection.query(
                 analyzeQuery,
                 env,
                 sf,
                 globalThis.client?.config,
+                instrumentation,
               );
 
-              annotateExplainWrappersFromFinalRows(
+              explainPlan!.actualRows = finalRows.length;
+              explainPlan!.actualLoops = 1;
+
+              annotateExplainWrappersFromStageStats(
                 explainPlan!,
-                joinRows.length,
-                finalRows.length,
-                explainOpts,
+                stageStats,
                 execT0,
+                explainOpts,
               );
 
               const execEndT = performance.now();

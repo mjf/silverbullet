@@ -77,12 +77,37 @@ export type CollectionStats = {
   executionCapabilities?: CollectionExecutionCapabilities;
 };
 
+export type QueryStageName =
+  | "where"
+  | "groupBy"
+  | "having"
+  | "orderBy"
+  | "select"
+  | "distinct"
+  | "limit";
+
+export type QueryStageStat = {
+  stage: QueryStageName;
+  inputRows: number;
+  outputRows: number;
+  startTimeMs: number;
+  endTimeMs: number;
+  elapsedMs: number;
+  rowsRemoved?: number;
+  memoryRows?: number;
+};
+
+export type QueryInstrumentation = {
+  onStage?: (stat: QueryStageStat) => void;
+};
+
 export interface LuaQueryCollection {
   query(
     query: LuaCollectionQuery,
     env: LuaEnv,
     sf: LuaStackFrame,
     config?: Config,
+    instrumentation?: QueryInstrumentation,
   ): Promise<any[]>;
 }
 
@@ -198,6 +223,35 @@ export class StatsTracker {
 
 // Implicit single group map key (aggregates without `group by`)
 const IMPLICIT_GROUP_KEY: unique symbol = Symbol("implicit-group");
+
+function nowMs(): number {
+  return performance.now();
+}
+
+function emitStageStat(
+  instrumentation: QueryInstrumentation | undefined,
+  stage: QueryStageName,
+  inputRows: number,
+  outputRows: number,
+  startTimeMs: number,
+  extra: {
+    rowsRemoved?: number;
+    memoryRows?: number;
+  } = {},
+): void {
+  if (!instrumentation?.onStage) return;
+  const endTimeMs = nowMs();
+  instrumentation.onStage({
+    stage,
+    inputRows,
+    outputRows,
+    startTimeMs,
+    endTimeMs,
+    elapsedMs: Math.round((endTimeMs - startTimeMs) * 1000) / 1000,
+    rowsRemoved: extra.rowsRemoved,
+    memoryRows: extra.memoryRows,
+  });
+}
 
 // Build environment for post-`group by` clauses. Injects `key` and `group`
 // as top-level variables. Unpacks first group item fields and group-by key
@@ -355,10 +409,10 @@ export function computeStatsFromArray(
       ndv,
       avgColumnCount: 0,
       statsSource: "computed-empty",
-executionCapabilities: {
-  predicatePushdown: "none",
-  scanKind: "materialized",
-},
+      executionCapabilities: {
+        predicatePushdown: "none",
+        scanKind: "materialized",
+      },
     };
   }
 
@@ -394,10 +448,10 @@ executionCapabilities: {
       ndv,
       avgColumnCount,
       statsSource: "computed-exact-small",
-executionCapabilities: {
-  predicatePushdown: "none",
-  scanKind: "materialized",
-},
+      executionCapabilities: {
+        predicatePushdown: "none",
+        scanKind: "materialized",
+      },
     };
   }
 
@@ -432,6 +486,10 @@ executionCapabilities: {
     ndv,
     avgColumnCount,
     statsSource: "computed-sketch-large",
+    executionCapabilities: {
+      predicatePushdown: "none",
+      scanKind: "materialized",
+    },
   };
 }
 
@@ -446,8 +504,9 @@ export class ArrayQueryCollection<T> implements LuaQueryCollection {
     env: LuaEnv,
     sf: LuaStackFrame,
     config?: Config,
+    instrumentation?: QueryInstrumentation,
   ): Promise<any[]> {
-    return applyQuery(this.array, query, env, sf, config);
+    return applyQuery(this.array, query, env, sf, config, instrumentation);
   }
 
   getStats(): CollectionStats {
@@ -938,9 +997,13 @@ export async function applyQuery(
   env: LuaEnv,
   sf: LuaStackFrame,
   config: Config = new Config(),
+  instrumentation?: QueryInstrumentation,
 ): Promise<any[]> {
   results = results.slice();
+
   if (query.where) {
+    const stageStart = nowMs();
+    const inputRows = results.length;
     const filteredResults = [];
     for (const value of results) {
       const itemEnv = buildItemEnvLocal(query.objectVariable, value, env, sf);
@@ -950,6 +1013,14 @@ export async function applyQuery(
       }
     }
     results = filteredResults;
+    emitStageStat(
+      instrumentation,
+      "where",
+      inputRows,
+      results.length,
+      stageStart,
+      { rowsRemoved: Math.max(0, inputRows - results.length) },
+    );
   }
 
   // Implicit single group
@@ -967,6 +1038,9 @@ export async function applyQuery(
   let groupByNames: string[] | undefined;
 
   if (query.groupBy) {
+    const stageStart = nowMs();
+    const inputRows = results.length;
+
     // Extract expressions and names from `group by` entries
     const groupByEntries = query.groupBy;
 
@@ -1057,9 +1131,19 @@ export async function applyQuery(
       void row.rawSet("group", groupTable);
       results.push(row);
     }
+
+    emitStageStat(
+      instrumentation,
+      "groupBy",
+      inputRows,
+      results.length,
+      stageStart,
+    );
   }
 
   if (query.having) {
+    const stageStart = nowMs();
+    const inputRows = results.length;
     const filteredResults = [];
     for (const value of results) {
       let condResult;
@@ -1090,6 +1174,14 @@ export async function applyQuery(
       }
     }
     results = filteredResults;
+    emitStageStat(
+      instrumentation,
+      "having",
+      inputRows,
+      results.length,
+      stageStart,
+      { rowsRemoved: Math.max(0, inputRows - results.length) },
+    );
   }
 
   const mkEnv = grouped
@@ -1101,6 +1193,8 @@ export async function applyQuery(
 
   // Pre-compute select for grouped + ordered queries
   if (grouped && query.select && query.orderBy) {
+    const stageStart = nowMs();
+    const inputRows = results.length;
     const selectExpr = query.select;
     selectResults = [];
     for (const item of results) {
@@ -1118,9 +1212,19 @@ export async function applyQuery(
       selectResults.push(selected);
     }
     selectResults = normalizeSelectResults(selectResults);
+    emitStageStat(
+      instrumentation,
+      "select",
+      inputRows,
+      selectResults.length,
+      stageStart,
+    );
   }
 
   if (query.orderBy) {
+    const stageStart = nowMs();
+    const inputRows = results.length;
+
     const collation = config.get<QueryCollationConfig>("queryCollation", {});
     const collator = Intl.Collator(collation?.locale, collation?.options);
 
@@ -1187,13 +1291,22 @@ export async function applyQuery(
     } else {
       results = tagged.map((t) => t.val);
     }
+
+    emitStageStat(
+      instrumentation,
+      "orderBy",
+      inputRows,
+      results.length,
+      stageStart,
+      { memoryRows: inputRows },
+    );
   }
 
   if (query.select) {
-    const selectExpr = query.select;
-    if (selectResults) {
-      results = selectResults;
-    } else {
+    if (!selectResults) {
+      const stageStart = nowMs();
+      const inputRows = results.length;
+      const selectExpr = query.select;
       const newResult = [];
       for (const item of results) {
         const itemEnv = mkEnv(query.objectVariable, item, env, sf);
@@ -1214,12 +1327,22 @@ export async function applyQuery(
           newResult.push(await evalSelectExpression(query.select, itemEnv, sf));
         }
       }
-      results = newResult;
+      results = normalizeSelectResults(newResult);
+      emitStageStat(
+        instrumentation,
+        "select",
+        inputRows,
+        results.length,
+        stageStart,
+      );
+    } else {
+      results = selectResults;
     }
-    results = normalizeSelectResults(results);
   }
 
   if (query.distinct) {
+    const stageStart = nowMs();
+    const inputRows = results.length;
     const seen = new Set();
     const distinctResult = [];
     for (const item of results) {
@@ -1230,14 +1353,49 @@ export async function applyQuery(
       }
     }
     results = distinctResult;
+    emitStageStat(
+      instrumentation,
+      "distinct",
+      inputRows,
+      results.length,
+      stageStart,
+      { rowsRemoved: Math.max(0, inputRows - results.length) },
+    );
   }
 
   if (query.limit !== undefined && query.offset !== undefined) {
+    const stageStart = nowMs();
+    const inputRows = results.length;
     results = results.slice(query.offset, query.offset + query.limit);
+    emitStageStat(
+      instrumentation,
+      "limit",
+      inputRows,
+      results.length,
+      stageStart,
+    );
   } else if (query.limit !== undefined) {
+    const stageStart = nowMs();
+    const inputRows = results.length;
     results = results.slice(0, query.limit);
+    emitStageStat(
+      instrumentation,
+      "limit",
+      inputRows,
+      results.length,
+      stageStart,
+    );
   } else if (query.offset !== undefined) {
+    const stageStart = nowMs();
+    const inputRows = results.length;
     results = results.slice(query.offset);
+    emitStageStat(
+      instrumentation,
+      "limit",
+      inputRows,
+      results.length,
+      stageStart,
+    );
   }
 
   return results;
@@ -1251,6 +1409,7 @@ export async function queryLua<T = any>(
   sf: LuaStackFrame = LuaStackFrame.lostFrame,
   enricher?: (key: KvKey, item: any) => any,
   config?: Config,
+  instrumentation?: QueryInstrumentation,
 ): Promise<T[]> {
   const results: T[] = [];
   for await (let { key, value } of kv.query({ prefix })) {
@@ -1259,7 +1418,7 @@ export async function queryLua<T = any>(
     }
     results.push(value);
   }
-  return applyQuery(results, query, env, sf, config);
+  return applyQuery(results, query, env, sf, config, instrumentation);
 }
 
 function generateKey(value: any) {
@@ -1314,6 +1473,7 @@ export class DataStoreQueryCollection implements LuaQueryCollection {
     env: LuaEnv,
     sf: LuaStackFrame,
     config?: Config,
+    instrumentation?: QueryInstrumentation,
   ): Promise<any[]> {
     return queryLua(
       this.dataStore.kv,
@@ -1323,6 +1483,7 @@ export class DataStoreQueryCollection implements LuaQueryCollection {
       sf,
       undefined,
       config,
+      instrumentation,
     );
   }
 
