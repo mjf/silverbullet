@@ -30,9 +30,7 @@ import {
   type BitmapIndexConfig,
   type EncodedObject,
 } from "./bitmap/bitmap_index.ts";
-import {
-  MCVList,
-} from "../space_lua/mcv.ts";
+import { MCVList } from "../space_lua/mcv.ts";
 
 // KV key prefixes
 const indexKey = "idx";
@@ -69,7 +67,9 @@ type BitmapPredicate =
       value: string | number | boolean;
     };
 
-function literalValueFromExpr(expr: any): string | number | boolean | undefined {
+function literalValueFromExpr(
+  expr: any,
+): string | number | boolean | undefined {
   switch (expr?.type) {
     case "String":
       return expr.value;
@@ -294,9 +294,10 @@ export class ObjectIndex {
         return {
           rowCount,
           ndv,
-          avgColumnCount: rowCount > 0 && meta
-            ? Math.round(meta.totalColumnCount / rowCount)
-            : 0,
+          avgColumnCount:
+            rowCount > 0 && meta
+              ? Math.round(meta.totalColumnCount / rowCount)
+              : 0,
           mcv: mcv.size > 0 ? mcv : undefined,
           statsSource: indexComplete
             ? "persisted-complete"
@@ -862,7 +863,11 @@ export class ObjectIndex {
       return undefined;
     }
 
-    const excluded = this.bitmapIndex.getBitmap(tagId, predicate.column, valueId);
+    const excluded = this.bitmapIndex.getBitmap(
+      tagId,
+      predicate.column,
+      valueId,
+    );
     const ids = new Set<number>();
     for (const bm of bitmaps) {
       for (const id of bm.toArray()) {
