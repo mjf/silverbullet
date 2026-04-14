@@ -179,19 +179,19 @@ describe("value_codec decode validation", () => {
 
   test("rejects truncated string", () => {
     expect(() =>
-      decodeCanonicalValue(Uint8Array.of(0x04, 0x00, 0x00, 0x00, 0x02, 0x61))
+      decodeCanonicalValue(Uint8Array.of(0x04, 0x00, 0x00, 0x00, 0x02, 0x61)),
     ).toThrow();
   });
 
   test("rejects truncated array", () => {
     expect(() =>
-      decodeCanonicalValue(Uint8Array.of(0x05, 0x00, 0x00, 0x00, 0x01))
+      decodeCanonicalValue(Uint8Array.of(0x05, 0x00, 0x00, 0x00, 0x01)),
     ).toThrow();
   });
 
   test("rejects truncated object", () => {
     expect(() =>
-      decodeCanonicalValue(Uint8Array.of(0x06, 0x00, 0x00, 0x00, 0x01))
+      decodeCanonicalValue(Uint8Array.of(0x06, 0x00, 0x00, 0x00, 0x01)),
     ).toThrow();
   });
 });

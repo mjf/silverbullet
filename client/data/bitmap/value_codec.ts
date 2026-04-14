@@ -65,11 +65,7 @@ function u32ToBytes(n: number): Uint8Array {
 }
 
 function bytesToU32(bytes: Uint8Array, offset: number): number {
-  const view = new DataView(
-    bytes.buffer,
-    bytes.byteOffset + offset,
-    4,
-  );
+  const view = new DataView(bytes.buffer, bytes.byteOffset + offset, 4);
   return view.getUint32(0, false);
 }
 
@@ -86,11 +82,7 @@ function f64ToBytes(n: number): Uint8Array {
 }
 
 function bytesToF64(bytes: Uint8Array, offset: number): number {
-  const view = new DataView(
-    bytes.buffer,
-    bytes.byteOffset + offset,
-    8,
-  );
+  const view = new DataView(bytes.buffer, bytes.byteOffset + offset, 8);
   return view.getFloat64(0, false);
 }
 
@@ -144,10 +136,7 @@ function encodeValueInternal(value: SupportedValue): Uint8Array {
   }
 
   if (typeof value === "string") {
-    return concatBytes([
-      Uint8Array.of(TAG_STRING),
-      encodeStringPayload(value),
-    ]);
+    return concatBytes([Uint8Array.of(TAG_STRING), encodeStringPayload(value)]);
   }
 
   if (Array.isArray(value)) {
