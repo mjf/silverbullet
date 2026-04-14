@@ -41,6 +41,8 @@ const indexVersionKey = ["$indexVersion"];
 // Bump this every time a full reindex is needed
 const desiredIndexVersion = 13;
 
+const textEncoder = new TextEncoder();
+
 type TagDefinition = {
   tagPage?: string;
   metatable?: any;
@@ -67,6 +69,27 @@ type BitmapPredicate =
       column: string;
       value: string | number | boolean;
     };
+
+type IndexStorageStats = {
+  bitmapBytes: number;
+  metaBytes: number;
+  dictionaryBytes: number;
+  objectBytes: number;
+  indexBytes: number;
+  totalBytes: number;
+};
+
+type StorageStatsRow = {
+  scope: "tag" | "global";
+  tag: string | null;
+  rowCount: number | null;
+  bitmapBytes: number;
+  metaBytes: number;
+  dictionaryBytes: number | null;
+  objectBytes: number;
+  indexBytes: number;
+  totalBytes: number;
+};
 
 function literalValueFromExpr(
   expr: any,
@@ -201,6 +224,108 @@ export class ObjectIndex {
     return value;
   }
 
+  private allKnownTags(): string[] {
+    const tags: string[] = [];
+    for (const tagId of this.bitmapIndex.allTagIds()) {
+      const decoded = this.bitmapIndex.getDictionary().decodeValue(tagId);
+      if (typeof decoded === "string") {
+        tags.push(decoded);
+      }
+    }
+    tags.sort();
+    return tags;
+  }
+
+  private estimateStoredValueSize(value: unknown): number {
+    if (value === null || value === undefined) {
+      return 0;
+    }
+
+    if (value instanceof Uint8Array) {
+      return value.byteLength;
+    }
+
+    if (typeof value === "string") {
+      return textEncoder.encode(value).byteLength;
+    }
+
+    if (typeof value === "number" || typeof value === "boolean") {
+      return textEncoder.encode(String(value)).byteLength;
+    }
+
+    try {
+      return textEncoder.encode(JSON.stringify(value)).byteLength;
+    } catch {
+      return 0;
+    }
+  }
+
+  private async computeIndexStorageStats(
+    tagName?: string,
+  ): Promise<IndexStorageStats> {
+    let bitmapBytes = 0;
+    let metaBytes = 0;
+    let dictionaryBytes = 0;
+    let objectBytes = 0;
+
+    if (tagName) {
+      for await (const { value } of this.ds.query({
+        prefix: [indexKey, tagName],
+      })) {
+        objectBytes += this.estimateStoredValueSize(value);
+      }
+
+      const tagId = this.bitmapIndex.getDictionary().tryEncode(tagName);
+      if (tagId !== undefined) {
+        for await (const { value } of this.ds.query({
+          prefix: ["b", String(tagId)],
+        })) {
+          bitmapBytes += this.estimateStoredValueSize(value);
+        }
+
+        const meta = await this.ds.get(["m", String(tagId)]);
+        if (meta !== undefined && meta !== null) {
+          metaBytes += this.estimateStoredValueSize(meta);
+        }
+      }
+    } else {
+      for await (const { value } of this.ds.query({
+        prefix: [indexKey],
+      })) {
+        objectBytes += this.estimateStoredValueSize(value);
+      }
+
+      for await (const { value } of this.ds.query({
+        prefix: ["b"],
+      })) {
+        bitmapBytes += this.estimateStoredValueSize(value);
+      }
+
+      for await (const { value } of this.ds.query({
+        prefix: ["m"],
+      })) {
+        metaBytes += this.estimateStoredValueSize(value);
+      }
+    }
+
+    const dictSnapshot = await this.ds.get(["$dict"]);
+    if (dictSnapshot !== undefined && dictSnapshot !== null) {
+      dictionaryBytes = this.estimateStoredValueSize(dictSnapshot);
+    }
+
+    const indexBytes = bitmapBytes + metaBytes + dictionaryBytes;
+    const totalBytes = indexBytes + objectBytes;
+
+    return {
+      bitmapBytes,
+      metaBytes,
+      dictionaryBytes,
+      objectBytes,
+      indexBytes,
+      totalBytes,
+    };
+  }
+
   tag(tagName: string): LuaQueryCollectionWithStats {
     if (!tagName) {
       throw new Error("Tag name is required");
@@ -308,20 +433,7 @@ export class ObjectIndex {
   }
 
   async stats(tagName?: string): Promise<LuaQueryCollection> {
-    const tags: string[] = [];
-
-    if (tagName) {
-      tags.push(tagName);
-    } else {
-      for (const tagId of this.bitmapIndex.allTagIds()) {
-        const decoded = this.bitmapIndex.getDictionary().decodeValue(tagId);
-        if (typeof decoded === "string") {
-          tags.push(decoded);
-        }
-      }
-      tags.sort();
-    }
-
+    const tags = tagName ? [tagName] : this.allKnownTags();
     const rows: Record<string, any>[] = [];
     const indexComplete = await this.hasFullIndexCompleted();
 
@@ -355,27 +467,30 @@ export class ObjectIndex {
       const predicatePushdown = indexTrusted ? "bitmap-basic" : "none";
       const scanKind = "index-scan";
 
+      rows.push({
+        tag,
+        column: null,
+        rowCount,
+        avgColumnCount,
+        ndv: null,
+        indexed: null,
+        statsSource,
+        predicatePushdown,
+        scanKind,
+        trackedMcvValues: 0,
+      });
+
       if (!meta || Object.keys(meta.columns).length === 0) {
-        rows.push({
-          tag,
-          column: null,
-          rowCount,
-          avgColumnCount,
-          ndv: null,
-          indexed: null,
-          statsSource,
-          predicatePushdown,
-          scanKind,
-          trackedMcvValues: 0,
-        });
         continue;
       }
 
       const columns = Object.keys(meta.columns).sort();
       for (const column of columns) {
         const colMeta = meta.columns[column];
-        const trackedMcvValues = this.bitmapIndex.getColumnMCV(tagId, column)
-          .length;
+        const trackedMcvValues = this.bitmapIndex.getColumnMCV(
+          tagId,
+          column,
+        ).length;
 
         rows.push({
           tag,
@@ -390,6 +505,46 @@ export class ObjectIndex {
           trackedMcvValues,
         });
       }
+    }
+
+    return new ArrayQueryCollection(rows);
+  }
+
+  async storageStats(tagName?: string): Promise<LuaQueryCollection> {
+    const rows: StorageStatsRow[] = [];
+    const tags = tagName ? [tagName] : this.allKnownTags();
+
+    if (!tagName) {
+      const globalStorage = await this.computeIndexStorageStats();
+      rows.push({
+        scope: "global",
+        tag: null,
+        rowCount: null,
+        bitmapBytes: globalStorage.bitmapBytes,
+        metaBytes: globalStorage.metaBytes,
+        dictionaryBytes: globalStorage.dictionaryBytes,
+        objectBytes: globalStorage.objectBytes,
+        indexBytes: globalStorage.indexBytes,
+        totalBytes: globalStorage.totalBytes,
+      });
+    }
+
+    for (const tag of tags) {
+      const tagId = this.bitmapIndex.getDictionary().tryEncode(tag);
+      const storage = await this.computeIndexStorageStats(tag);
+
+      rows.push({
+        scope: "tag",
+        tag,
+        rowCount: tagId === undefined ? 0 : this.bitmapIndex.getRowCount(tagId),
+        bitmapBytes: storage.bitmapBytes,
+        metaBytes: storage.metaBytes,
+        dictionaryBytes: null,
+        objectBytes: storage.objectBytes,
+        indexBytes: storage.bitmapBytes + storage.metaBytes,
+        totalBytes:
+          storage.objectBytes + storage.bitmapBytes + storage.metaBytes,
+      });
     }
 
     return new ArrayQueryCollection(rows);

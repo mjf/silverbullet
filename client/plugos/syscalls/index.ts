@@ -26,6 +26,12 @@ export function indexSyscalls(
     ): Promise<LuaQueryCollection> => {
       return objectIndex.stats(tagName);
     },
+    "index.storageStats": async (
+      _ctx,
+      tagName?: string,
+    ): Promise<LuaQueryCollection> => {
+      return objectIndex.storageStats(tagName);
+    },
     "index.contentPages": (): LuaQueryCollection => {
       return objectIndex.contentPages();
     },
