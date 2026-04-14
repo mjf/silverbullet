@@ -41,7 +41,10 @@ const indexVersionKey = ["$indexVersion"];
 // Bump this every time a full reindex is needed
 const desiredIndexVersion = 13;
 
+const textEncoder = new TextEncoder();
+
 type TagDefinition = {
+  tagPage?: string;
   metatable?: any;
   mustValidate?: boolean;
   schema?: any;
@@ -66,6 +69,27 @@ type BitmapPredicate =
       column: string;
       value: string | number | boolean;
     };
+
+type IndexStorageStats = {
+  bitmapBytes: number;
+  metaBytes: number;
+  dictionaryBytes: number;
+  objectBytes: number;
+  indexBytes: number;
+  totalBytes: number;
+};
+
+type StorageStatsRow = {
+  scope: "tag" | "global";
+  tag: string | null;
+  rowCount: number | null;
+  bitmapBytes: number;
+  metaBytes: number;
+  dictionaryBytes: number | null;
+  objectBytes: number;
+  indexBytes: number;
+  totalBytes: number;
+};
 
 function literalValueFromExpr(
   expr: any,
@@ -189,8 +213,6 @@ export class ObjectIndex {
     });
   }
 
-  // --- Enricher: applies metatables to query results ---
-
   private enrichValue(tagName: string, value: any): any {
     const mt = this.config.get<LuaTable | undefined>(
       ["tags", tagName, "metatable"],
@@ -202,7 +224,107 @@ export class ObjectIndex {
     return value;
   }
 
-  // --- Query collections ---
+  private allKnownTags(): string[] {
+    const tags: string[] = [];
+    for (const tagId of this.bitmapIndex.allTagIds()) {
+      const decoded = this.bitmapIndex.getDictionary().decodeValue(tagId);
+      if (typeof decoded === "string") {
+        tags.push(decoded);
+      }
+    }
+    tags.sort();
+    return tags;
+  }
+
+  private estimateStoredValueSize(value: unknown): number {
+    if (value === null || value === undefined) {
+      return 0;
+    }
+
+    if (value instanceof Uint8Array) {
+      return value.byteLength;
+    }
+
+    if (typeof value === "string") {
+      return textEncoder.encode(value).byteLength;
+    }
+
+    if (typeof value === "number" || typeof value === "boolean") {
+      return textEncoder.encode(String(value)).byteLength;
+    }
+
+    try {
+      return textEncoder.encode(JSON.stringify(value)).byteLength;
+    } catch {
+      return 0;
+    }
+  }
+
+  private async computeIndexStorageStats(
+    tagName?: string,
+  ): Promise<IndexStorageStats> {
+    let bitmapBytes = 0;
+    let metaBytes = 0;
+    let dictionaryBytes = 0;
+    let objectBytes = 0;
+
+    if (tagName) {
+      for await (const { value } of this.ds.query({
+        prefix: [indexKey, tagName],
+      })) {
+        objectBytes += this.estimateStoredValueSize(value);
+      }
+
+      const tagId = this.bitmapIndex.getDictionary().tryEncode(tagName);
+      if (tagId !== undefined) {
+        for await (const { value } of this.ds.query({
+          prefix: ["b", String(tagId)],
+        })) {
+          bitmapBytes += this.estimateStoredValueSize(value);
+        }
+
+        const meta = await this.ds.get(["m", String(tagId)]);
+        if (meta !== undefined && meta !== null) {
+          metaBytes += this.estimateStoredValueSize(meta);
+        }
+      }
+    } else {
+      for await (const { value } of this.ds.query({
+        prefix: [indexKey],
+      })) {
+        objectBytes += this.estimateStoredValueSize(value);
+      }
+
+      for await (const { value } of this.ds.query({
+        prefix: ["b"],
+      })) {
+        bitmapBytes += this.estimateStoredValueSize(value);
+      }
+
+      for await (const { value } of this.ds.query({
+        prefix: ["m"],
+      })) {
+        metaBytes += this.estimateStoredValueSize(value);
+      }
+    }
+
+    const dictSnapshot = await this.ds.get(["$dict"]);
+    if (dictSnapshot !== undefined && dictSnapshot !== null) {
+      dictionaryBytes = this.estimateStoredValueSize(dictSnapshot);
+    }
+
+    const indexBytes = bitmapBytes + metaBytes + dictionaryBytes;
+    const totalBytes = indexBytes + objectBytes;
+
+    return {
+      bitmapBytes,
+      metaBytes,
+      dictionaryBytes,
+      objectBytes,
+      indexBytes,
+      totalBytes,
+    };
+  }
 
   tag(tagName: string): LuaQueryCollectionWithStats {
     if (!tagName) {
@@ -237,7 +359,6 @@ export class ObjectIndex {
           }
         }
 
-        // Fallback: full scan, decode, enrich, then query in memory
         const results: ObjectValue<any>[] = [];
         for await (const { value } of self.ds.query({
           prefix: [indexKey, tagName],
@@ -311,23 +432,12 @@ export class ObjectIndex {
     };
   }
 
-  // Query stats
-
   async stats(tagName?: string): Promise<LuaQueryCollection> {
-    const tags: string[] = [];
-
-    if (tagName) {
-      tags.push(tagName);
-    } else {
-      for (const tagId of this.bitmapIndex.allTagIds()) {
-        const decoded = this.bitmapIndex.getDictionary().decodeValue(tagId);
-        if (typeof decoded === "string") {
-          tags.push(decoded);
-        }
-      }
-      tags.sort();
+    if (tagName === "") {
+      throw new Error("Tag name is required");
     }
 
+    const tags = tagName === undefined ? this.allKnownTags() : [tagName];
     const rows: Record<string, any>[] = [];
     const indexComplete = await this.hasFullIndexCompleted();
 
@@ -361,27 +471,30 @@ export class ObjectIndex {
       const predicatePushdown = indexTrusted ? "bitmap-basic" : "none";
       const scanKind = "index-scan";
 
+      rows.push({
+        tag,
+        column: null,
+        rowCount,
+        avgColumnCount,
+        ndv: null,
+        indexed: null,
+        statsSource,
+        predicatePushdown,
+        scanKind,
+        trackedMcvValues: 0,
+      });
+
       if (!meta || Object.keys(meta.columns).length === 0) {
-        rows.push({
-          tag,
-          column: null,
-          rowCount,
-          avgColumnCount,
-          ndv: null,
-          indexed: null,
-          statsSource,
-          predicatePushdown,
-          scanKind,
-          trackedMcvValues: 0,
-        });
         continue;
       }
 
       const columns = Object.keys(meta.columns).sort();
       for (const column of columns) {
         const colMeta = meta.columns[column];
-        const trackedMcvValues = this.bitmapIndex.getColumnMCV(tagId, column)
-          .length;
+        const trackedMcvValues = this.bitmapIndex.getColumnMCV(
+          tagId,
+          column,
+        ).length;
 
         rows.push({
           tag,
@@ -396,6 +509,51 @@ export class ObjectIndex {
           trackedMcvValues,
         });
       }
+    }
+
+    return new ArrayQueryCollection(rows);
+  }
+
+  async storageStats(tagName?: string): Promise<LuaQueryCollection> {
+    if (tagName === "") {
+      throw new Error("Tag name is required");
+    }
+
+    const rows: StorageStatsRow[] = [];
+    const tags = tagName === undefined ? this.allKnownTags() : [tagName];
+
+    if (tagName === undefined) {
+      const globalStorage = await this.computeIndexStorageStats();
+      rows.push({
+        scope: "global",
+        tag: null,
+        rowCount: null,
+        bitmapBytes: globalStorage.bitmapBytes,
+        metaBytes: globalStorage.metaBytes,
+        dictionaryBytes: globalStorage.dictionaryBytes,
+        objectBytes: globalStorage.objectBytes,
+        indexBytes: globalStorage.indexBytes,
+        totalBytes: globalStorage.totalBytes,
+      });
+    }
+
+    for (const tag of tags) {
+      const tagId = this.bitmapIndex.getDictionary().tryEncode(tag);
+      const storage = await this.computeIndexStorageStats(tag);
+
+      rows.push({
+        scope: "tag",
+        tag,
+        rowCount:
+          tagId === undefined ? 0 : this.bitmapIndex.getRowCount(tagId),
+        bitmapBytes: storage.bitmapBytes,
+        metaBytes: storage.metaBytes,
+        dictionaryBytes: null,
+        objectBytes: storage.objectBytes,
+        indexBytes: storage.bitmapBytes + storage.metaBytes,
+        totalBytes:
+          storage.objectBytes + storage.bitmapBytes + storage.metaBytes,
+      });
     }
 
     return new ArrayQueryCollection(rows);
@@ -519,8 +677,6 @@ export class ObjectIndex {
     return new ArrayQueryCollection(entries);
   }
 
-  // --- Object CRUD ---
-
   async getObjectByRef(
     page: string,
     tag: string,
@@ -567,8 +723,6 @@ export class ObjectIndex {
     await this.flushBitmapState();
   }
 
-  // --- Indexing ---
-
   public async indexObjects<T>(
     page: string,
     objects: ObjectValue<T>[],
@@ -597,11 +751,8 @@ export class ObjectIndex {
         env.setLocal(key, jsToLuaValue(value));
       }
     }
-    // Use the tag() collection's query method
     return this.tag(tag).query(query, env, sf) as Promise<ObjectValue<T>[]>;
   }
-
-  // --- Batch write: encode objects, store, update bitmaps ---
 
   private async batchSet(page: string, kvs: KV[]): Promise<void> {
     const writes: KV[] = [];
@@ -611,7 +762,6 @@ export class ObjectIndex {
       const tag = key[0] as string;
       const refKey = key[1] as string;
 
-      // Check if this ref already exists (re-index case)
       const existingObjectId = await this.ds.get<number>([
         reverseKey,
         tag,
@@ -620,7 +770,6 @@ export class ObjectIndex {
       ]);
 
       if (existingObjectId !== null && existingObjectId !== undefined) {
-        // Remove old object from bitmap index
         const oldEncoded = await this.ds.get<EncodedObject>([
           indexKey,
           tag,
@@ -643,7 +792,6 @@ export class ObjectIndex {
         deletes.push([indexKey, tag, String(existingObjectId)]);
       }
 
-      // Encode and store new object
       const encoded = this.bitmapIndex.encodeObject(
         value as Record<string, unknown>,
       );
@@ -651,10 +799,8 @@ export class ObjectIndex {
       const objectId =
         existingObjectId ?? this.bitmapIndex.allocateObjectId(tagId);
 
-      // If reusing an existing objectId, don't increment count (unindex decremented it)
       if (existingObjectId !== null && existingObjectId !== undefined) {
         meta.count++;
-        // dirtyMeta already set by unindexObject
       }
 
       this.bitmapIndex.indexObject(tagId, objectId, encoded, meta);
@@ -669,7 +815,6 @@ export class ObjectIndex {
       });
     }
 
-    // Flush bitmap state to KV writes
     const bitmapFlush = this.bitmapIndex.flushToKVs();
     writes.push(...bitmapFlush.writes);
     deletes.push(...bitmapFlush.deletes);
@@ -692,22 +837,17 @@ export class ObjectIndex {
     }
   }
 
-  // --- File clearing ---
-
   public async clearFileIndex(file: string): Promise<void> {
     const normalizedPage = this.normalizePageName(file);
 
-    // Find all reverse-index entries for this page
     const allDeletes: KvKey[] = [];
     for await (const { key, value } of this.ds.query<number>({
       prefix: [reverseKey],
     })) {
-      // key: [reverseKey, tag, refKey, page]
       if (key[3] === normalizedPage) {
         const tag = key[1] as string;
         const objectId = value;
 
-        // Remove from bitmap index
         const encoded = await this.ds.get<EncodedObject>([
           indexKey,
           tag,
@@ -723,8 +863,8 @@ export class ObjectIndex {
           }
         }
 
-        allDeletes.push(key); // reverse key
-        allDeletes.push([indexKey, tag, String(objectId)]); // object key
+        allDeletes.push(key);
+        allDeletes.push([indexKey, tag, String(objectId)]);
       }
     }
 
@@ -743,7 +883,6 @@ export class ObjectIndex {
     for await (const { key } of this.ds.query({ prefix: [reverseKey] })) {
       allKeys.push(key);
     }
-    // Clean up bitmap storage keys
     for await (const { key } of this.ds.query({ prefix: ["b"] })) {
       allKeys.push(key);
     }
@@ -753,7 +892,6 @@ export class ObjectIndex {
     for await (const { key } of this.ds.query({ prefix: ["$dict"] })) {
       allKeys.push(key);
     }
-    // Clean up legacy keys from old index format
     for await (const { key } of this.ds.query({ prefix: ["$indexStats"] })) {
       allKeys.push(key);
     }
@@ -763,8 +901,6 @@ export class ObjectIndex {
     await this.ds.batchDelete(allKeys);
     console.log("Deleted", allKeys.length, "keys from the index");
   }
-
-  // --- Reindex ---
 
   async ensureFullIndex(space: Space) {
     const currentIndexVersion = await this.getCurrentIndexVersion();
@@ -794,8 +930,6 @@ export class ObjectIndex {
   async reindexSpace(space: Space) {
     await this.markFullIndexInComplete();
 
-    // Let any already-running incremental indexing settle first so we do not
-    // clear the index while old queue work is still in flight.
     await this.mq.awaitEmptyQueue("indexQueue");
 
     console.log("Clearing page index...");
@@ -868,8 +1002,6 @@ export class ObjectIndex {
     await this.ds.delete(indexVersionKey);
   }
 
-  // --- Helpers ---
-
   private normalizePageName(page: string): string {
     return page.endsWith(".md") ? page.replace(/\.md$/, "") : page;
   }
@@ -901,8 +1033,6 @@ export class ObjectIndex {
       return false;
     }
 
-    // Only trust bitmap pushdown when the persisted index is fully built
-    // and the indexing queue is currently drained.
     if (!(await this.hasFullIndexCompleted())) {
       return false;
     }
@@ -1012,8 +1142,6 @@ export class ObjectIndex {
     }
     return [...ids].sort((a, b) => a - b);
   }
-
-  // --- Validation / transform pipeline (unchanged logic) ---
 
   private async processObjectsToKVs<T>(
     page: string,

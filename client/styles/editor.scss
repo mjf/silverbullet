@@ -393,13 +393,6 @@
     font-weight: normal;
   }
 
-  .sb-html-inline-widget {
-    display: inline;
-  }
-
-  .sb-html-block-widget {
-    display: block;
-  }
 
   .sb-table-widget {
     display: block;
@@ -626,6 +619,11 @@
 
     tt {
       background-color: var(--editor-code-background-color);
+    }
+
+    button {
+      font-family: var(--editor-font);
+      font-size: inherit;
     }
 
     // Only show the button bar on hover on non-touch devices

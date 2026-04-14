@@ -1,5 +1,6 @@
-// Roaring Bitmap — pure TypeScript, V8-optimized, no WASM.
-
+/**
+ * Roaring Bitmap Implementation
+ */
 const ARRAY_MAX = 4096;
 
 enum ContainerType {
@@ -22,7 +23,7 @@ interface Container {
   readonly containerType: ContainerType;
 }
 
-// --- ArrayContainer ---
+// ArrayContainer
 
 class ArrayContainer implements Container {
   readonly containerType = ContainerType.Array;
@@ -106,7 +107,7 @@ class ArrayContainer implements Container {
   }
 }
 
-// --- BitmapContainer ---
+// BitmapContainer
 
 class BitmapContainer implements Container {
   readonly containerType = ContainerType.Bitmap;
@@ -206,7 +207,7 @@ class BitmapContainer implements Container {
   }
 }
 
-// --- RunContainer ---
+// RunContainer
 
 class RunContainer implements Container {
   readonly containerType = ContainerType.Run;
@@ -229,7 +230,7 @@ class RunContainer implements Container {
   }
 
   add(lsb: number): Container {
-    // Find run containing or after lsb
+    // Find run containing or after LSB
     let lo = 0;
     let hi = this.numRuns;
     while (lo < hi) {
@@ -238,14 +239,14 @@ class RunContainer implements Container {
       else hi = mid;
     }
 
-    // Check if lsb is already in run at lo
+    // Check if LSB is already in run at lo
     if (lo < this.numRuns) {
       const s = this.runs[lo * 2];
       const l = this.runs[lo * 2 + 1];
       if (lsb >= s && lsb <= s + l) return this; // already contained
     }
 
-    // Check if lsb extends run at lo-1
+    // Check if LSB extends run at lo-1
     const canExtendPrev =
       lo > 0 &&
       this.runs[(lo - 1) * 2] + this.runs[(lo - 1) * 2 + 1] + 1 === lsb;
@@ -418,7 +419,7 @@ class RunContainer implements Container {
   }
 }
 
-// --- Cross-container operations ---
+// Cross-container operations
 
 function andArrayArray(a: ArrayContainer, b: ArrayContainer): Container {
   const out = new Uint16Array(Math.min(a.cardinality, b.cardinality));
@@ -764,7 +765,7 @@ function andNotRunBitmap(a: RunContainer, b: BitmapContainer): Container {
   return new ArrayContainer(new Uint16Array(out), out.length);
 }
 
-// --- Helpers ---
+// Helpers
 
 function popcount(n: number): number {
   n = n - ((n >>> 1) & 0x55555555);
@@ -824,7 +825,7 @@ function bitmapToArray(data: Uint32Array, cardinality: number): ArrayContainer {
   return new ArrayContainer(arr, cardinality);
 }
 
-// --- RoaringBitmap ---
+// RoaringBitmap
 
 export class RoaringBitmap {
   private containers: Map<number, Container> = new Map();

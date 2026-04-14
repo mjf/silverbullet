@@ -26,10 +26,22 @@ export function indexSyscalls(
     ): Promise<LuaQueryCollection> => {
       return objectIndex.stats(tagName);
     },
-    "index.aggregates": (_ctx): LuaQueryCollection => {
+    "index.storageStats": async (
+      _ctx,
+      tagName?: string,
+    ): Promise<LuaQueryCollection> => {
+      return objectIndex.storageStats(tagName);
+    },
+    "index.contentPages": (): LuaQueryCollection => {
+      return objectIndex.contentPages();
+    },
+    "index.metaPages": (): LuaQueryCollection => {
+      return objectIndex.metaPages();
+    },
+    "index.aggregates": (): LuaQueryCollection => {
       return objectIndex.aggregates();
     },
-    "index.ensureFullIndex": (_ctx) => {
+    "index.ensureFullIndex": () => {
       return objectIndex.ensureFullIndex(client.space);
     },
     "index.reindexSpace": () => {
