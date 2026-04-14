@@ -188,7 +188,6 @@ export class Client {
     );
 
     this.initSpace();
-    await this.objectIndex.ensureFullIndex(this.space);
 
     this.ui = new MainUI(this);
     this.ui.render(this.parent);
@@ -201,6 +200,8 @@ export class Client {
     this.focus();
 
     this.clientSystem.init();
+
+    void this.objectIndex.ensureFullIndex(this.space);
 
     if (this.bootConfig.performWipe) {
       if (confirm("Are you sure you want to wipe the client?")) {

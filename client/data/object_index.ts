@@ -433,7 +433,11 @@ export class ObjectIndex {
   }
 
   async stats(tagName?: string): Promise<LuaQueryCollection> {
-    const tags = tagName ? [tagName] : this.allKnownTags();
+    if (tagName === "") {
+      throw new Error("Tag name is required");
+    }
+
+    const tags = tagName === undefined ? this.allKnownTags() : [tagName];
     const rows: Record<string, any>[] = [];
     const indexComplete = await this.hasFullIndexCompleted();
 
@@ -511,10 +515,14 @@ export class ObjectIndex {
   }
 
   async storageStats(tagName?: string): Promise<LuaQueryCollection> {
-    const rows: StorageStatsRow[] = [];
-    const tags = tagName ? [tagName] : this.allKnownTags();
+    if (tagName === "") {
+      throw new Error("Tag name is required");
+    }
 
-    if (!tagName) {
+    const rows: StorageStatsRow[] = [];
+    const tags = tagName === undefined ? this.allKnownTags() : [tagName];
+
+    if (tagName === undefined) {
       const globalStorage = await this.computeIndexStorageStats();
       rows.push({
         scope: "global",
@@ -536,7 +544,8 @@ export class ObjectIndex {
       rows.push({
         scope: "tag",
         tag,
-        rowCount: tagId === undefined ? 0 : this.bitmapIndex.getRowCount(tagId),
+        rowCount:
+          tagId === undefined ? 0 : this.bitmapIndex.getRowCount(tagId),
         bitmapBytes: storage.bitmapBytes,
         metaBytes: storage.metaBytes,
         dictionaryBytes: null,

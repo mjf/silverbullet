@@ -321,6 +321,7 @@ export class BitmapIndex {
     meta: TagMeta,
   ): void {
     let objectColumnCount = 0;
+    const encodedFields = new Set(encoded._enc);
 
     for (const [key, value] of Object.entries(encoded)) {
       if (key === "_enc") continue;
@@ -331,10 +332,12 @@ export class BitmapIndex {
         meta.columns[key] = { ndv: 0, indexed: true };
       }
 
+      const isEncodedField = encodedFields.has(key);
+
       if (Array.isArray(value)) {
         for (const elem of value) {
           const valueId =
-            typeof elem === "number" && encoded._enc.includes(key)
+            typeof elem === "number" && isEncodedField
               ? elem
               : this.dict.encode(elem);
           const wasEmpty = this.setBitAndCheck(tagId, key, valueId, objectId);
@@ -342,7 +345,7 @@ export class BitmapIndex {
         }
       } else {
         const valueId =
-          typeof value === "number" && encoded._enc.includes(key)
+          typeof value === "number" && isEncodedField
             ? value
             : this.dict.encode(value);
         const wasEmpty = this.setBitAndCheck(tagId, key, valueId, objectId);
@@ -364,16 +367,19 @@ export class BitmapIndex {
     meta: TagMeta,
   ): void {
     let objectColumnCount = 0;
+    const encodedFields = new Set(encoded._enc);
 
     for (const [key, value] of Object.entries(encoded)) {
       if (key === "_enc") continue;
       objectColumnCount++;
       if (!meta.columns[key]?.indexed) continue;
 
+      const isEncodedField = encodedFields.has(key);
+
       if (Array.isArray(value)) {
         for (const elem of value) {
           const valueId =
-            typeof elem === "number" && encoded._enc.includes(key)
+            typeof elem === "number" && isEncodedField
               ? elem
               : this.dict.tryEncode(elem);
           if (valueId !== undefined) {
@@ -390,7 +396,7 @@ export class BitmapIndex {
         }
       } else {
         const valueId =
-          typeof value === "number" && encoded._enc.includes(key)
+          typeof value === "number" && isEncodedField
             ? value
             : this.dict.tryEncode(value);
         if (valueId !== undefined) {
