@@ -3296,6 +3296,10 @@ function formatNode(
     lines.push(`${detailPad}${keyLabel}: ${node.sortKeys.join(", ")}`);
   }
 
+  if (node.outputColumns && node.outputColumns.length > 0) {
+    lines.push(`${detailPad}Output: ${node.outputColumns.join(", ")}`);
+  }
+
   if (node.limitCount !== undefined) {
     lines.push(`${detailPad}Count: ${node.limitCount}`);
   }
