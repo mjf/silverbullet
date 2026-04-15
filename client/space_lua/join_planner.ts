@@ -202,6 +202,13 @@ export type ExplainNode = {
   groupBySpec?: { expr: LuaExpression; alias?: string }[];
   distinctSpec?: boolean;
 
+  // Aggregate detail
+  aggregates?: AggregateDescription[];
+  implicitGroup?: boolean;
+
+  // Filter classification
+  filterType?: "where" | "having";
+
   selectivity?: number;
   ndvSource?:
     | "roaring-bitmap index"
@@ -219,6 +226,14 @@ export type ExplainNode = {
   statsSource?: string;
   executionScanKind?: string;
   predicatePushdown?: string;
+};
+
+export type AggregateDescription = {
+  name: string;
+  args: string;
+  filter?: string;
+  orderBy?: string;
+  rowsFiltered?: number;
 };
 
 export type ExplainOptions = {
@@ -2367,6 +2382,7 @@ export function wrapPlanWithQueryOps(
     groupBy?: { expr: LuaExpression; alias?: string }[];
     where?: LuaExpression;
     having?: LuaExpression;
+    select?: LuaExpression;
     distinct?: boolean;
   },
   sourceStats?: Map<string, CollectionStats>,
@@ -2386,6 +2402,7 @@ export function wrapPlanWithQueryOps(
         estimatedWidth: root.estimatedWidth,
         filterExpr: exprToString(residual),
         whereExpr: residual,
+        filterType: "where",
         statsSource: root.statsSource,
         children: [root],
       };
@@ -2403,6 +2420,15 @@ export function wrapPlanWithQueryOps(
     const estimatedGroupRows =
       ndvGroupRows ?? Math.max(1, Math.round(root.estimatedRows * 0.5));
 
+    // Collect aggregate function descriptions from select and having
+    const aggDescs: AggregateDescription[] = [];
+    if (query.select) {
+      aggDescs.push(...collectAggregateDescriptions(query.select));
+    }
+    if (query.having) {
+      aggDescs.push(...collectAggregateDescriptions(query.having));
+    }
+
     root = {
       nodeType: "GroupAggregate",
       startupCost: root.estimatedCost,
@@ -2411,6 +2437,8 @@ export function wrapPlanWithQueryOps(
       estimatedWidth: root.estimatedWidth,
       sortKeys: keys,
       groupBySpec: query.groupBy,
+      aggregates: aggDescs.length > 0 ? aggDescs : undefined,
+      implicitGroup: query.groupBy.length === 0 ? true : undefined,
       statsSource: root.statsSource,
       children: [root],
     };
@@ -2425,6 +2453,7 @@ export function wrapPlanWithQueryOps(
       estimatedWidth: root.estimatedWidth,
       filterExpr: exprToString(query.having),
       havingExpr: query.having,
+      filterType: "having",
       statsSource: root.statsSource,
       children: [root],
     };
@@ -2764,6 +2793,115 @@ function stripEquiPreds(
   return expr;
 }
 
+/**
+ * Walk an expression AST and collect descriptions of all aggregate calls.
+ * Recognizes FunctionCall, FilteredCall, and AggregateCall nodes whose
+ * prefix is a Variable matching a known aggregate name pattern.
+ */
+function collectAggregateDescriptions(
+  expr: LuaExpression | undefined,
+): AggregateDescription[] {
+  if (!expr) return [];
+  const result: AggregateDescription[] = [];
+  walkAggregates(expr, result);
+  return result;
+}
+
+function walkAggregates(
+  expr: LuaExpression,
+  out: AggregateDescription[],
+): void {
+  switch (expr.type) {
+    case "FilteredCall": {
+      const fc = expr.call;
+      if (fc.prefix.type === "Variable") {
+        const args = fc.args.map(exprToString).join(", ");
+        out.push({
+          name: fc.prefix.name,
+          args,
+          filter: exprToString(expr.filter),
+        });
+        return;
+      }
+      walkAggregates(fc, out);
+      walkAggregates(expr.filter, out);
+      return;
+    }
+    case "AggregateCall": {
+      const fc = expr.call;
+      if (fc.prefix.type === "Variable") {
+        const args = fc.args.map(exprToString).join(", ");
+        const ob = expr.orderBy
+          .map(
+            (o) =>
+              exprToString(o.expression) +
+              (o.direction === "desc" ? " desc" : ""),
+          )
+          .join(", ");
+        out.push({
+          name: fc.prefix.name,
+          args,
+          orderBy: ob,
+        });
+        return;
+      }
+      walkAggregates(fc, out);
+      return;
+    }
+    case "FunctionCall": {
+      // Plain aggregate call (no filter, no intra-aggregate order by)
+      if (expr.prefix.type === "Variable") {
+        // Could be an aggregate — we collect it; the consumer can
+        // cross-check against the aggregate registry if needed.
+        const args = expr.args.map(exprToString).join(", ");
+        const desc: AggregateDescription = { name: expr.prefix.name, args };
+        if (expr.orderBy && expr.orderBy.length > 0) {
+          desc.orderBy = expr.orderBy
+            .map(
+              (o) =>
+                exprToString(o.expression) +
+                (o.direction === "desc" ? " desc" : ""),
+            )
+            .join(", ");
+        }
+        out.push(desc);
+        return;
+      }
+      walkAggregates(expr.prefix, out);
+      for (const arg of expr.args) {
+        walkAggregates(arg, out);
+      }
+      return;
+    }
+    case "Binary":
+      walkAggregates(expr.left, out);
+      walkAggregates(expr.right, out);
+      return;
+    case "Unary":
+      walkAggregates(expr.argument, out);
+      return;
+    case "Parenthesized":
+      walkAggregates(expr.expression, out);
+      return;
+    case "TableConstructor":
+      for (const field of expr.fields) {
+        switch (field.type) {
+          case "DynamicField":
+            walkAggregates(field.key, out);
+            walkAggregates(field.value, out);
+            break;
+          case "PropField":
+          case "ExpressionField":
+            walkAggregates(field.value, out);
+            break;
+        }
+      }
+      return;
+    default:
+      return;
+  }
+}
+
 function estimateGroupRowsFromNdv(
   inputRows: number,
   groupBy: { expr: LuaExpression; alias?: string }[],
@@ -3002,7 +3140,9 @@ function formatNode(
   }
 
   if (node.filterExpr) {
-    lines.push(`${detailPad}Filter: ${node.filterExpr}`);
+    const filterLabel =
+      node.filterType === "having" ? "Filter (Having)" : "Filter";
+    lines.push(`${detailPad}${filterLabel}: ${node.filterExpr}`);
   }
   if (
     opts.analyze &&
@@ -3111,7 +3251,7 @@ function formatNodeLabel(node: ExplainNode): string {
     case "FunctionScan":
       return `Function Scan on ${node.source}`;
     case "Filter":
-      return "Filter";
+      return node.filterType === "having" ? "Filter (Having)" : "Filter";
     case "HashJoin":
       return node.joinType && node.joinType !== "inner"
         ? `Hash ${node.joinType.charAt(0).toUpperCase() + node.joinType.slice(1)} Join`

@@ -637,7 +637,19 @@ export function getBuiltinAggregateEntries(): {
 }
 
 /**
+ * Result of executing an aggregate, including the computed value
+ * and optional instrumentation counters.
+ */
+export type AggregateResult = {
+  value: LuaValue;
+  rowsFiltered?: number;
+};
+
+/**
  * Execute an aggregate function over a group of items.
+ *
+ * Returns an `AggregateResult` when `instrumented` is true, otherwise
+ * returns the raw `LuaValue` for backward compatibility.
  */
 export async function executeAggregate(
   spec: AggregateSpec,
@@ -655,7 +667,8 @@ export async function executeAggregate(
   config: Config,
   filterExpr?: LuaExpression,
   orderBy?: LuaOrderBy[],
-): Promise<LuaValue> {
+  instrumented?: boolean,
+): Promise<LuaValue | AggregateResult> {
   const ctx = buildAggCtx(spec.name, config);
 
   // Evaluate extra args using the first item's env so that references
@@ -678,6 +691,7 @@ export async function executeAggregate(
 
   // Collect filtered items
   const filteredItems: LuaValue[] = [];
+  let rowsFiltered = 0;
   const len = items.length;
   for (let i = 1; i <= len; i++) {
     const item = items.rawGet(i);
@@ -687,6 +701,7 @@ export async function executeAggregate(
       const filterEnv = buildItemEnv(objectVariable, item, env, sf);
       const filterResult = await evalExprFn(filterExpr, filterEnv, sf);
       if (!luaTruthy(filterResult)) {
+        rowsFiltered++;
         continue;
       }
     }
@@ -745,6 +760,13 @@ export async function executeAggregate(
   // Finish
   if (spec.finish) {
     state = await luaCall(spec.finish, [state, ctx, ...extraArgs], noCtx, sf);
+  }
+
+  if (instrumented) {
+    return {
+      value: state,
+      rowsFiltered: filterExpr ? rowsFiltered : undefined,
+    };
   }
 
   return state;
