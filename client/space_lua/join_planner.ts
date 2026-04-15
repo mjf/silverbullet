@@ -256,10 +256,7 @@ function summarizeJoinStatsSource(
   if (left === "persisted-partial" || right === "persisted-partial") {
     return "partial";
   }
-  if (
-    isApproximateStatsSource(left) ||
-    isApproximateStatsSource(right)
-  ) {
+  if (isApproximateStatsSource(left) || isApproximateStatsSource(right)) {
     return "approximate";
   }
   if (left || right) {
@@ -268,9 +265,7 @@ function summarizeJoinStatsSource(
   return "unknown";
 }
 
-function shouldAvoidAggressiveReordering(
-  sources: JoinSource[],
-): boolean {
+function shouldAvoidAggressiveReordering(sources: JoinSource[]): boolean {
   return sources.some((s) => isPartialStatsSource(s.stats?.statsSource));
 }
 
@@ -279,8 +274,7 @@ function canUseMcvForPlanning(
   rightSource: StatsSource | undefined,
 ): boolean {
   return (
-    leftSource === "persisted-complete" &&
-    rightSource === "persisted-complete"
+    leftSource === "persisted-complete" && rightSource === "persisted-complete"
   );
 }
 
@@ -291,7 +285,10 @@ function ndvConfidenceMultiplier(
   if (isPartialStatsSource(leftSource) || isPartialStatsSource(rightSource)) {
     return 0.25;
   }
-  if (isApproximateStatsSource(leftSource) || isApproximateStatsSource(rightSource)) {
+  if (
+    isApproximateStatsSource(leftSource) ||
+    isApproximateStatsSource(rightSource)
+  ) {
     return 0.5;
   }
   return 1.0;
@@ -513,6 +510,8 @@ function propagateJoinMcv(
   rightSourceName: string,
   joinType: JoinType,
   equiPred?: EquiPredicate,
+  leftNdvMap?: Map<string, Map<string, number>>,
+  rightNdvMap?: Map<string, number>,
 ): Map<string, Map<string, MCVList>> | undefined {
   if (!leftMcv && !rightMcv) return undefined;
 
@@ -539,25 +538,29 @@ function propagateJoinMcv(
 
       const leftTracked = leftColMcv.trackedRowCount();
       const leftTotal = leftColMcv.totalCount();
+      // Use actual NDV from the map, fall back to trackedSize
+      const leftColNdv =
+        leftNdvMap?.get(equiPred.leftSource)?.get(equiPred.leftColumn) ??
+        leftColMcv.trackedSize();
       const leftUntrackedNdv = Math.max(
         1,
-        leftTotal - leftTracked > 0 ? leftTotal - leftTracked : 1,
+        leftColNdv - leftColMcv.trackedSize(),
       );
+      const leftUntrackedRows = Math.max(0, leftTotal - leftTracked);
       const leftAvgUntracked =
-        leftTotal > leftTracked
-          ? (leftTotal - leftTracked) / leftUntrackedNdv
-          : 1;
+        leftUntrackedRows > 0 ? leftUntrackedRows / leftUntrackedNdv : 1;
 
       const rightTracked = rightColMcv.trackedRowCount();
       const rightTotal = rightColMcv.totalCount();
+      const rightColNdv =
+        rightNdvMap?.get(equiPred.rightColumn) ?? rightColMcv.trackedSize();
       const rightUntrackedNdv = Math.max(
         1,
-        rightTotal - rightTracked > 0 ? rightTotal - rightTracked : 1,
+        rightColNdv - rightColMcv.trackedSize(),
       );
+      const rightUntrackedRows = Math.max(0, rightTotal - rightTracked);
       const rightAvgUntracked =
-        rightTotal > rightTracked
-          ? (rightTotal - rightTracked) / rightUntrackedNdv
-          : 1;
+        rightUntrackedRows > 0 ? rightUntrackedRows / rightUntrackedNdv : 1;
 
       const seen = new Set<string>();
 
@@ -669,7 +672,10 @@ function estimateJoinWithCandidate(
       Math.min(joinedRows, Math.ceil(candidateRows / 2)),
     );
 
-    const confidence = ndvConfidenceMultiplier(leftStatsSource, rightStatsSource);
+    const confidence = ndvConfidenceMultiplier(
+      leftStatsSource,
+      rightStatsSource,
+    );
 
     const leftNdv = observedLeftNdv ?? inferredLeftNdv;
     const rightNdv = observedRightNdv ?? inferredRightNdv;
@@ -677,7 +683,9 @@ function estimateJoinWithCandidate(
     const adjustedLeftNdv =
       confidence < 1 ? Math.max(1, Math.round(leftNdv / confidence)) : leftNdv;
     const adjustedRightNdv =
-      confidence < 1 ? Math.max(1, Math.round(rightNdv / confidence)) : rightNdv;
+      confidence < 1
+        ? Math.max(1, Math.round(rightNdv / confidence))
+        : rightNdv;
 
     const leftMcv = joinedMcv
       ?.get(equiPred.leftSource)
@@ -848,7 +856,7 @@ export function buildJoinTree(
       accStatsSource,
     );
 
-    const method = selectPhysicalOperator(
+    let method = selectPhysicalOperator(
       accRows,
       right,
       jt,
@@ -856,6 +864,11 @@ export function buildJoinTree(
       accWidth,
       config,
     );
+
+    // Without equi-predicate degrade to cross
+    if (!equiPred && method !== "loop") {
+      method = "loop";
+    }
 
     const joinNdv = propagateJoinNdv(
       accNdv,
@@ -872,6 +885,8 @@ export function buildJoinTree(
       right.name,
       jt,
       equiPred,
+      accNdv,
+      right.stats?.ndv ?? new Map(),
     );
 
     const joinStatsSource = summarizeJoinStatsSource(
@@ -897,13 +912,14 @@ export function buildJoinTree(
     accWidth += estimatedWidth(right);
     accNdv = joinNdv;
     accMcv = joinMcv;
-    accStatsSource = joinStatsSource === "exact"
-      ? "persisted-complete"
-      : joinStatsSource === "partial"
-        ? "persisted-partial"
-        : joinStatsSource === "approximate"
-          ? "computed-sketch-large"
-          : undefined;
+    accStatsSource =
+      joinStatsSource === "exact"
+        ? "persisted-complete"
+        : joinStatsSource === "partial"
+          ? "persisted-partial"
+          : joinStatsSource === "approximate"
+            ? "computed-sketch-large"
+            : undefined;
   }
 
   return tree;
@@ -979,9 +995,9 @@ function orderSources(
 
       const candidateWidth = clampWidth(estimatedWidth(candidate));
       const candidatePenalty = executionScanPenalty(candidate);
+
       const cost =
-        joinedRows *
-        estimatedRows(candidate) *
+        (outputRows + estimatedRows(candidate)) *
         candidatePenalty *
         (getWidthWeight(config) * clampWidth(joinedWidth) +
           getCandidateWidthWeight(config) * candidateWidth);
@@ -1011,18 +1027,21 @@ function orderSources(
           candidate.name,
           joinType,
           equiPred,
+          joinedNdv,
+          candidate.stats?.ndv ?? new Map(),
         );
         const nextSummary = summarizeJoinStatsSource(
           joinedStatsSource,
           candidate.stats?.statsSource,
         );
-        bestNextStatsSource = nextSummary === "exact"
-          ? "persisted-complete"
-          : nextSummary === "partial"
-            ? "persisted-partial"
-            : nextSummary === "approximate"
-              ? "computed-sketch-large"
-              : undefined;
+        bestNextStatsSource =
+          nextSummary === "exact"
+            ? "persisted-complete"
+            : nextSummary === "partial"
+              ? "persisted-partial"
+              : nextSummary === "approximate"
+                ? "computed-sketch-large"
+                : undefined;
       }
     }
 
@@ -1069,7 +1088,7 @@ function selectPhysicalOperator(
     const k = right.hint.kind;
     if (k === "merge") {
       if (!hasEquiPred) {
-        throw new Error("Merge join requires equi-predicate");
+        throw new Error("merge join requires equi-predicate");
       }
       return "merge";
     }
@@ -1086,7 +1105,17 @@ function selectPhysicalOperator(
   const rw = clampWidth(estimatedWidth(right));
   const lw = clampWidth(leftWidth);
 
-  if (rr <= getSmallTableThreshold(config)) return "loop";
+  if (rr <= getSmallTableThreshold(config)) {
+    // Semi/anti without using predicate needs hash path for equi-pred
+    if (
+      (joinType === "semi" || joinType === "anti") &&
+      hasEquiPred &&
+      !right.hint?.using
+    ) {
+      return "hash";
+    }
+    return "loop";
+  }
 
   const hashCost = computeJoinCost(
     "hash",
@@ -1099,6 +1128,7 @@ function selectPhysicalOperator(
     rw,
     config,
   ).totalCost;
+
   const nljCost = computeJoinCost(
     "loop",
     joinType,
@@ -1341,9 +1371,22 @@ async function nestedLoopSemiAntiJoin(
   predicate: LuaValue,
   joinType: "semi" | "anti",
   sf: LuaStackFrame,
+  equiPred?: EquiPredicate,
 ): Promise<LuaTable[]> {
   const results: LuaTable[] = [];
   for (const leftRow of leftRows) {
+    // NULL-key guard: match hashSemiAntiJoin semantics
+    if (equiPred) {
+      const leftObj = leftRow.rawGet(equiPred.leftSource);
+      const val = extractField(leftObj, equiPred.leftColumn);
+      const key = hashJoinKey(val);
+      if (key === null) {
+        // NULL key → no match possible (SQL NULL ≠ anything)
+        if (joinType === "anti") results.push(leftRow);
+        continue;
+      }
+    }
+
     const leftArg = loopPredicateLeftArg(leftNode, leftRow);
     let found = false;
     for (const rightItem of rightItems) {
@@ -1555,6 +1598,28 @@ async function sortMergeJoin(
   leftKeyed.sort((a, b) => compareSortKeys(a.key, b.key));
   rightKeyed.sort((a, b) => compareSortKeys(a.key, b.key));
 
+  // Skip NULL keys (NULL does not equal to anything)
+  if (equiPred) {
+    while (
+      leftKeyed.length > 0 &&
+      hashJoinKey(
+        extractField(
+          leftKeyed[0].row.rawGet(equiPred.leftSource),
+          equiPred.leftColumn,
+        ),
+      ) === null
+    ) {
+      leftKeyed.shift();
+    }
+    while (
+      rightKeyed.length > 0 &&
+      hashJoinKey(extractField(rightKeyed[0].item, equiPred.rightColumn)) ===
+        null
+    ) {
+      rightKeyed.shift();
+    }
+  }
+
   const results: LuaTable[] = [];
   let processed = 0;
   let li = 0;
@@ -1639,6 +1704,7 @@ async function dispatchJoin(
         predicate,
         joinType,
         sf,
+        equiPred,
       );
     }
 
@@ -1664,9 +1730,9 @@ async function dispatchJoin(
     );
   }
 
-  switch (tree.method) {
-    case "hash":
-      if (equiPred) {
+  if (equiPred) {
+    switch (tree.method) {
+      case "hash":
         return hashInnerJoin(
           leftRows,
           rightItems,
@@ -1675,10 +1741,7 @@ async function dispatchJoin(
           sf,
           config,
         );
-      }
-      break;
-    case "merge":
-      if (equiPred) {
+      case "merge":
         return sortMergeJoin(
           leftRows,
           rightItems,
@@ -1687,10 +1750,7 @@ async function dispatchJoin(
           config,
           equiPred,
         );
-      }
-      break;
-    case "loop":
-      if (equiPred) {
+      case "loop":
         return nestedLoopEquiJoin(
           leftRows,
           rightItems,
@@ -1699,8 +1759,12 @@ async function dispatchJoin(
           sf,
           config,
         );
-      }
-      break;
+    }
+  }
+
+  // Without equi-predicate degrade to cross
+  if (tree.method !== "loop") {
+    (tree as JoinInner).method = "loop";
   }
 
   return crossJoin(leftRows, rightItems, rightName, sf, config);
@@ -1720,7 +1784,12 @@ export async function executeJoinTree(
     return items.map((item) => rowToTable(tree.source.name, item));
   }
   const leftRows = await executeJoinTree(tree.left, env, sf, config, overrides);
-  const rightSource = (tree.right as JoinLeaf).source;
+  if (tree.right.kind !== "leaf") {
+    throw new Error(
+      "Join planner: right child must be a leaf node (left-deep trees only)",
+    );
+  }
+  const rightSource = tree.right.source;
   const rightItems = await materializeSource(rightSource, env, sf, overrides);
   return dispatchJoin(tree, leftRows, rightItems, rightSource, env, sf, config);
 }
@@ -1932,7 +2001,7 @@ function isExplicitlyScopedToSource(
       return (
         isExplicitlyScopedToSource(expr.prefix, sourceNames, targetSource) &&
         expr.args.every((arg) =>
-          isExplicitlyScopedToSource(arg, sourceNames, targetSource)
+          isExplicitlyScopedToSource(arg, sourceNames, targetSource),
         ) &&
         (!expr.orderBy ||
           expr.orderBy.every((ob) =>
@@ -1940,7 +2009,7 @@ function isExplicitlyScopedToSource(
               ob.expression,
               sourceNames,
               targetSource,
-            )
+            ),
           ))
       );
 
@@ -1954,7 +2023,7 @@ function isExplicitlyScopedToSource(
       return (
         isExplicitlyScopedToSource(expr.call, sourceNames, targetSource) &&
         expr.orderBy.every((ob) =>
-          isExplicitlyScopedToSource(ob.expression, sourceNames, targetSource)
+          isExplicitlyScopedToSource(ob.expression, sourceNames, targetSource),
         )
       );
 
@@ -2119,10 +2188,7 @@ function explainNdvSource(
   if (!(hasObservedLeftNdv || hasObservedRightNdv)) {
     return "row-count heuristic";
   }
-  if (
-    leftSS === "persisted-complete" ||
-    rightSS === "persisted-complete"
-  ) {
+  if (leftSS === "persisted-complete" || rightSS === "persisted-complete") {
     return "roaring-bitmap index";
   }
   if (
@@ -2157,7 +2223,8 @@ export function explainJoinTree(
       filterExpr: pushedFilterExprBySource?.get(tree.source.name),
       statsSource: tree.source.stats?.statsSource,
       executionScanKind: tree.source.stats?.executionCapabilities?.scanKind,
-      predicatePushdown: tree.source.stats?.executionCapabilities?.predicatePushdown,
+      predicatePushdown:
+        tree.source.stats?.executionCapabilities?.predicatePushdown,
       children: [],
     };
   }
@@ -2222,9 +2289,8 @@ export function explainJoinTree(
     const leftSS = leftLeafSource?.stats?.statsSource;
     const rightSS = rightStats?.statsSource;
 
-    const hasObservedLeftNdv = tree.estimatedNdv
-      ?.get(ep.leftSource)
-      ?.has(ep.leftColumn) ?? false;
+    const hasObservedLeftNdv =
+      tree.estimatedNdv?.get(ep.leftSource)?.has(ep.leftColumn) ?? false;
     const hasObservedRightNdv = rightStats?.ndv?.has(ep.rightColumn) ?? false;
 
     ndvSource = explainNdvSource(
@@ -2772,8 +2838,12 @@ export async function executeAndInstrument(
     config,
     overrides,
   );
-
-  const rightSource = (tree.right as JoinLeaf).source;
+  if (tree.right.kind !== "leaf") {
+    throw new Error(
+      "Join planner: right child must be a leaf node (left-deep trees only)",
+    );
+  }
+  const rightSource = tree.right.source;
   const rightT0 = opts.analyze && opts.timing ? performance.now() : 0;
   const rightItems = await materializeSource(rightSource, env, sf, overrides);
   plan.children[1].actualRows = rightItems.length;

@@ -38,8 +38,8 @@ describe("BitmapIndex encoding", () => {
   test("short strings are dictionary-encoded", () => {
     const idx = makeIndex();
     const encoded = idx.encodeObject({ name: "Alice", page: "MyPage" });
-    expect(encoded._enc).toContain("name");
-    expect(encoded._enc).toContain("page");
+    expect(encoded.$enc).toContain("name");
+    expect(encoded.$enc).toContain("page");
     expect(typeof encoded.name).toBe("number");
     expect(typeof encoded.page).toBe("number");
   });
@@ -48,7 +48,7 @@ describe("BitmapIndex encoding", () => {
     const idx = makeIndex();
     const encoded = idx.encodeObject({ pos: 42, level: 3 });
     // Numbers are encoded
-    expect(encoded._enc).toContain("pos");
+    expect(encoded.$enc).toContain("pos");
     expect(typeof encoded.pos).toBe("number"); // dict ID, also a number
   });
 
@@ -56,34 +56,34 @@ describe("BitmapIndex encoding", () => {
     const idx = makeIndex({ maxValueBytes: 10 });
     const longStr = "a".repeat(100);
     const encoded = idx.encodeObject({ text: longStr, name: "short" });
-    expect(encoded._enc).not.toContain("text");
-    expect(encoded._enc).toContain("name");
+    expect(encoded.$enc).not.toContain("text");
+    expect(encoded.$enc).toContain("name");
     expect(encoded.text).toBe(longStr);
   });
 
   test("null/undefined values are not encoded", () => {
     const idx = makeIndex();
     const encoded = idx.encodeObject({ a: null, b: undefined, c: "yes" });
-    expect(encoded._enc).not.toContain("a");
-    expect(encoded._enc).not.toContain("b");
-    expect(encoded._enc).toContain("c");
+    expect(encoded.$enc).not.toContain("a");
+    expect(encoded.$enc).not.toContain("b");
+    expect(encoded.$enc).toContain("c");
   });
 
   test("array elements are individually encoded", () => {
     const idx = makeIndex();
     const encoded = idx.encodeObject({ tags: ["item", "todo"] });
-    expect(encoded._enc).toContain("tags");
+    expect(encoded.$enc).toContain("tags");
     expect(Array.isArray(encoded.tags)).toBe(true);
     const arr = encoded.tags as number[];
     expect(typeof arr[0]).toBe("number");
     expect(typeof arr[1]).toBe("number");
   });
 
-  test("_enc field is reserved and skipped", () => {
+  test("$enc field is reserved and skipped", () => {
     const idx = makeIndex();
-    const encoded = idx.encodeObject({ _enc: "bogus", name: "test" });
-    expect(Array.isArray(encoded._enc)).toBe(true);
-    expect(encoded._enc).toContain("name");
+    const encoded = idx.encodeObject({ $enc: "bogus", name: "test" });
+    expect(Array.isArray(encoded.$enc)).toBe(true);
+    expect(encoded.$enc).toContain("name");
   });
 
   test("dictionary size cap disables new encodings", () => {
@@ -91,8 +91,8 @@ describe("BitmapIndex encoding", () => {
     const encoded1 = idx.encodeObject({ a: "first" });
     const encoded2 = idx.encodeObject({ b: "second" });
 
-    expect(encoded1._enc).toContain("a");
-    expect(encoded2._enc).not.toContain("b");
+    expect(encoded1.$enc).toContain("a");
+    expect(encoded2.$enc).not.toContain("b");
     expect(encoded2.b).toBe("second");
   });
 });
@@ -517,5 +517,50 @@ describe("BitmapIndex multi-tag", () => {
 
     // Items on P1 should be objectIds 0 and 1
     expect(itemsOnP1.toArray()).toEqual([0, 1]);
+  });
+});
+
+// Dictionary.encodeIfFits
+
+describe("Dictionary encodeIfFits", () => {
+  test("returns undefined for null/undefined", () => {
+    const idx = makeIndex();
+    const dict = idx.getDictionary();
+    expect(dict.encodeIfFits(null, 256, 100000)).toBeUndefined();
+    expect(dict.encodeIfFits(undefined, 256, 100000)).toBeUndefined();
+  });
+
+  test("returns ID for short value", () => {
+    const idx = makeIndex();
+    const dict = idx.getDictionary();
+    const id = dict.encodeIfFits("hello", 256, 100000);
+    expect(id).toBe(0);
+    // Same value again returns same ID
+    expect(dict.encodeIfFits("hello", 256, 100000)).toBe(0);
+  });
+
+  test("returns undefined when value exceeds maxBytes", () => {
+    const idx = makeIndex();
+    const dict = idx.getDictionary();
+    const id = dict.encodeIfFits("a".repeat(300), 10, 100000);
+    expect(id).toBeUndefined();
+  });
+
+  test("returns undefined when dictionary is full", () => {
+    const idx = makeIndex();
+    const dict = idx.getDictionary();
+    dict.encodeIfFits("first", 256, 1);
+    // Dictionary now has 1 entry, maxSize is 1
+    const id = dict.encodeIfFits("second", 256, 1);
+    expect(id).toBeUndefined();
+  });
+
+  test("returns existing ID even when dictionary is full", () => {
+    const idx = makeIndex();
+    const dict = idx.getDictionary();
+    const id = dict.encodeIfFits("first", 256, 1);
+    expect(id).toBe(0);
+    // Already exists, so returns it even though dict is "full"
+    expect(dict.encodeIfFits("first", 256, 1)).toBe(0);
   });
 });

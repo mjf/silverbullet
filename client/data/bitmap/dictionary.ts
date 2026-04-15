@@ -26,11 +26,15 @@ function normalizeValue(value: unknown): DictionaryValue {
 }
 
 function bytesToKey(bytes: Uint8Array): string {
-  let out = "";
-  for (const b of bytes) {
-    out += String.fromCharCode(b);
+  if (bytes.length <= 8192) {
+    return String.fromCharCode.apply(null, bytes as unknown as number[]);
   }
-  return out;
+  const chunks: string[] = [];
+  for (let i = 0; i < bytes.length; i += 8192) {
+    const slice = bytes.subarray(i, Math.min(i + 8192, bytes.length));
+    chunks.push(String.fromCharCode.apply(null, slice as unknown as number[]));
+  }
+  return chunks.join("");
 }
 
 export function canonicalize(value: unknown): string {
@@ -72,6 +76,33 @@ export class Dictionary {
     if (existing !== undefined) {
       return existing;
     }
+
+    const id = this.nextId++;
+    this.valueToId.set(key, id);
+    this.idToValue.set(id, normalized);
+    this.dirty = true;
+    return id;
+  }
+
+  /**
+   * Encode a value only if it already exists in the dictionary or fits
+   * within maxBytes. Performs a single canonicalize call.
+   * Returns undefined if the value should not be encoded.
+   */
+  encodeIfFits(
+    value: unknown,
+    maxBytes: number,
+    maxSize: number,
+  ): number | undefined {
+    if (value === null || value === undefined) return undefined;
+    const normalized = normalizeValue(value);
+    const key = canonicalize(normalized);
+
+    const existing = this.valueToId.get(key);
+    if (existing !== undefined) return existing;
+
+    if (this.idToValue.size >= maxSize) return undefined;
+    if (key.length > maxBytes) return undefined;
 
     const id = this.nextId++;
     this.valueToId.set(key, id);

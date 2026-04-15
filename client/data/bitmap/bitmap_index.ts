@@ -14,11 +14,7 @@
  */
 
 import { RoaringBitmap } from "./roaring_bitmap.ts";
-import {
-  Dictionary,
-  canonicalize,
-  type DictionarySnapshot,
-} from "./dictionary.ts";
+import { Dictionary, type DictionarySnapshot } from "./dictionary.ts";
 import type { KV, KvKey } from "../../../plug-api/types/datastore.ts";
 
 // Storage key prefixes
@@ -26,6 +22,9 @@ const BITMAP_PREFIX = "b";
 const META_PREFIX = "m";
 const OBJECT_PREFIX = "o";
 const DICT_KEY: KvKey = ["$dict"];
+
+// Internal metadata field — uses $ prefix to avoid collisions with user data
+const ENC_FIELD = "$enc";
 
 // Configuration
 
@@ -79,13 +78,18 @@ function emptyTagMeta(): TagMeta {
  * Non-encoded fields (long strings, numbers, booleans, arrays, objects)
  * are stored as-is.
  *
- * The `_enc` field lists which fields were dictionary-encoded,
+ * The `$enc` field lists which fields were dictionary-encoded,
  * so we know what to decode on read.
  */
 export type EncodedObject = {
-  _enc: string[];
+  $enc: string[];
   [key: string]: unknown;
 };
+
+// Two-level bitmap cache: tagId → column → valueId → RoaringBitmap
+
+type ColumnBitmaps = Map<number, RoaringBitmap>;
+type TagBitmaps = Map<string, ColumnBitmaps>;
 
 // BitmapIndex
 
@@ -94,9 +98,9 @@ export class BitmapIndex {
   private config: BitmapIndexConfig;
   // In-memory cache of tag metadata
   private metaCache: Map<number, TagMeta> = new Map();
-  // In-memory cache of bitmaps: `${tagId}\0${column}\0${valueId}` -> bitmap
-  private bitmapCache: Map<string, RoaringBitmap> = new Map();
-  // Track dirty bitmaps for batch flush
+  // Two-level bitmap cache: tagId → (column → (valueId → bitmap))
+  private bitmapsByTag: Map<number, TagBitmaps> = new Map();
+  // Track dirty bitmaps for batch flush: "tagId\0column\0valueId"
   private dirtyBitmaps: Set<string> = new Set();
   private dirtyMeta: Set<number> = new Set();
 
@@ -113,39 +117,56 @@ export class BitmapIndex {
     return this.config;
   }
 
-  // Encoding
+  // Bitmap cache helpers
 
-  /**
-   * Determine if a field value should be dictionary-encoded.
-   */
-  shouldEncode(value: unknown): boolean {
-    if (value === null || value === undefined) return false;
-    if (this.dict.size >= this.config.maxDictionarySize) return false;
-    const canonical = canonicalize(value);
-    // Already in dictionary — always encode
-    if (this.dict.tryEncode(value) !== undefined) return true;
-    // Check byte length
-    return canonical.length <= this.config.maxValueBytes;
+  private getOrCreateTagBitmaps(tagId: number): TagBitmaps {
+    let tag = this.bitmapsByTag.get(tagId);
+    if (!tag) {
+      tag = new Map();
+      this.bitmapsByTag.set(tagId, tag);
+    }
+    return tag;
   }
+
+  private getOrCreateColumnBitmaps(
+    tagBitmaps: TagBitmaps,
+    column: string,
+  ): ColumnBitmaps {
+    let col = tagBitmaps.get(column);
+    if (!col) {
+      col = new Map();
+      tagBitmaps.set(column, col);
+    }
+    return col;
+  }
+
+  private dirtyKey(tagId: number, column: string, valueId: number): string {
+    return `${tagId}\0${column}\0${valueId}`;
+  }
+
+  // Encoding
 
   /**
    * Encode an object: replace short-string fields with dictionary IDs.
    * Returns the encoded object and the list of encoded field names.
+   * Uses a single canonicalize call per value via Dictionary.encodeIfFits.
    */
   encodeObject(obj: Record<string, unknown>): EncodedObject {
-    const encoded: EncodedObject = { _enc: [] };
+    const encoded: EncodedObject = { $enc: [] };
     const encFields: string[] = [];
+    const maxBytes = this.config.maxValueBytes;
+    const maxSize = this.config.maxDictionarySize;
 
     for (const [key, value] of Object.entries(obj)) {
-      if (key === "_enc") continue; // reserved
+      if (key === ENC_FIELD) continue;
 
       if (Array.isArray(value)) {
-        // Encode array elements individually
         const encodedArr: unknown[] = [];
         let anyEncoded = false;
         for (const elem of value) {
-          if (this.shouldEncode(elem)) {
-            encodedArr.push(this.dict.encode(elem));
+          const id = this.dict.encodeIfFits(elem, maxBytes, maxSize);
+          if (id !== undefined) {
+            encodedArr.push(id);
             anyEncoded = true;
           } else {
             encodedArr.push(elem);
@@ -153,15 +174,18 @@ export class BitmapIndex {
         }
         encoded[key] = anyEncoded ? encodedArr : value;
         if (anyEncoded) encFields.push(key);
-      } else if (this.shouldEncode(value)) {
-        encoded[key] = this.dict.encode(value);
-        encFields.push(key);
       } else {
-        encoded[key] = value;
+        const id = this.dict.encodeIfFits(value, maxBytes, maxSize);
+        if (id !== undefined) {
+          encoded[key] = id;
+          encFields.push(key);
+        } else {
+          encoded[key] = value;
+        }
       }
     }
 
-    encoded._enc = encFields;
+    encoded.$enc = encFields;
     return encoded;
   }
 
@@ -170,10 +194,10 @@ export class BitmapIndex {
    */
   decodeObject(encoded: EncodedObject): Record<string, unknown> {
     const result: Record<string, unknown> = {};
-    const encFields = new Set(encoded._enc);
+    const encFields = new Set(encoded.$enc);
 
     for (const [key, value] of Object.entries(encoded)) {
-      if (key === "_enc") continue;
+      if (key === ENC_FIELD) continue;
 
       if (encFields.has(key)) {
         if (Array.isArray(value)) {
@@ -194,14 +218,6 @@ export class BitmapIndex {
   }
 
   // Bitmap operations
-
-  private bitmapCacheKey(
-    tagId: number,
-    column: string,
-    valueId: number,
-  ): string {
-    return `${tagId}\0${column}\0${valueId}`;
-  }
 
   private bitmapStorageKey(
     tagId: number,
@@ -227,7 +243,7 @@ export class BitmapIndex {
     if (tagMeta.count < this.config.minRowsForIndex) return false;
 
     const colMeta = tagMeta.columns[column];
-    if (!colMeta) return true; // new column, index by default
+    if (!colMeta) return true;
 
     if (colMeta.ndv > this.config.maxBitmapsPerColumn) return false;
     if (
@@ -273,14 +289,15 @@ export class BitmapIndex {
     valueId: number,
     objectId: number,
   ): void {
-    const cacheKey = this.bitmapCacheKey(tagId, column, valueId);
-    let bm = this.bitmapCache.get(cacheKey);
+    const tagBitmaps = this.getOrCreateTagBitmaps(tagId);
+    const colBitmaps = this.getOrCreateColumnBitmaps(tagBitmaps, column);
+    let bm = colBitmaps.get(valueId);
     if (!bm) {
       bm = new RoaringBitmap();
-      this.bitmapCache.set(cacheKey, bm);
+      colBitmaps.set(valueId, bm);
     }
     bm.add(objectId);
-    this.dirtyBitmaps.add(cacheKey);
+    this.dirtyBitmaps.add(this.dirtyKey(tagId, column, valueId));
   }
 
   /**
@@ -292,11 +309,12 @@ export class BitmapIndex {
     valueId: number,
     objectId: number,
   ): void {
-    const cacheKey = this.bitmapCacheKey(tagId, column, valueId);
-    const bm = this.bitmapCache.get(cacheKey);
+    const colBitmaps = this.bitmapsByTag.get(tagId)?.get(column);
+    if (!colBitmaps) return;
+    const bm = colBitmaps.get(valueId);
     if (!bm) return;
     bm.remove(objectId);
-    this.dirtyBitmaps.add(cacheKey);
+    this.dirtyBitmaps.add(this.dirtyKey(tagId, column, valueId));
   }
 
   /**
@@ -308,7 +326,7 @@ export class BitmapIndex {
     column: string,
     valueId: number,
   ): RoaringBitmap | undefined {
-    return this.bitmapCache.get(this.bitmapCacheKey(tagId, column, valueId));
+    return this.bitmapsByTag.get(tagId)?.get(column)?.get(valueId);
   }
 
   /**
@@ -321,10 +339,10 @@ export class BitmapIndex {
     meta: TagMeta,
   ): void {
     let objectColumnCount = 0;
-    const encodedFields = new Set(encoded._enc);
+    const encodedFields = new Set(encoded.$enc);
 
     for (const [key, value] of Object.entries(encoded)) {
-      if (key === "_enc") continue;
+      if (key === ENC_FIELD) continue;
       objectColumnCount++;
       if (!this.shouldIndexColumn(key, meta)) continue;
 
@@ -367,10 +385,10 @@ export class BitmapIndex {
     meta: TagMeta,
   ): void {
     let objectColumnCount = 0;
-    const encodedFields = new Set(encoded._enc);
+    const encodedFields = new Set(encoded.$enc);
 
     for (const [key, value] of Object.entries(encoded)) {
-      if (key === "_enc") continue;
+      if (key === ENC_FIELD) continue;
       objectColumnCount++;
       if (!meta.columns[key]?.indexed) continue;
 
@@ -420,27 +438,35 @@ export class BitmapIndex {
    * Recompute NDV for all columns of a tag from the bitmap cache.
    */
   recomputeNDV(tagId: number, meta: TagMeta): void {
-    // Reset all NDVs
     for (const col of Object.keys(meta.columns)) {
       meta.columns[col].ndv = 0;
     }
 
-    // Count non-empty bitmaps per column
-    const prefix = `${tagId}\0`;
-    for (const [cacheKey, bm] of this.bitmapCache) {
-      if (!cacheKey.startsWith(prefix)) continue;
-      if (bm.isEmpty()) continue;
-      // Parse column name from cache key: "tagId\0column\0valueId"
-      const parts = cacheKey.split("\0");
-      const column = parts[1];
-      if (meta.columns[column]) {
-        meta.columns[column].ndv++;
+    const tagBitmaps = this.bitmapsByTag.get(tagId);
+    if (tagBitmaps) {
+      for (const [column, colBitmaps] of tagBitmaps) {
+        if (!meta.columns[column]) continue;
+        let count = 0;
+        for (const bm of colBitmaps.values()) {
+          if (!bm.isEmpty()) count++;
+        }
+        meta.columns[column].ndv = count;
       }
     }
 
-    // Update indexed status based on thresholds
     for (const [col, colMeta] of Object.entries(meta.columns)) {
       colMeta.indexed = this.shouldIndexColumn(col, meta);
+    }
+
+    this.dirtyMeta.add(tagId);
+  }
+
+  /**
+   * Recompute NDV for all known tags.
+   */
+  recomputeAllNDV(): void {
+    for (const [tagId, meta] of this.metaCache) {
+      this.recomputeNDV(tagId, meta);
     }
   }
 
@@ -456,23 +482,22 @@ export class BitmapIndex {
   /**
    * Compute Most Common Values for a column from bitmap cardinalities.
    * Returns the top-k (value, count) pairs sorted by count descending.
-   * Exact — no sketches needed.
    */
   getColumnMCV(
     tagId: number,
     column: string,
     topK: number = 10,
   ): { value: string; count: number }[] {
-    const prefix = `${tagId}\0${column}\0`;
-    const entries: { valueId: number; count: number }[] = [];
+    const colBitmaps = this.bitmapsByTag.get(tagId)?.get(column);
+    if (!colBitmaps) return [];
 
-    for (const [cacheKey, bm] of this.bitmapCache) {
-      if (!cacheKey.startsWith(prefix) || bm.isEmpty()) continue;
-      const valueId = parseInt(cacheKey.substring(prefix.length), 10);
-      entries.push({ valueId, count: bm.cardinality() });
+    const entries: { valueId: number; count: number }[] = [];
+    for (const [valueId, bm] of colBitmaps) {
+      if (!bm.isEmpty()) {
+        entries.push({ valueId, count: bm.cardinality() });
+      }
     }
 
-    // Sort descending by count, take top-k
     entries.sort((a, b) => b.count - a.count);
     const topEntries = entries.slice(0, topK);
 
@@ -499,25 +524,23 @@ export class BitmapIndex {
     const writes: KV[] = [];
     const deletes: KvKey[] = [];
 
-    // Flush dirty bitmaps
-    for (const cacheKey of this.dirtyBitmaps) {
-      const parts = cacheKey.split("\0");
+    for (const dirtyStr of this.dirtyBitmaps) {
+      const parts = dirtyStr.split("\0");
       const tagId = parseInt(parts[0], 10);
       const column = parts[1];
       const valueId = parseInt(parts[2], 10);
       const storageKey = this.bitmapStorageKey(tagId, column, valueId);
-      const bm = this.bitmapCache.get(cacheKey);
+      const bm = this.bitmapsByTag.get(tagId)?.get(column)?.get(valueId);
 
       if (!bm || bm.isEmpty()) {
         deletes.push(storageKey);
-        this.bitmapCache.delete(cacheKey);
+        this.bitmapsByTag.get(tagId)?.get(column)?.delete(valueId);
       } else {
         writes.push({ key: storageKey, value: bm.serialize() });
       }
     }
     this.dirtyBitmaps.clear();
 
-    // Flush dirty metadata
     for (const tagId of this.dirtyMeta) {
       const meta = this.metaCache.get(tagId);
       if (meta) {
@@ -526,7 +549,6 @@ export class BitmapIndex {
     }
     this.dirtyMeta.clear();
 
-    // Flush dictionary if dirty
     if (this.dict.dirty) {
       writes.push({ key: DICT_KEY, value: this.dict.toSnapshot() });
       this.dict.clearDirty();
@@ -552,8 +574,9 @@ export class BitmapIndex {
     valueId: number,
     data: Uint8Array,
   ): void {
-    const cacheKey = this.bitmapCacheKey(tagId, column, valueId);
-    this.bitmapCache.set(cacheKey, RoaringBitmap.deserialize(data));
+    const tagBitmaps = this.getOrCreateTagBitmaps(tagId);
+    const colBitmaps = this.getOrCreateColumnBitmaps(tagBitmaps, column);
+    colBitmaps.set(valueId, RoaringBitmap.deserialize(data));
   }
 
   /**
@@ -562,7 +585,7 @@ export class BitmapIndex {
   clear(): void {
     this.dict = new Dictionary();
     this.metaCache.clear();
-    this.bitmapCache.clear();
+    this.bitmapsByTag.clear();
     this.dirtyBitmaps.clear();
     this.dirtyMeta.clear();
   }
@@ -583,13 +606,13 @@ export class BitmapIndex {
 
   /**
    * Get all non-empty bitmaps for a (tag, column) pair — one per distinct value.
-   * Used by bitmap_query for ~= (inequality) pre-filtering.
    */
   getColumnBitmaps(tagId: number, column: string): RoaringBitmap[] {
-    const prefix = `${tagId}\0${column}\0`;
+    const colBitmaps = this.bitmapsByTag.get(tagId)?.get(column);
+    if (!colBitmaps) return [];
     const results: RoaringBitmap[] = [];
-    for (const [cacheKey, bm] of this.bitmapCache) {
-      if (cacheKey.startsWith(prefix) && !bm.isEmpty()) {
+    for (const bm of colBitmaps.values()) {
+      if (!bm.isEmpty()) {
         results.push(bm);
       }
     }
@@ -605,15 +628,16 @@ export class BitmapIndex {
     valueId: number,
     objectId: number,
   ): boolean {
-    const cacheKey = this.bitmapCacheKey(tagId, column, valueId);
-    let bm = this.bitmapCache.get(cacheKey);
+    const tagBitmaps = this.getOrCreateTagBitmaps(tagId);
+    const colBitmaps = this.getOrCreateColumnBitmaps(tagBitmaps, column);
+    let bm = colBitmaps.get(valueId);
     const wasEmpty = !bm || bm.isEmpty();
     if (!bm) {
       bm = new RoaringBitmap();
-      this.bitmapCache.set(cacheKey, bm);
+      colBitmaps.set(valueId, bm);
     }
     bm.add(objectId);
-    this.dirtyBitmaps.add(cacheKey);
+    this.dirtyBitmaps.add(this.dirtyKey(tagId, column, valueId));
     return wasEmpty;
   }
 
@@ -626,11 +650,12 @@ export class BitmapIndex {
     valueId: number,
     objectId: number,
   ): boolean {
-    const cacheKey = this.bitmapCacheKey(tagId, column, valueId);
-    const bm = this.bitmapCache.get(cacheKey);
+    const colBitmaps = this.bitmapsByTag.get(tagId)?.get(column);
+    if (!colBitmaps) return false;
+    const bm = colBitmaps.get(valueId);
     if (!bm) return false;
     bm.remove(objectId);
-    this.dirtyBitmaps.add(cacheKey);
+    this.dirtyBitmaps.add(this.dirtyKey(tagId, column, valueId));
     return bm.isEmpty();
   }
 }

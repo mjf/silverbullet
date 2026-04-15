@@ -5996,7 +5996,7 @@ do
     local _r = query [[
       from
         x = xs,
-        y = ys semi hash
+        y = ys semi loop
       select {
         id = x.id,
       }
@@ -6005,8 +6005,8 @@ do
 
   assertEquals(ok, false)
   assertTrue(
-    string.find(tostring(err), "semi join requires equi%-predicate or loop using predicate") ~= nil,
-    "expected semi join predicate error, got: " .. tostring(err)
+    string.find(tostring(err), "semi loop join requires using predicate") ~= nil,
+    "expected semi loop predicate error, got: " .. tostring(err)
   )
 end
 
@@ -6034,7 +6034,7 @@ do
 
   assertEquals(ok, false)
   assertTrue(
-    string.find(tostring(err), "anti join requires equi%-predicate or loop using predicate") ~= nil,
+    string.find(tostring(err), "anti loop join requires using predicate") ~= nil,
     "expected anti join predicate error, got: " .. tostring(err)
   )
 end

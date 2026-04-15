@@ -274,3 +274,99 @@ describe("Dictionary capacity", () => {
     }
   });
 });
+
+// encodeIfFits
+
+describe("Dictionary encodeIfFits", () => {
+  test("returns undefined for null", () => {
+    const d = new Dictionary();
+    expect(d.encodeIfFits(null, 256, 100)).toBeUndefined();
+  });
+
+  test("returns undefined for undefined", () => {
+    const d = new Dictionary();
+    expect(d.encodeIfFits(undefined, 256, 100)).toBeUndefined();
+  });
+
+  test("encodes short string and returns ID", () => {
+    const d = new Dictionary();
+    const id = d.encodeIfFits("hello", 256, 100);
+    expect(id).toBe(0);
+    expect(d.size).toBe(1);
+    expect(d.decodeValue(id!)).toBe("hello");
+  });
+
+  test("duplicate returns same ID without growing", () => {
+    const d = new Dictionary();
+    const id1 = d.encodeIfFits("x", 256, 100);
+    const id2 = d.encodeIfFits("x", 256, 100);
+    expect(id1).toBe(id2);
+    expect(d.size).toBe(1);
+  });
+
+  test("returns undefined when canonical length exceeds maxBytes", () => {
+    const d = new Dictionary();
+    const id = d.encodeIfFits("a".repeat(300), 10, 100);
+    expect(id).toBeUndefined();
+    expect(d.size).toBe(0);
+  });
+
+  test("returns undefined when dictionary is at capacity", () => {
+    const d = new Dictionary();
+    d.encodeIfFits("first", 256, 1);
+    expect(d.size).toBe(1);
+
+    const id = d.encodeIfFits("second", 256, 1);
+    expect(id).toBeUndefined();
+    expect(d.size).toBe(1);
+  });
+
+  test("returns existing ID even when at capacity", () => {
+    const d = new Dictionary();
+    const id = d.encodeIfFits("only", 256, 1);
+    expect(id).toBe(0);
+    // Already exists — returned even though dict is full
+    expect(d.encodeIfFits("only", 256, 1)).toBe(0);
+    expect(d.size).toBe(1);
+  });
+
+  test("sets dirty flag on new entry", () => {
+    const d = new Dictionary();
+    d.encodeIfFits("val", 256, 100);
+    expect(d.dirty).toBe(true);
+  });
+
+  test("does not set dirty on duplicate", () => {
+    const d = new Dictionary();
+    d.encodeIfFits("val", 256, 100);
+    d.clearDirty();
+    d.encodeIfFits("val", 256, 100);
+    expect(d.dirty).toBe(false);
+  });
+
+  test("does not set dirty when rejected", () => {
+    const d = new Dictionary();
+    d.encodeIfFits("too long", 1, 100);
+    expect(d.dirty).toBe(false);
+  });
+
+  test("IDs are consistent with encode()", () => {
+    const d = new Dictionary();
+    const id1 = d.encodeIfFits("a", 256, 100);
+    const id2 = d.encode("a");
+    const id3 = d.encode("b");
+    const id4 = d.encodeIfFits("b", 256, 100);
+    expect(id1).toBe(id2);
+    expect(id3).toBe(id4);
+  });
+
+  test("encodes numbers and booleans", () => {
+    const d = new Dictionary();
+    const idNum = d.encodeIfFits(42, 256, 100);
+    const idBool = d.encodeIfFits(true, 256, 100);
+    expect(idNum).toBeDefined();
+    expect(idBool).toBeDefined();
+    expect(d.decodeValue(idNum!)).toBe(42);
+    expect(d.decodeValue(idBool!)).toBe(true);
+  });
+});
