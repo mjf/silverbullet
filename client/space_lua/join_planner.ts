@@ -2647,19 +2647,6 @@ export function wrapPlanWithQueryOps(
     };
   }
 
-  if (query.distinct) {
-    root = {
-      nodeType: "Unique",
-      startupCost: root.startupCost,
-      estimatedCost: root.estimatedCost,
-      estimatedRows: Math.max(1, Math.round(root.estimatedRows * 0.8)),
-      estimatedWidth: root.estimatedWidth,
-      distinctSpec: true,
-      statsSource: root.statsSource,
-      children: [root],
-    };
-  }
-
   if (query.orderBy && query.orderBy.length > 0) {
     const keys = query.orderBy.map(
       (o) => exprToString(o.expr) + (o.desc ? " desc" : ""),
@@ -2675,6 +2662,19 @@ export function wrapPlanWithQueryOps(
       estimatedWidth: root.estimatedWidth,
       sortKeys: keys,
       orderBySpec: query.orderBy,
+      statsSource: root.statsSource,
+      children: [root],
+    };
+  }
+
+  if (query.distinct) {
+    root = {
+      nodeType: "Unique",
+      startupCost: root.startupCost,
+      estimatedCost: root.estimatedCost,
+      estimatedRows: Math.max(1, Math.round(root.estimatedRows * 0.8)),
+      estimatedWidth: root.estimatedWidth,
+      distinctSpec: true,
       statsSource: root.statsSource,
       children: [root],
     };
@@ -3140,8 +3140,9 @@ export async function executeAndInstrument(
   opts: ExplainOptions,
   config?: JoinPlannerConfig,
   overrides?: MaterializedSourceOverrides,
+  originMs?: number,
 ): Promise<LuaTable[]> {
-  const t0 = opts.analyze && opts.timing ? performance.now() : 0;
+  const t0 = originMs ?? (opts.analyze && opts.timing ? performance.now() : 0);
 
   if (tree.kind === "leaf") {
     const items = await materializeSource(tree.source, env, sf, overrides);
@@ -3164,6 +3165,7 @@ export async function executeAndInstrument(
     opts,
     config,
     overrides,
+    t0,
   );
   if (tree.right.kind !== "leaf") {
     throw new Error(
@@ -3176,10 +3178,10 @@ export async function executeAndInstrument(
   plan.children[1].actualRows = rightItems.length;
   plan.children[1].actualLoops = 1;
   if (opts.analyze && opts.timing) {
-    const rightElapsed =
-      Math.round((performance.now() - rightT0) * 1000) / 1000;
-    plan.children[1].actualStartupTimeMs = rightElapsed;
-    plan.children[1].actualTimeMs = rightElapsed;
+    plan.children[1].actualStartupTimeMs =
+      Math.round((rightT0 - t0) * 1000) / 1000;
+    plan.children[1].actualTimeMs =
+      Math.round((performance.now() - t0) * 1000) / 1000;
   }
 
   const joinT0 = opts.analyze && opts.timing ? performance.now() : 0;

@@ -1750,6 +1750,7 @@ export function evalExpression(
                 explainOpts,
                 plannerConfig,
                 materializedOverrides,
+                execT0,
               );
 
               const joinedCollection = toCollection(joinRows);
