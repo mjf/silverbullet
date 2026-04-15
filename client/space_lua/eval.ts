@@ -857,7 +857,7 @@ function wrapperNodeStageName(node: ExplainNode): QueryStageStat["stage"] | null
     case "Filter":
       return node.havingExpr ? "having" : node.whereExpr ? "where" : null;
     case "GroupAggregate":
-      return node.implicitGroup ? "select" : "groupBy";
+      return "groupBy";
     case "Project":
       return "select";
     case "Unique":
@@ -1170,6 +1170,9 @@ async function executeSingleSourceExplainAnalyze(
   }
 
   annotateExplainWrappersFromStageStats(plan, stageStats, t0, opts);
+
+console.log("stageStats:", stageStats.map(s => s.stage));
+console.log("wrapperNodes:", collectExplainWrapperNodes(plan).map(n => n.nodeType));
 
   plan.actualRows = finalRows.length;
   plan.actualLoops = 1;
