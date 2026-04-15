@@ -166,6 +166,7 @@ export type ExplainNodeType =
   | "Sort"
   | "Limit"
   | "GroupAggregate"
+  | "Project"
   | "Unique";
 
 export type ExplainNode = {
@@ -201,6 +202,9 @@ export type ExplainNode = {
   orderBySpec?: { expr: LuaExpression; desc: boolean }[];
   groupBySpec?: { expr: LuaExpression; alias?: string }[];
   distinctSpec?: boolean;
+
+  // Projection detail
+  outputColumns?: string[];
 
   // Aggregate detail
   aggregates?: AggregateDescription[];
@@ -2061,6 +2065,8 @@ function isExplicitlyScopedToSource(
               sourceNames,
               targetSource,
             );
+          default:
+            return false;
         }
       });
 
@@ -2373,6 +2379,125 @@ export function explainJoinTree(
   };
 }
 
+/**
+ * Extract output column descriptions from a select expression AST
+ *
+ * Respects the evaluation order: `PropField` and `DynamicField` in
+ * source order first, then `ExpressionField` (positional) entries
+ * as in the `evalExpressionWithAggregates`.
+ */
+function collectOutputColumns(expr: LuaExpression): string[] {
+  // Non-table select (e.g. `select p.name` → bare expression)
+  if (expr.type !== "TableConstructor") {
+    return [exprToString(expr)];
+  }
+
+  // Named/dynamic fields first (in source order), then positional
+  const named: string[] = [];
+  const positional: string[] = [];
+
+  for (const field of expr.fields) {
+    switch (field.type) {
+      case "PropField": {
+        const key = field.key;
+        const exprStr = exprToString(field.value);
+        const short = shortExprName(field.value);
+        if (key === short) {
+          named.push(key);
+        } else {
+          named.push(`${key} (${exprStr})`);
+        }
+        break;
+      }
+      case "DynamicField": {
+        const keyStr = exprToString(field.key);
+        const valStr = exprToString(field.value);
+        named.push(`[${keyStr}] (${valStr})`);
+        break;
+      }
+      case "ExpressionField": {
+        positional.push(exprToString(field.value));
+        break;
+      }
+    }
+  }
+
+  return [...named, ...positional];
+}
+
+// Short human-readable name for an expression (leaf identifier only)
+function shortExprName(expr: LuaExpression): string | undefined {
+  switch (expr.type) {
+    case "Variable":
+      return expr.name;
+    case "PropertyAccess":
+      return expr.property;
+    case "FunctionCall":
+      if (expr.prefix.type === "Variable") return expr.prefix.name;
+      if (expr.prefix.type === "PropertyAccess") return expr.prefix.property;
+      return undefined;
+    case "FilteredCall":
+      return shortExprName(expr.call);
+    case "AggregateCall":
+      return shortExprName(expr.call);
+    default:
+      return undefined;
+  }
+}
+
+// Well-known aggregate function names for AST-only detection.
+// Used in explain plan to determine implicit grouping when Config
+// is not available.
+const KNOWN_AGGREGATE_NAMES = new Set([
+  "count", "sum", "avg", "min", "max",
+  "array_agg", "string_agg", "group_concat",
+  "bool_and", "bool_or", "every",
+  "percentile_cont", "percentile_disc",
+  "json_agg", "json_object_agg",
+]);
+
+/**
+ * Check if an expression contains aggregate calls using AST node types
+ * and a set of well-known aggregate names.
+ */
+function selectContainsAggregate(expr: LuaExpression): boolean {
+  switch (expr.type) {
+    case "FilteredCall":
+      return true;
+    case "AggregateCall":
+      return true;
+    case "FunctionCall":
+      if (
+        expr.prefix.type === "Variable" &&
+        KNOWN_AGGREGATE_NAMES.has(expr.prefix.name)
+      ) {
+        return true;
+      }
+      return expr.args.some(selectContainsAggregate);
+    case "TableConstructor":
+      return expr.fields.some((f) => {
+        switch (f.type) {
+          case "PropField":
+          case "ExpressionField":
+            return selectContainsAggregate(f.value);
+          case "DynamicField":
+            return selectContainsAggregate(f.value);
+        }
+      });
+    case "Binary":
+      return (
+        selectContainsAggregate(expr.left) ||
+        selectContainsAggregate(expr.right)
+      );
+    case "Unary":
+      return selectContainsAggregate(expr.argument);
+    case "Parenthesized":
+      return selectContainsAggregate(expr.expression);
+    default:
+      return false;
+  }
+}
+
 export function wrapPlanWithQueryOps(
   plan: ExplainNode,
   query: {
@@ -2454,6 +2579,45 @@ export function wrapPlanWithQueryOps(
       filterExpr: exprToString(query.having),
       havingExpr: query.having,
       filterType: "having",
+      statsSource: root.statsSource,
+      children: [root],
+    };
+  }
+
+  // Implicit whole-table aggregate: select contains aggregates but
+  // there is no explicit group by.  Mirrors the implicit single-group
+  // detection in applyQuery.
+  const hasExplicitGroupBy = query.groupBy && query.groupBy.length > 0;
+  const isImplicitAggregate = query.select &&
+    !hasExplicitGroupBy &&
+    !query.groupBy &&
+    selectContainsAggregate(query.select);
+
+  if (isImplicitAggregate) {
+    const cols = collectOutputColumns(query.select!);
+    const aggDescs = collectAggregateDescriptions(query.select!);
+    root = {
+      nodeType: "GroupAggregate",
+      startupCost: root.estimatedCost,
+      estimatedCost: root.estimatedCost + root.estimatedRows,
+      estimatedRows: 1,
+      estimatedWidth: cols.length > 0 ? cols.length : root.estimatedWidth,
+      sortKeys: [],
+      outputColumns: cols,
+      aggregates: aggDescs.length > 0 ? aggDescs : undefined,
+      implicitGroup: true,
+      statsSource: root.statsSource,
+      children: [root],
+    };
+  } else if (query.select) {
+    const cols = collectOutputColumns(query.select);
+    root = {
+      nodeType: "Project",
+      startupCost: root.startupCost,
+      estimatedCost: root.estimatedCost + root.estimatedRows,
+      estimatedRows: root.estimatedRows,
+      estimatedWidth: cols.length > 0 ? cols.length : root.estimatedWidth,
+      outputColumns: cols,
       statsSource: root.statsSource,
       children: [root],
     };
@@ -3272,5 +3436,9 @@ function formatNodeLabel(node: ExplainNode): string {
       return "Group Aggregate";
     case "Unique":
       return "Unique";
+    case "Project":
+      return "Project";
+    default:
+      return node.nodeType;
   }
 }

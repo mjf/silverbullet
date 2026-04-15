@@ -820,6 +820,7 @@ function unwrapToJoinPlan(node: ExplainNode): ExplainNode {
     node.nodeType === "Sort" ||
     node.nodeType === "GroupAggregate" ||
     node.nodeType === "Filter" ||
+    node.nodeType === "Project" ||
     node.nodeType === "Unique"
   ) {
     return unwrapToJoinPlan(node.children[0]);
@@ -838,6 +839,7 @@ function collectExplainWrapperNodes(plan: ExplainNode): ExplainNode[] {
     switch (node.nodeType) {
       case "Filter":
       case "GroupAggregate":
+      case "Project":
       case "Unique":
       case "Sort":
       case "Limit":
@@ -855,7 +857,9 @@ function wrapperNodeStageName(node: ExplainNode): QueryStageStat["stage"] | null
     case "Filter":
       return node.havingExpr ? "having" : node.whereExpr ? "where" : null;
     case "GroupAggregate":
-      return "groupBy";
+      return node.implicitGroup ? "select" : "groupBy";
+    case "Project":
+      return "select";
     case "Unique":
       return "distinct";
     case "Sort":
@@ -960,6 +964,7 @@ async function buildExplainQueryShape(
         explainQuery.having = clause.expression;
         break;
       case "Select":
+        explainQuery.select = fieldsToExpression(clause.fields, clause.ctx);
         explainQuery.distinct = clause.distinct !== false;
         break;
     }
