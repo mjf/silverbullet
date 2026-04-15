@@ -2436,7 +2436,7 @@ function shortExprName(expr: LuaExpression): string | undefined {
     case "Variable":
       return expr.name;
     case "PropertyAccess":
-      return expr.property;
+      return exprToString(expr);
     case "FunctionCall":
       if (expr.prefix.type === "Variable") return expr.prefix.name;
       if (expr.prefix.type === "PropertyAccess") return expr.prefix.property;

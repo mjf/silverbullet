@@ -725,6 +725,9 @@ function deriveFieldName(e: LuaExpression): string | undefined {
     case "Variable":
       return e.name;
     case "PropertyAccess":
+      if (e.object.type === "Variable") {
+        return `${e.object.name}.${e.property}`;
+      }
       return e.property;
     case "FunctionCall":
       if (e.name) return e.name;
