@@ -852,7 +852,9 @@ function collectExplainWrapperNodes(plan: ExplainNode): ExplainNode[] {
   return nodes;
 }
 
-function wrapperNodeStageName(node: ExplainNode): QueryStageStat["stage"] | null {
+function wrapperNodeStageName(
+  node: ExplainNode,
+): QueryStageStat["stage"] | null {
   switch (node.nodeType) {
     case "Filter":
       return node.havingExpr ? "having" : node.whereExpr ? "where" : null;
@@ -936,6 +938,8 @@ async function buildExplainQueryShape(
         explainQuery.orderBy = clause.orderBy.map((o) => ({
           expr: o.expression,
           desc: o.direction === "desc",
+          nulls: o.nulls,
+          using: o.using,
         }));
         break;
       case "Limit": {
@@ -1099,14 +1103,16 @@ function shouldTrustSingleSourceIndexRowCount(
   ) => Promise<any[]>;
   isTagIndexTrusted: () => Promise<boolean>;
 } {
-  return !!stats &&
+  return (
+    !!stats &&
     stats.statsSource === "persisted-complete" &&
     !!collection &&
     typeof collection === "object" &&
     "query" in collection &&
     typeof (collection as any).query === "function" &&
     "isTagIndexTrusted" in collection &&
-    typeof (collection as any).isTagIndexTrusted === "function";
+    typeof (collection as any).isTagIndexTrusted === "function"
+  );
 }
 
 async function executeSingleSourceExplainAnalyze(
@@ -1167,9 +1173,10 @@ async function executeSingleSourceExplainAnalyze(
 
   if (opts.timing) {
     // Use the earliest stage stat start time as the scan end boundary
-    const scanEndMs = stageStats.length > 0
-      ? Math.round((stageStats[0].startTimeMs - t0) * 1000) / 1000
-      : Math.round((performance.now() - t0) * 1000) / 1000;
+    const scanEndMs =
+      stageStats.length > 0
+        ? Math.round((stageStats[0].startTimeMs - t0) * 1000) / 1000
+        : Math.round((performance.now() - t0) * 1000) / 1000;
     scanPlan.actualStartupTimeMs = 0;
     scanPlan.actualTimeMs = scanEndMs;
   }
@@ -1693,6 +1700,8 @@ export function evalExpression(
                   orderByClauseForValidation?.orderBy.map((o) => ({
                     expr: o.expression,
                     desc: o.direction === "desc",
+                    nulls: o.nulls,
+                    using: o.using,
                   })) ?? undefined,
               },
               sf,
@@ -1783,11 +1792,18 @@ export function evalExpression(
                     break;
                   }
                   case "Select": {
-                    analyzeQuery.select = fieldsToExpression(clause.fields, clause.ctx);
+                    analyzeQuery.select = fieldsToExpression(
+                      clause.fields,
+                      clause.ctx,
+                    );
                     break;
                   }
                   case "Limit": {
-                    const limitVal = await evalExpression(clause.limit, env, sf);
+                    const limitVal = await evalExpression(
+                      clause.limit,
+                      env,
+                      sf,
+                    );
                     analyzeQuery.limit = Number(limitVal);
                     if (clause.offset) {
                       const offsetVal = await evalExpression(
@@ -1809,7 +1825,9 @@ export function evalExpression(
                     break;
                   }
                   case "GroupBy": {
-                    analyzeQuery.groupBy = fieldsToGroupByEntries(clause.fields);
+                    analyzeQuery.groupBy = fieldsToGroupByEntries(
+                      clause.fields,
+                    );
                     break;
                   }
                   case "Having": {

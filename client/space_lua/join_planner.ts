@@ -199,7 +199,12 @@ export type ExplainNode = {
   // Wrapper plan metadata
   whereExpr?: LuaExpression;
   havingExpr?: LuaExpression;
-  orderBySpec?: { expr: LuaExpression; desc: boolean }[];
+  orderBySpec?: {
+    expr: LuaExpression;
+    desc: boolean;
+    nulls?: "first" | "last";
+    using?: string;
+  }[];
   groupBySpec?: { expr: LuaExpression; alias?: string }[];
   distinctSpec?: boolean;
 
@@ -2513,7 +2518,12 @@ function selectContainsAggregate(expr: LuaExpression): boolean {
 export function wrapPlanWithQueryOps(
   plan: ExplainNode,
   query: {
-    orderBy?: { expr: LuaExpression; desc: boolean }[];
+    orderBy?: {
+      expr: LuaExpression;
+      desc: boolean;
+      nulls?: "first" | "last";
+      using?: string | LuaFunctionBody;
+    }[];
     limit?: number;
     offset?: number;
     groupBy?: { expr: LuaExpression; alias?: string }[];
@@ -2612,7 +2622,8 @@ export function wrapPlanWithQueryOps(
   // there is no explicit group by.  Mirrors the implicit single-group
   // detection in applyQuery.
   const hasExplicitGroupBy = query.groupBy && query.groupBy.length > 0;
-  const isImplicitAggregate = query.select &&
+  const isImplicitAggregate =
+    query.select &&
     !hasExplicitGroupBy &&
     selectContainsAggregate(query.select);
 
@@ -2676,9 +2687,15 @@ export function wrapPlanWithQueryOps(
   }
 
   if (query.orderBy && query.orderBy.length > 0) {
-    const keys = query.orderBy.map(
-      (o) => exprToString(o.expr) + (o.desc ? " desc" : ""),
-    );
+    const keys = query.orderBy.map((o) => {
+      let s = exprToString(o.expr);
+      if (o.desc) s += " desc";
+      if (o.using) {
+        s += ` using ${typeof o.using === "string" ? o.using : "<function>"}`;
+      }
+      if (o.nulls) s += ` nulls ${o.nulls}`;
+      return s;
+    });
     const nLogN =
       root.estimatedRows *
       Math.ceil(Math.log2(Math.max(2, root.estimatedRows)));
@@ -2689,7 +2706,17 @@ export function wrapPlanWithQueryOps(
       estimatedRows: root.estimatedRows,
       estimatedWidth: root.estimatedWidth,
       sortKeys: keys,
-      orderBySpec: query.orderBy,
+      orderBySpec: query.orderBy.map((o) => ({
+        expr: o.expr,
+        desc: o.desc,
+        nulls: o.nulls,
+        using:
+          typeof o.using === "string"
+            ? o.using
+            : o.using
+              ? "<function>"
+              : undefined,
+      })),
       statsSource: root.statsSource,
       children: [root],
     };
@@ -2881,7 +2908,12 @@ export function validatePostJoinSourceReferences(
     groupBy?: { expr: LuaExpression; alias?: string }[];
     having?: LuaExpression;
     select?: LuaExpression;
-    orderBy?: { expr: LuaExpression; desc: boolean }[];
+    orderBy?: {
+      expr: LuaExpression;
+      desc: boolean;
+      nulls?: "first" | "last";
+      using?: string | LuaFunctionBody;
+    }[];
   },
   sf: LuaStackFrame,
 ): void {
@@ -2948,6 +2980,24 @@ export function exprToString(expr: LuaExpression): string {
       const args = expr.args.map(exprToString).join(", ");
       return `${prefix}(${args})`;
     }
+    case "FilteredCall": {
+      const call = exprToString(expr.call);
+      const filter = exprToString(expr.filter);
+      return `${call} filter(where ${filter})`;
+    }
+    case "AggregateCall": {
+      const call = exprToString(expr.call);
+      const ob = expr.orderBy
+        .map(
+          (o: any) =>
+            exprToString(o.expression) +
+            (o.direction === "desc" ? " desc" : ""),
+        )
+        .join(", ");
+      return `${call} order by ${ob}`;
+    }
+    case "Parenthesized":
+      return `(${exprToString(expr.expression)})`;
     case "TableAccess":
       return `${exprToString(expr.object)}[${exprToString(expr.key)}]`;
     default:
@@ -3505,12 +3555,14 @@ function formatNodeLabel(node: ExplainNode): string {
     case "Limit":
       return "Limit";
     case "GroupAggregate":
-      return node.implicitGroup ? "Group Aggregate (implicit)" : "Group Aggregate";
+      return node.implicitGroup
+        ? "Implicit Group Aggregate"
+        : "Group Aggregate";
     case "Unique":
       return "Unique";
     case "Project": {
       const isImplicit = node.implicitGroup === false;
-      return isImplicit ? "Project (implicit)" : "Project";
+      return isImplicit ? "Implicit Project" : "Project";
     }
     default:
       return node.nodeType;
