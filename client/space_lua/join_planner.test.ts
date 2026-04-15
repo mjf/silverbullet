@@ -77,8 +77,12 @@ describe("wrapPlanWithQueryOps group NDV", () => {
       accumulatedNdv,
     );
 
-    expect(wrapped.nodeType).toBe("GroupAggregate");
-    expect(wrapped.estimatedRows).toBe(37);
+    // Top node is now the implicit Project wrapping the GroupAggregate
+    expect(wrapped.nodeType).toBe("Project");
+    expect(wrapped.children.length).toBe(1);
+    const groupNode = wrapped.children[0];
+    expect(groupNode.nodeType).toBe("GroupAggregate");
+    expect(groupNode.estimatedRows).toBe(37);
   });
 
   it("falls back to leaf source NDV when accumulated NDV is absent", () => {
@@ -125,7 +129,11 @@ describe("wrapPlanWithQueryOps group NDV", () => {
       undefined,
     );
 
-    expect(wrapped.nodeType).toBe("GroupAggregate");
-    expect(wrapped.estimatedRows).toBe(42);
+    // Top node is now the implicit Project wrapping the GroupAggregate
+    expect(wrapped.nodeType).toBe("Project");
+    expect(wrapped.children.length).toBe(1);
+    const groupNode = wrapped.children[0];
+    expect(groupNode.nodeType).toBe("GroupAggregate");
+    expect(groupNode.estimatedRows).toBe(42);
   });
 });

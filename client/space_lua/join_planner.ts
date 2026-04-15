@@ -2612,8 +2612,7 @@ export function wrapPlanWithQueryOps(
   // there is no explicit group by.  Mirrors the implicit single-group
   // detection in applyQuery.
   const hasExplicitGroupBy = query.groupBy && query.groupBy.length > 0;
-  const isImplicitAggregate =
-    query.select &&
+  const isImplicitAggregate = query.select &&
     !hasExplicitGroupBy &&
     selectContainsAggregate(query.select);
 
@@ -2633,7 +2632,11 @@ export function wrapPlanWithQueryOps(
       statsSource: root.statsSource,
       children: [root],
     };
-  } else if (query.select) {
+  }
+
+  // Always emit a Project node so the user sees what columns are produced.
+  // When there is no explicit `select`, the projection is implicit (select *).
+  if (query.select) {
     const cols = collectOutputColumns(query.select);
     root = {
       nodeType: "Project",
@@ -2642,6 +2645,31 @@ export function wrapPlanWithQueryOps(
       estimatedRows: root.estimatedRows,
       estimatedWidth: cols.length > 0 ? cols.length : root.estimatedWidth,
       outputColumns: cols,
+      statsSource: root.statsSource,
+      children: [root],
+    };
+  } else {
+    // Infer column names from source stats NDV keys when available
+    let implicitCols: string[] = ["*"];
+    if (sourceStats && sourceStats.size > 0) {
+      const allColumns = new Set<string>();
+      for (const stats of sourceStats.values()) {
+        for (const col of stats.ndv.keys()) {
+          allColumns.add(col);
+        }
+      }
+      if (allColumns.size > 0) {
+        implicitCols = [...allColumns].sort();
+      }
+    }
+    root = {
+      nodeType: "Project",
+      startupCost: root.startupCost,
+      estimatedCost: root.estimatedCost,
+      estimatedRows: root.estimatedRows,
+      estimatedWidth: root.estimatedWidth,
+      outputColumns: implicitCols,
+      implicitGroup: false,
       statsSource: root.statsSource,
       children: [root],
     };
@@ -3317,7 +3345,7 @@ function formatNode(
     );
   }
 
-  if (node.sortKeys) {
+  if (node.sortKeys && node.sortKeys.length > 0) {
     const keyLabel =
       node.nodeType === "GroupAggregate" ? "Group Key" : "Sort Key";
     lines.push(`${detailPad}${keyLabel}: ${node.sortKeys.join(", ")}`);
@@ -3477,11 +3505,13 @@ function formatNodeLabel(node: ExplainNode): string {
     case "Limit":
       return "Limit";
     case "GroupAggregate":
-      return "Group Aggregate";
+      return node.implicitGroup ? "Group Aggregate (implicit)" : "Group Aggregate";
     case "Unique":
       return "Unique";
-    case "Project":
-      return "Project";
+    case "Project": {
+      const isImplicit = node.implicitGroup === false;
+      return isImplicit ? "Project (implicit)" : "Project";
+    }
     default:
       return node.nodeType;
   }
