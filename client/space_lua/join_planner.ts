@@ -2405,14 +2405,14 @@ function collectOutputColumns(expr: LuaExpression): string[] {
         if (key === short) {
           named.push(key);
         } else {
-          named.push(`${key} (${exprStr})`);
+          named.push(`${key} = ${exprStr}`);
         }
         break;
       }
       case "DynamicField": {
         const keyStr = exprToString(field.key);
         const valStr = exprToString(field.value);
-        named.push(`[${keyStr}] (${valStr})`);
+        named.push(`[${keyStr}] = ${valStr}`);
         break;
       }
       case "ExpressionField": {
@@ -2449,11 +2449,21 @@ function shortExprName(expr: LuaExpression): string | undefined {
 // Used in explain plan to determine implicit grouping when Config
 // is not available.
 const KNOWN_AGGREGATE_NAMES = new Set([
-  "count", "sum", "avg", "min", "max",
-  "array_agg", "string_agg", "group_concat",
-  "bool_and", "bool_or", "every",
-  "percentile_cont", "percentile_disc",
-  "json_agg", "json_object_agg",
+  "count",
+  "sum",
+  "avg",
+  "min",
+  "max",
+  "array_agg",
+  "string_agg",
+  "group_concat",
+  "bool_and",
+  "bool_or",
+  "every",
+  "percentile_cont",
+  "percentile_disc",
+  "json_agg",
+  "json_object_agg",
 ]);
 
 /**
@@ -2481,7 +2491,9 @@ function selectContainsAggregate(expr: LuaExpression): boolean {
           case "ExpressionField":
             return selectContainsAggregate(f.value);
           case "DynamicField":
-            return selectContainsAggregate(f.value);
+            return (
+              selectContainsAggregate(f.key) || selectContainsAggregate(f.value)
+            );
         }
       });
     case "Binary":
@@ -2554,6 +2566,18 @@ export function wrapPlanWithQueryOps(
       aggDescs.push(...collectAggregateDescriptions(query.having));
     }
 
+    const seen = new Set<string>();
+    const uniqueAggs: AggregateDescription[] = [];
+    for (const agg of aggDescs) {
+      let sig = `${agg.name}(${agg.args})`;
+      if (agg.filter) sig += ` filter(${agg.filter})`;
+      if (agg.orderBy) sig += ` order by ${agg.orderBy}`;
+      if (!seen.has(sig)) {
+        seen.add(sig);
+        uniqueAggs.push(agg);
+      }
+    }
+
     root = {
       nodeType: "GroupAggregate",
       startupCost: root.estimatedCost,
@@ -2562,7 +2586,7 @@ export function wrapPlanWithQueryOps(
       estimatedWidth: root.estimatedWidth,
       sortKeys: keys,
       groupBySpec: query.groupBy,
-      aggregates: aggDescs.length > 0 ? aggDescs : undefined,
+      aggregates: uniqueAggs.length > 0 ? uniqueAggs : undefined,
       implicitGroup: query.groupBy.length === 0 ? true : undefined,
       statsSource: root.statsSource,
       children: [root],
@@ -2588,9 +2612,9 @@ export function wrapPlanWithQueryOps(
   // there is no explicit group by.  Mirrors the implicit single-group
   // detection in applyQuery.
   const hasExplicitGroupBy = query.groupBy && query.groupBy.length > 0;
-  const isImplicitAggregate = query.select &&
+  const isImplicitAggregate =
+    query.select &&
     !hasExplicitGroupBy &&
-    !query.groupBy &&
     selectContainsAggregate(query.select);
 
   if (isImplicitAggregate) {
@@ -3013,10 +3037,10 @@ function walkAggregates(
       return;
     }
     case "FunctionCall": {
-      // Plain aggregate call (no filter, no intra-aggregate order by)
-      if (expr.prefix.type === "Variable") {
-        // Could be an aggregate — we collect it; the consumer can
-        // cross-check against the aggregate registry if needed.
+      if (
+        expr.prefix.type === "Variable" &&
+        KNOWN_AGGREGATE_NAMES.has(expr.prefix.name)
+      ) {
         const args = expr.args.map(exprToString).join(", ");
         const desc: AggregateDescription = { name: expr.prefix.name, args };
         if (expr.orderBy && expr.orderBy.length > 0) {
@@ -3031,6 +3055,7 @@ function walkAggregates(
         out.push(desc);
         return;
       }
+      // Non-aggregate function: recurse into prefix and args
       walkAggregates(expr.prefix, out);
       for (const arg of expr.args) {
         walkAggregates(arg, out);
@@ -3298,6 +3323,19 @@ function formatNode(
 
   if (node.outputColumns && node.outputColumns.length > 0) {
     lines.push(`${detailPad}Output: ${node.outputColumns.join(", ")}`);
+  }
+
+  if (node.implicitGroup) {
+    lines.push(`${detailPad}Grouping: whole-table aggregate`);
+  }
+
+  if (opts.verbose && node.aggregates && node.aggregates.length > 0) {
+    for (const agg of node.aggregates) {
+      let desc = `${agg.name}(${agg.args})`;
+      if (agg.filter) desc += ` filter(${agg.filter})`;
+      if (agg.orderBy) desc += ` order by ${agg.orderBy}`;
+      lines.push(`${detailPad}Aggregate: ${desc}`);
+    }
   }
 
   if (node.limitCount !== undefined) {
