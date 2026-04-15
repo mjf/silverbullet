@@ -7,6 +7,7 @@ import {
   type LuaQueryCollection,
   type LuaQueryCollectionWithStats,
   type CollectionStats,
+  type QueryInstrumentation,
 } from "../space_lua/query_collection.ts";
 import {
   jsToLuaValue,
@@ -341,6 +342,7 @@ export class ObjectIndex {
         env: LuaEnv,
         sf: LuaStackFrame,
         config?: Config,
+        instrumentation?: QueryInstrumentation,
       ): Promise<ObjectValue<any>[]> {
         const bitmapPredicate = extractBitmapPredicate(
           query.where,
@@ -357,7 +359,7 @@ export class ObjectIndex {
               tagName,
               objectIds,
             );
-            return applyQuery(prefetched, query, env, sf, config);
+            return applyQuery(prefetched, query, env, sf, config, instrumentation);
           }
         }
 
@@ -370,7 +372,7 @@ export class ObjectIndex {
           ) as ObjectValue<any>;
           results.push(self.enrichValue(tagName, decoded));
         }
-        return applyQuery(results, query, env, sf, config);
+        return applyQuery(results, query, env, sf, config, instrumentation);
       },
 
       async isTagIndexTrusted(): Promise<boolean> {
@@ -587,6 +589,7 @@ export class ObjectIndex {
         env: LuaEnv,
         sf: LuaStackFrame,
         config?: Config,
+        instrumentation?: QueryInstrumentation,
       ): Promise<any[]> {
         const varName = query.objectVariable || "_";
         const filter = parseExpressionString(buildFilterExpr(varName));
@@ -607,7 +610,7 @@ export class ObjectIndex {
           const decoded = self.bitmapIndex.decodeObject(value as EncodedObject);
           results.push(self.enrichValue(tagName, decoded));
         }
-        return applyQuery(results, { ...query, where }, env, sf, config);
+        return applyQuery(results, { ...query, where }, env, sf, config, instrumentation);
       },
     };
   }

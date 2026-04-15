@@ -1159,20 +1159,20 @@ async function executeSingleSourceExplainAnalyze(
     instrumentation,
   );
 
+  annotateExplainWrappersFromStageStats(plan, stageStats, t0, opts);
+
   const scanPlan = unwrapToJoinPlan(plan);
   scanPlan.actualRows = baseRowCount;
   scanPlan.actualLoops = 1;
 
   if (opts.timing) {
-    const elapsed = Math.round((performance.now() - t0) * 1000) / 1000;
+    // Use the earliest stage stat start time as the scan end boundary
+    const scanEndMs = stageStats.length > 0
+      ? Math.round((stageStats[0].startTimeMs - t0) * 1000) / 1000
+      : Math.round((performance.now() - t0) * 1000) / 1000;
     scanPlan.actualStartupTimeMs = 0;
-    scanPlan.actualTimeMs = elapsed;
+    scanPlan.actualTimeMs = scanEndMs;
   }
-
-  annotateExplainWrappersFromStageStats(plan, stageStats, t0, opts);
-
-console.log("stageStats:", stageStats.map(s => s.stage));
-console.log("wrapperNodes:", collectExplainWrapperNodes(plan).map(n => n.nodeType));
 
   plan.actualRows = finalRows.length;
   plan.actualLoops = 1;
