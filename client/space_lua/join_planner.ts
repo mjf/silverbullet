@@ -20,23 +20,28 @@ import {
   singleResult,
 } from "./runtime.ts";
 import { MCVList } from "./mcv.ts";
+import type { Config } from "../config.ts";
 
 // 1. Constants
 
 const DEFAULT_WATCHDOG_LIMIT = 5e5;
 const DEFAULT_YIELD_CHUNK = 5000;
-const DEFAULT_SELECTIVITY = 0.01;
 const DEFAULT_SMALL_TABLE_THRESHOLD = 20;
 const DEFAULT_RANGE_SELECTIVITY = 0.33;
 const DEFAULT_MERGE_JOIN_THRESHOLD = 200;
 const DEFAULT_WIDTH_WEIGHT = 1;
 const DEFAULT_CANDIDATE_WIDTH_WEIGHT = 2;
-
-/** Fallback row estimate when a source has no stats */
 const DEFAULT_ESTIMATED_ROWS = 100;
-
-/** Fallback average column count when a source has no stats */
 const DEFAULT_ESTIMATED_WIDTH = 5;
+const DEFAULT_SEMI_ANTI_LOOP_DISCOUNT = 0.5;
+const DEFAULT_PARTIAL_STATS_CONFIDENCE = 0.25;
+const DEFAULT_APPROXIMATE_STATS_CONFIDENCE = 0.5;
+const DEFAULT_BITMAP_SCAN_PENALTY = 0.6;
+const DEFAULT_INDEX_SCAN_NO_PUSHDOWN_PENALTY = 2.0;
+const DEFAULT_KV_SCAN_PENALTY = 1.4;
+const DEFAULT_FILTER_SELECTIVITY = 0.5;
+const DEFAULT_DISTINCT_SURVIVAL_RATIO = 0.8;
+const DEFAULT_INFERRED_NDV_DIVISOR = 2;
 
 // 2. Config types and accessors
 
@@ -49,6 +54,16 @@ export type JoinPlannerConfig = {
   mergeJoinThreshold?: number;
   widthWeight?: number;
   candidateWidthWeight?: number;
+  semiAntiLoopDiscount?: number;
+  partialStatsConfidence?: number;
+  approximateStatsConfidence?: number;
+  bitmapScanPenalty?: number;
+  indexScanNoPushdownPenalty?: number;
+  kvScanPenalty?: number;
+  defaultFilterSelectivity?: number;
+  defaultDistinctSurvivalRatio?: number;
+  defaultRangeSelectivity?: number;
+  inferredNdvDivisor?: number;
 };
 
 function getWatchdogLimit(config?: JoinPlannerConfig): number {
@@ -88,6 +103,73 @@ function getCandidateWidthWeight(config?: JoinPlannerConfig): number {
   return finiteNumberOrDefault(
     config?.candidateWidthWeight,
     DEFAULT_CANDIDATE_WIDTH_WEIGHT,
+  );
+}
+
+function getSemiAntiLoopDiscount(config?: JoinPlannerConfig): number {
+  return finiteNumberOrDefault(
+    config?.semiAntiLoopDiscount,
+    DEFAULT_SEMI_ANTI_LOOP_DISCOUNT,
+  );
+}
+
+function getPartialStatsConfidence(config?: JoinPlannerConfig): number {
+  return finiteNumberOrDefault(
+    config?.partialStatsConfidence,
+    DEFAULT_PARTIAL_STATS_CONFIDENCE,
+  );
+}
+
+function getApproximateStatsConfidence(config?: JoinPlannerConfig): number {
+  return finiteNumberOrDefault(
+    config?.approximateStatsConfidence,
+    DEFAULT_APPROXIMATE_STATS_CONFIDENCE,
+  );
+}
+
+function getBitmapScanPenalty(config?: JoinPlannerConfig): number {
+  return finiteNumberOrDefault(
+    config?.bitmapScanPenalty,
+    DEFAULT_BITMAP_SCAN_PENALTY,
+  );
+}
+
+function getIndexScanNoPushdownPenalty(config?: JoinPlannerConfig): number {
+  return finiteNumberOrDefault(
+    config?.indexScanNoPushdownPenalty,
+    DEFAULT_INDEX_SCAN_NO_PUSHDOWN_PENALTY,
+  );
+}
+
+function getKvScanPenalty(config?: JoinPlannerConfig): number {
+  return finiteNumberOrDefault(config?.kvScanPenalty, DEFAULT_KV_SCAN_PENALTY);
+}
+
+function getDefaultFilterSelectivity(config?: JoinPlannerConfig): number {
+  return finiteNumberOrDefault(
+    config?.defaultFilterSelectivity,
+    DEFAULT_FILTER_SELECTIVITY,
+  );
+}
+
+function getDefaultDistinctSurvivalRatio(config?: JoinPlannerConfig): number {
+  return finiteNumberOrDefault(
+    config?.defaultDistinctSurvivalRatio,
+    DEFAULT_DISTINCT_SURVIVAL_RATIO,
+  );
+}
+
+function getDefaultRangeSelectivity(config?: JoinPlannerConfig): number {
+  return finiteNumberOrDefault(
+    config?.defaultRangeSelectivity,
+    DEFAULT_RANGE_SELECTIVITY,
+  );
+}
+
+function getInferredNdvDivisor(config?: JoinPlannerConfig): number {
+  return finiteNumberOrDefault(
+    config?.inferredNdvDivisor,
+    DEFAULT_INFERRED_NDV_DIVISOR,
   );
 }
 
@@ -154,7 +236,17 @@ export type OpStats = {
 
 type JoinStatsSummary = "exact" | "approximate" | "partial" | "unknown";
 
-// 6. Explain types
+// 6. Shared query-clause types
+
+// Single entry in an ORDER BY clause, with optional extensions.
+export type OrderByEntry = {
+  expr: LuaExpression;
+  desc: boolean;
+  nulls?: "first" | "last";
+  using?: unknown;
+};
+
+// 7. Explain types
 
 export type ExplainNodeType =
   | "Scan"
@@ -259,7 +351,7 @@ export type ExplainResult = {
   executionTimeMs?: number;
 };
 
-// 7. Stats provenance helpers
+// 8. Stats provenance helpers
 
 function isPartialStatsSource(source: StatsSource | undefined): boolean {
   return source === "persisted-partial";
@@ -305,20 +397,21 @@ function canUseMcvForPlanning(
 function ndvConfidenceMultiplier(
   leftSource: StatsSource | undefined,
   rightSource: StatsSource | undefined,
+  config?: JoinPlannerConfig,
 ): number {
   if (isPartialStatsSource(leftSource) || isPartialStatsSource(rightSource)) {
-    return 0.25;
+    return getPartialStatsConfidence(config);
   }
   if (
     isApproximateStatsSource(leftSource) ||
     isApproximateStatsSource(rightSource)
   ) {
-    return 0.5;
+    return getApproximateStatsConfidence(config);
   }
   return 1.0;
 }
 
-// 8. Cardinality and selectivity estimation
+// 9. Cardinality and selectivity estimation
 
 function estimatedRows(s: JoinSource): number {
   return s.stats?.rowCount ?? DEFAULT_ESTIMATED_ROWS;
@@ -355,14 +448,16 @@ function estimateRangeSelectivity(
   rangePredicates: RangePredicate[],
   leftNames: Set<string>,
   rightName: string,
+  config?: JoinPlannerConfig,
 ): number {
   let sel = 1.0;
+  const rangeSel = getDefaultRangeSelectivity(config);
   for (const rp of rangePredicates) {
     if (
       (leftNames.has(rp.leftSource) && rp.rightSource === rightName) ||
       (leftNames.has(rp.rightSource) && rp.leftSource === rightName)
     ) {
-      sel *= DEFAULT_RANGE_SELECTIVITY;
+      sel *= rangeSel;
     }
   }
   return sel;
@@ -562,7 +657,6 @@ function propagateJoinMcv(
 
       const leftTracked = leftColMcv.trackedRowCount();
       const leftTotal = leftColMcv.totalCount();
-      // Use actual NDV from the map, fall back to trackedSize
       const leftColNdv =
         leftNdvMap?.get(equiPred.leftSource)?.get(equiPred.leftColumn) ??
         leftColMcv.trackedSize();
@@ -669,6 +763,7 @@ function estimateJoinWithCandidate(
   rangePreds?: RangePredicate[],
   joinType: JoinType = "inner",
   leftStatsSource?: StatsSource,
+  config?: JoinPlannerConfig,
 ): { selectivity: number; equiPred?: EquiPredicate; outputRows: number } {
   const equiPred = findEquiPredBetweenSets(
     joinedNames,
@@ -690,15 +785,17 @@ function estimateJoinWithCandidate(
     );
     const observedRightNdv = candidate.stats?.ndv?.get(equiPred.rightColumn);
 
+    const ndvDivisor = getInferredNdvDivisor(config);
     const inferredLeftNdv = Math.max(1, Math.min(joinedRows, candidateRows));
     const inferredRightNdv = Math.max(
       1,
-      Math.min(joinedRows, Math.ceil(candidateRows / 2)),
+      Math.min(joinedRows, Math.ceil(candidateRows / ndvDivisor)),
     );
 
     const confidence = ndvConfidenceMultiplier(
       leftStatsSource,
       rightStatsSource,
+      config,
     );
 
     const leftNdv = observedLeftNdv ?? inferredLeftNdv;
@@ -769,7 +866,7 @@ function estimateJoinWithCandidate(
   }
 
   const rangeSel = rangePreds
-    ? estimateRangeSelectivity(rangePreds, joinedNames, candidate.name)
+    ? estimateRangeSelectivity(rangePreds, joinedNames, candidate.name, config)
     : 1.0;
 
   outputRows *= rangeSel;
@@ -785,7 +882,7 @@ function estimateJoinWithCandidate(
   return { selectivity: combinedSel, equiPred, outputRows };
 }
 
-// 9. Join cost model
+// 10. Join cost model
 
 type JoinCost = {
   startupCost: number;
@@ -825,13 +922,13 @@ function computeJoinCost(
   }
 
   const startupCost = leftCost;
-  const discount = joinType === "inner" ? 1.0 : 0.5;
+  const discount = joinType === "inner" ? 1.0 : getSemiAntiLoopDiscount(config);
   const totalCost =
     leftCost + leftRows * rightRows * discount * (ww * lw + cww * rw);
   return { startupCost, totalCost };
 }
 
-// 10. Join tree construction
+// 11. Join tree construction
 
 export function buildJoinTree(
   sources: JoinSource[],
@@ -878,6 +975,7 @@ export function buildJoinTree(
       rangePreds,
       jt,
       accStatsSource,
+      config,
     );
 
     let method = selectPhysicalOperator(
@@ -889,7 +987,6 @@ export function buildJoinTree(
       config,
     );
 
-    // Without equi-predicate degrade to cross
     if (!equiPred && method !== "loop") {
       method = "loop";
     }
@@ -1015,10 +1112,11 @@ function orderSources(
         rangePreds,
         joinType,
         joinedStatsSource,
+        config,
       );
 
       const candidateWidth = clampWidth(estimatedWidth(candidate));
-      const candidatePenalty = executionScanPenalty(candidate);
+      const candidatePenalty = executionScanPenalty(candidate, config);
 
       const cost =
         (outputRows + estimatedRows(candidate)) *
@@ -1082,23 +1180,26 @@ function orderSources(
   return ordered;
 }
 
-function executionScanPenalty(source: JoinSource): number {
+function executionScanPenalty(
+  source: JoinSource,
+  config?: JoinPlannerConfig,
+): number {
   const caps = source.stats?.executionCapabilities;
   if (!caps) return 1.0;
 
   if (caps.predicatePushdown === "bitmap-basic") {
-    return 0.6;
+    return getBitmapScanPenalty(config);
   }
   if (caps.scanKind === "index-scan" && caps.predicatePushdown === "none") {
-    return 2.0;
+    return getIndexScanNoPushdownPenalty(config);
   }
   if (caps.scanKind === "kv-scan") {
-    return 1.4;
+    return getKvScanPenalty(config);
   }
   return 1.0;
 }
 
-// 11. Physical operator selection
+// 12. Physical operator selection ���
 
 function selectPhysicalOperator(
   leftRowCount: number,
@@ -1130,7 +1231,6 @@ function selectPhysicalOperator(
   const lw = clampWidth(leftWidth);
 
   if (rr <= getSmallTableThreshold(config)) {
-    // Semi/anti without using predicate needs hash path for equi-pred
     if (
       (joinType === "semi" || joinType === "anti") &&
       hasEquiPred &&
@@ -1189,7 +1289,7 @@ function selectPhysicalOperator(
   return hashCost < nljCost ? "hash" : "loop";
 }
 
-// 12. Row helpers and materialization
+// 13. Row helpers and materialization
 
 async function cooperativeYield(): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, 0));
@@ -1358,7 +1458,7 @@ function loopPredicateLeftArg(leftNode: JoinNode, row: LuaTable): LuaValue {
   return row;
 }
 
-// 13. Join operators
+// 14. Join operators ���
 
 async function hashSemiAntiJoin(
   leftRows: LuaTable[],
@@ -1399,13 +1499,11 @@ async function nestedLoopSemiAntiJoin(
 ): Promise<LuaTable[]> {
   const results: LuaTable[] = [];
   for (const leftRow of leftRows) {
-    // NULL-key guard: match hashSemiAntiJoin semantics
     if (equiPred) {
       const leftObj = leftRow.rawGet(equiPred.leftSource);
       const val = extractField(leftObj, equiPred.leftColumn);
       const key = hashJoinKey(val);
       if (key === null) {
-        // NULL key → no match possible (SQL NULL ≠ anything)
         if (joinType === "anti") results.push(leftRow);
         continue;
       }
@@ -1622,7 +1720,6 @@ async function sortMergeJoin(
   leftKeyed.sort((a, b) => compareSortKeys(a.key, b.key));
   rightKeyed.sort((a, b) => compareSortKeys(a.key, b.key));
 
-  // Skip NULL keys (NULL does not equal to anything)
   if (equiPred) {
     while (
       leftKeyed.length > 0 &&
@@ -1786,7 +1883,6 @@ async function dispatchJoin(
     }
   }
 
-  // Without equi-predicate degrade to cross
   if (tree.method !== "loop") {
     (tree as JoinInner).method = "loop";
   }
@@ -1794,7 +1890,7 @@ async function dispatchJoin(
   return crossJoin(leftRows, rightItems, rightName, sf, config);
 }
 
-// 14. Join tree execution
+// 15. Join tree execution
 
 export async function executeJoinTree(
   tree: JoinNode,
@@ -1818,7 +1914,7 @@ export async function executeJoinTree(
   return dispatchJoin(tree, leftRows, rightItems, rightSource, env, sf, config);
 }
 
-// 15. Predicate extraction
+// 16. Predicate extraction
 
 export function extractEquiPredicates(
   expr: LuaExpression | undefined,
@@ -1926,7 +2022,7 @@ function parseGroupKeySourceColumn(
   return null;
 }
 
-// 16. Single-source filter pushdown
+// 17. Single-source filter pushdown
 
 export type SingleSourceFilter = {
   sourceName: string;
@@ -2170,7 +2266,7 @@ export async function applyPushedFilters(
   return result;
 }
 
-// 17. Equi-predicate stripping
+// 18. Equi-predicate stripping
 
 export function stripUsedJoinPredicates(
   expr: LuaExpression | undefined,
@@ -2190,7 +2286,7 @@ function collectUsedEquiPredsFromJoinTree(node: JoinNode): EquiPredicate[] {
   return result;
 }
 
-// 18. Explain infrastructure
+// 19. Explain infrastructure
 
 function findLeafSource(
   node: JoinNode,
@@ -2276,7 +2372,7 @@ export function explainJoinTree(
       leftPlan.estimatedRows,
       rightPlan.estimatedRows,
       jt,
-      DEFAULT_SELECTIVITY,
+      1 / Math.max(leftPlan.estimatedRows, rightPlan.estimatedRows, 1),
     );
 
   const { startupCost, totalCost } = computeJoinCost(
@@ -2386,18 +2482,12 @@ export function explainJoinTree(
 
 /**
  * Extract output column descriptions from a select expression AST
- *
- * Respects the evaluation order: `PropField` and `DynamicField` in
- * source order first, then `ExpressionField` (positional) entries
- * as in the `evalExpressionWithAggregates`.
  */
 function collectOutputColumns(expr: LuaExpression): string[] {
-  // Non-table select (e.g. `select p.name` → bare expression)
   if (expr.type !== "TableConstructor") {
     return [exprToString(expr)];
   }
 
-  // Named/dynamic fields first (in source order), then positional
   const named: string[] = [];
   const positional: string[] = [];
 
@@ -2430,13 +2520,12 @@ function collectOutputColumns(expr: LuaExpression): string[] {
   return [...named, ...positional];
 }
 
-// Short human-readable name for an expression (leaf identifier only)
 function shortExprName(expr: LuaExpression): string | undefined {
   switch (expr.type) {
     case "Variable":
       return expr.name;
     case "PropertyAccess":
-      return exprToString(expr);
+      return expr.property;
     case "FunctionCall":
       if (expr.prefix.type === "Variable") return expr.prefix.name;
       if (expr.prefix.type === "PropertyAccess") return expr.prefix.property;
@@ -2450,9 +2539,6 @@ function shortExprName(expr: LuaExpression): string | undefined {
   }
 }
 
-// Well-known aggregate function names for AST-only detection.
-// Used in explain plan to determine implicit grouping when Config
-// is not available.
 const KNOWN_AGGREGATE_NAMES = new Set([
   "count",
   "sum",
@@ -2471,10 +2557,6 @@ const KNOWN_AGGREGATE_NAMES = new Set([
   "json_object_agg",
 ]);
 
-/**
- * Check if an expression contains aggregate calls using AST node types
- * and a set of well-known aggregate names.
- */
 function selectContainsAggregate(expr: LuaExpression): boolean {
   switch (expr.type) {
     case "FilteredCall":
@@ -2518,12 +2600,7 @@ function selectContainsAggregate(expr: LuaExpression): boolean {
 export function wrapPlanWithQueryOps(
   plan: ExplainNode,
   query: {
-    orderBy?: {
-      expr: LuaExpression;
-      desc: boolean;
-      nulls?: "first" | "last";
-      using?: string | LuaFunctionBody;
-    }[];
+    orderBy?: OrderByEntry[];
     limit?: number;
     offset?: number;
     groupBy?: { expr: LuaExpression; alias?: string }[];
@@ -2534,8 +2611,10 @@ export function wrapPlanWithQueryOps(
   },
   sourceStats?: Map<string, CollectionStats>,
   accumulatedNdv?: Map<string, Map<string, number>>,
+  config?: JoinPlannerConfig,
 ): ExplainNode {
   let root = plan;
+  const filterSel = getDefaultFilterSelectivity(config);
 
   if (query.where) {
     const usedPreds = collectUsedEquiPreds(root);
@@ -2545,7 +2624,7 @@ export function wrapPlanWithQueryOps(
         nodeType: "Filter",
         startupCost: root.startupCost,
         estimatedCost: root.estimatedCost,
-        estimatedRows: Math.max(1, Math.round(root.estimatedRows * 0.5)),
+        estimatedRows: Math.max(1, Math.round(root.estimatedRows * filterSel)),
         estimatedWidth: root.estimatedWidth,
         filterExpr: exprToString(residual),
         whereExpr: residual,
@@ -2565,9 +2644,8 @@ export function wrapPlanWithQueryOps(
       accumulatedNdv,
     );
     const estimatedGroupRows =
-      ndvGroupRows ?? Math.max(1, Math.round(root.estimatedRows * 0.5));
+      ndvGroupRows ?? Math.max(1, Math.round(root.estimatedRows * filterSel));
 
-    // Collect aggregate function descriptions from select and having
     const aggDescs: AggregateDescription[] = [];
     if (query.select) {
       aggDescs.push(...collectAggregateDescriptions(query.select));
@@ -2608,7 +2686,7 @@ export function wrapPlanWithQueryOps(
       nodeType: "Filter",
       startupCost: root.startupCost,
       estimatedCost: root.estimatedCost,
-      estimatedRows: Math.max(1, Math.round(root.estimatedRows * 0.5)),
+      estimatedRows: Math.max(1, Math.round(root.estimatedRows * filterSel)),
       estimatedWidth: root.estimatedWidth,
       filterExpr: exprToString(query.having),
       havingExpr: query.having,
@@ -2618,9 +2696,6 @@ export function wrapPlanWithQueryOps(
     };
   }
 
-  // Implicit whole-table aggregate: select contains aggregates but
-  // there is no explicit group by.  Mirrors the implicit single-group
-  // detection in applyQuery.
   const hasExplicitGroupBy = query.groupBy && query.groupBy.length > 0;
   const isImplicitAggregate =
     query.select &&
@@ -2645,8 +2720,6 @@ export function wrapPlanWithQueryOps(
     };
   }
 
-  // Always emit a Project node so the user sees what columns are produced.
-  // When there is no explicit `select`, the projection is implicit (select *).
   if (query.select) {
     const cols = collectOutputColumns(query.select);
     root = {
@@ -2660,7 +2733,6 @@ export function wrapPlanWithQueryOps(
       children: [root],
     };
   } else {
-    // Infer column names from source stats NDV keys when available
     let implicitCols: string[] = ["*"];
     if (sourceStats && sourceStats.size > 0) {
       const allColumns = new Set<string>();
@@ -2690,10 +2762,10 @@ export function wrapPlanWithQueryOps(
     const keys = query.orderBy.map((o) => {
       let s = exprToString(o.expr);
       if (o.desc) s += " desc";
+      if (o.nulls) s += ` nulls ${o.nulls}`;
       if (o.using) {
         s += ` using ${typeof o.using === "string" ? o.using : "<function>"}`;
       }
-      if (o.nulls) s += ` nulls ${o.nulls}`;
       return s;
     });
     const nLogN =
@@ -2727,7 +2799,12 @@ export function wrapPlanWithQueryOps(
       nodeType: "Unique",
       startupCost: root.startupCost,
       estimatedCost: root.estimatedCost,
-      estimatedRows: Math.max(1, Math.round(root.estimatedRows * 0.8)),
+      estimatedRows: Math.max(
+        1,
+        Math.round(
+          root.estimatedRows * getDefaultDistinctSurvivalRatio(config),
+        ),
+      ),
       estimatedWidth: root.estimatedWidth,
       distinctSpec: true,
       statsSource: root.statsSource,
@@ -2760,7 +2837,7 @@ export function wrapPlanWithQueryOps(
   return root;
 }
 
-// 19. Restricted-source validation
+// 20. Restricted-source validation
 
 type RestrictedSourceRef = {
   source: string;
@@ -2908,12 +2985,7 @@ export function validatePostJoinSourceReferences(
     groupBy?: { expr: LuaExpression; alias?: string }[];
     having?: LuaExpression;
     select?: LuaExpression;
-    orderBy?: {
-      expr: LuaExpression;
-      desc: boolean;
-      nulls?: "first" | "last";
-      using?: string | LuaFunctionBody;
-    }[];
+    orderBy?: OrderByEntry[];
   },
   sf: LuaStackFrame,
 ): void {
@@ -2947,7 +3019,7 @@ export function validatePostJoinSourceReferences(
   }
 }
 
-// 20. Expression / explain helpers
+// 21. Expression / explain helpers
 
 function formatHintLabel(hint: LuaJoinHint): string {
   const parts: string[] = [];
@@ -2980,24 +3052,6 @@ export function exprToString(expr: LuaExpression): string {
       const args = expr.args.map(exprToString).join(", ");
       return `${prefix}(${args})`;
     }
-    case "FilteredCall": {
-      const call = exprToString(expr.call);
-      const filter = exprToString(expr.filter);
-      return `${call} filter(where ${filter})`;
-    }
-    case "AggregateCall": {
-      const call = exprToString(expr.call);
-      const ob = expr.orderBy
-        .map(
-          (o: any) =>
-            exprToString(o.expression) +
-            (o.direction === "desc" ? " desc" : ""),
-        )
-        .join(", ");
-      return `${call} order by ${ob}`;
-    }
-    case "Parenthesized":
-      return `(${exprToString(expr.expression)})`;
     case "TableAccess":
       return `${exprToString(expr.object)}[${exprToString(expr.key)}]`;
     default:
@@ -3059,11 +3113,6 @@ function stripEquiPreds(
   return expr;
 }
 
-/**
- * Walk an expression AST and collect descriptions of all aggregate calls.
- * Recognizes FunctionCall, FilteredCall, and AggregateCall nodes whose
- * prefix is a Variable matching a known aggregate name pattern.
- */
 function collectAggregateDescriptions(
   expr: LuaExpression | undefined,
 ): AggregateDescription[] {
@@ -3133,7 +3182,6 @@ function walkAggregates(
         out.push(desc);
         return;
       }
-      // Non-aggregate function: recurse into prefix and args
       walkAggregates(expr.prefix, out);
       for (const arg of expr.args) {
         walkAggregates(arg, out);
@@ -3208,7 +3256,7 @@ function estimateGroupRowsFromNdv(
   return Math.max(1, Math.min(inputRows, Math.round(combinedNdv)));
 }
 
-// 21. Explain analyze execution
+// 22. Explain analyze execution
 
 export async function executeAndInstrument(
   tree: JoinNode,
@@ -3318,7 +3366,7 @@ export async function executeAndInstrument(
   return joinResult;
 }
 
-// 22. Explain formatting
+// 23. Explain formatting
 
 export function formatExplainOutput(
   result: ExplainResult,
@@ -3556,15 +3604,62 @@ function formatNodeLabel(node: ExplainNode): string {
       return "Limit";
     case "GroupAggregate":
       return node.implicitGroup
-        ? "Implicit Group Aggregate"
+        ? "Group Aggregate (implicit)"
         : "Group Aggregate";
     case "Unique":
       return "Unique";
     case "Project": {
       const isImplicit = node.implicitGroup === false;
-      return isImplicit ? "Implicit Project" : "Project";
+      return isImplicit ? "Project (implicit)" : "Project";
     }
     default:
       return node.nodeType;
   }
+}
+
+// 24. Config bridge
+
+/**
+ * Build a JoinPlannerConfig from the SilverBullet Config object.
+ * Call sites should invoke this once and pass the result through
+ * to buildJoinTree / executeJoinTree / wrapPlanWithQueryOps.
+ */
+export function joinPlannerConfigFromConfig(config: Config): JoinPlannerConfig {
+  return {
+    watchdogLimit:
+      config.get("queryPlanner.watchdogLimit", undefined) ?? undefined,
+    yieldChunk: config.get("queryPlanner.yieldChunk", undefined) ?? undefined,
+    smallTableThreshold:
+      config.get("queryPlanner.smallTableThreshold", undefined) ?? undefined,
+    mergeJoinThreshold:
+      config.get("queryPlanner.mergeJoinThreshold", undefined) ?? undefined,
+    widthWeight: config.get("queryPlanner.widthWeight", undefined) ?? undefined,
+    candidateWidthWeight:
+      config.get("queryPlanner.candidateWidthWeight", undefined) ?? undefined,
+    semiAntiLoopDiscount:
+      config.get("queryPlanner.semiAntiLoopDiscount", undefined) ?? undefined,
+    partialStatsConfidence:
+      config.get("queryPlanner.partialStatsConfidence", undefined) ?? undefined,
+    approximateStatsConfidence:
+      config.get("queryPlanner.approximateStatsConfidence", undefined) ??
+      undefined,
+    bitmapScanPenalty:
+      config.get("queryPlanner.bitmapScanPenalty", undefined) ?? undefined,
+    indexScanNoPushdownPenalty:
+      config.get("queryPlanner.indexScanNoPushdownPenalty", undefined) ??
+      undefined,
+    kvScanPenalty:
+      config.get("queryPlanner.kvScanPenalty", undefined) ?? undefined,
+    defaultFilterSelectivity:
+      config.get("queryPlanner.defaultFilterSelectivity", undefined) ??
+      undefined,
+    defaultDistinctSurvivalRatio:
+      config.get("queryPlanner.defaultDistinctSurvivalRatio", undefined) ??
+      undefined,
+    defaultRangeSelectivity:
+      config.get("queryPlanner.defaultRangeSelectivity", undefined) ??
+      undefined,
+    inferredNdvDivisor:
+      config.get("queryPlanner.inferredNdvDivisor", undefined) ?? undefined,
+  };
 }

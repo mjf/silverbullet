@@ -32,6 +32,8 @@ export interface NDVSketch {
 }
 
 const DEFAULT_NUM_BUCKETS = 512;
+const SATURATION_WARNING_THRESHOLD = 0.01;
+const SATURATION_RESET_THRESHOLD = 0.05;
 
 export class HalfXorSketch implements NDVSketch {
   private xorMatrix: Uint32Array;
@@ -83,7 +85,7 @@ export class HalfXorSketch implements NDVSketch {
       this.emptyCount++;
       if (
         this.saturationWarningFired &&
-        this.emptyCount > this.numBuckets * 0.05
+        this.emptyCount > this.numBuckets * SATURATION_RESET_THRESHOLD
       ) {
         this.saturationWarningFired = false;
       }
@@ -189,7 +191,10 @@ export class HalfXorSketch implements NDVSketch {
 
   private checkSaturation(contextTag: string): void {
     if (this.saturationWarningFired) return;
-    const threshold = Math.max(1, Math.floor(this.numBuckets * 0.01));
+    const threshold = Math.max(
+      1,
+      Math.floor(this.numBuckets * SATURATION_WARNING_THRESHOLD),
+    );
     if (this.emptyCount <= threshold) {
       console.warn(
         `Planner: sketch for '${contextTag}' is approaching saturation`,

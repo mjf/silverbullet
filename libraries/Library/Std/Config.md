@@ -64,6 +64,30 @@ config.define("index", {
   additionalProperties = true
 })
 
+config.define("queryPlanner", {
+  description = "Configure cost-base join planner tuning knobs",
+  type = "object",
+  properties = {
+    watchdogLimit = schema.nullable "number",
+    yieldChunk = schema.nullable "number",
+    smallTableThreshold = schema.nullable "number",
+    mergeJoinThreshold = schema.nullable "number",
+    widthWeight = schema.nullable "number",
+    candidateWidthWeight = schema.nullable "number",
+    semiAntiLoopDiscount = schema.nullable "number",
+    partialStatsConfidence = schema.nullable "number",
+    approximateStatsConfidence = schema.nullable "number",
+    bitmapScanPenalty = schema.nullable "number",
+    indexScanNoPushdownPenalty = schema.nullable "number",
+    kvScanPenalty = schema.nullable "number",
+    defaultFilterSelectivity = schema.nullable "number",
+    defaultDistinctSurvivalRatio = schema.nullable "number",
+    defaultRangeSelectivity = schema.nullable "number",
+    inferredNdvDivisor = schema.nullable "number",
+  },
+  additionalProperties = false
+})
+
 config.define("plugs", {
   description = "List of plugs to enable",
   oneOf = {

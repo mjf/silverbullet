@@ -26,6 +26,9 @@ const DICT_KEY: KvKey = ["$dict"];
 // Internal metadata field — uses $ prefix to avoid collisions with user data
 const ENC_FIELD = "$enc";
 
+// Add after existing constants (around line 28):
+const DEFAULT_MCV_TOP_K = 10;
+
 // Configuration
 
 export type BitmapIndexConfig = {
@@ -486,7 +489,7 @@ export class BitmapIndex {
   getColumnMCV(
     tagId: number,
     column: string,
-    topK: number = 10,
+    topK: number = DEFAULT_MCV_TOP_K,
   ): { value: string; count: number }[] {
     const colBitmaps = this.bitmapsByTag.get(tagId)?.get(column);
     if (!colBitmaps) return [];
