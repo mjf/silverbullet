@@ -2597,10 +2597,7 @@ export function explainJoinTree(
       estimatedRows: rows,
       estimatedWidth: width,
       filterExpr: pushedFilterExpr,
-      pushedDownFilter:
-        !!pushedFilterExpr &&
-        predicatePushdownKind !== undefined &&
-        predicatePushdownKind !== "none",
+      pushedDownFilter: !!pushedFilterExpr,
       statsSource: tree.source.stats?.statsSource,
       executionScanKind: tree.source.stats?.executionCapabilities?.scanKind,
       predicatePushdown: predicatePushdownKind,
@@ -2747,55 +2744,28 @@ function collectOutputColumns(expr: LuaExpression): string[] {
     return [exprToString(expr)];
   }
 
-  const named: string[] = [];
-  const positional: string[] = [];
+  const outputs: string[] = [];
 
   for (const field of expr.fields) {
     switch (field.type) {
       case "PropField": {
-        const key = field.key;
-        const exprStr = exprToString(field.value);
-        const short = shortExprName(field.value);
-        if (key === short) {
-          named.push(key);
-        } else {
-          named.push(`${key} = ${exprStr}`);
-        }
+        outputs.push(`${field.key} = ${exprToString(field.value)}`);
         break;
       }
       case "DynamicField": {
         const keyStr = exprToString(field.key);
         const valStr = exprToString(field.value);
-        named.push(`[${keyStr}] = ${valStr}`);
+        outputs.push(`[${keyStr}] = ${valStr}`);
         break;
       }
       case "ExpressionField": {
-        positional.push(exprToString(field.value));
+        outputs.push(exprToString(field.value));
         break;
       }
     }
   }
 
-  return [...named, ...positional];
-}
-
-function shortExprName(expr: LuaExpression): string | undefined {
-  switch (expr.type) {
-    case "Variable":
-      return expr.name;
-    case "PropertyAccess":
-      return expr.property;
-    case "FunctionCall":
-      if (expr.prefix.type === "Variable") return expr.prefix.name;
-      if (expr.prefix.type === "PropertyAccess") return expr.prefix.property;
-      return undefined;
-    case "FilteredCall":
-      return shortExprName(expr.call);
-    case "AggregateCall":
-      return shortExprName(expr.call);
-    default:
-      return undefined;
-  }
+  return outputs;
 }
 
 const KNOWN_AGGREGATE_NAMES = new Set([
@@ -3908,8 +3878,10 @@ function formatNode(
     let filterLabel: string;
     if (node.nodeType === "Scan" || node.nodeType === "FunctionScan") {
       filterLabel = node.pushedDownFilter ? "Pushdown Filter" : "Filter";
+    } else if (node.filterType === "having") {
+      filterLabel = "Having Condition";
     } else {
-      filterLabel = node.filterType === "having" ? "Having Filter" : "Filter";
+      filterLabel = "Filter";
     }
     lines.push(`${detailPad}${filterLabel}: ${node.filterExpr}`);
   }
@@ -3918,8 +3890,14 @@ function formatNode(
     node.rowsRemovedByFilter !== undefined &&
     node.rowsRemovedByFilter > 0
   ) {
+    const removedByFilterLabel =
+      (node.nodeType === "Scan" || node.nodeType === "FunctionScan") &&
+      node.pushedDownFilter
+        ? "Rows Removed by Pushdown Filter"
+        : "Rows Removed by Filter";
+
     lines.push(
-      `${detailPad}Rows Removed by Filter: ${node.rowsRemovedByFilter}`,
+      `${detailPad}${removedByFilterLabel}: ${node.rowsRemovedByFilter}`,
     );
   }
 
@@ -3965,7 +3943,7 @@ function formatNode(
     }
 
     if (node.predicatePushdown) {
-      lines.push(`${detailPad}Execution Capability: ${node.predicatePushdown}`);
+      lines.push(`${detailPad}Pushdown Capability: ${node.predicatePushdown}`);
     }
 
     if (node.selectivity !== undefined) {
@@ -3978,35 +3956,35 @@ function formatNode(
     }
 
     if (node.statsSource) {
-      lines.push(`${detailPad}Statistics: ${node.statsSource}`);
+      lines.push(`${detailPad}Stats: ${node.statsSource}`);
     }
 
     if (node.ndvSource && node.joinKeyNdv) {
       const l = node.joinKeyNdv;
       const fmtNdv = (n: number) => (n < 0 ? "n/a" : String(n));
       lines.push(
-        `${detailPad}Number of Distinct Values: ${node.ndvSource}  (values ${l.left}=${fmtNdv(l.leftNdv)} ${l.right}=${fmtNdv(l.rightNdv)})`,
+        `${detailPad}NDV: ${node.ndvSource}  (values ${l.left}=${fmtNdv(l.leftNdv)} ${l.right}=${fmtNdv(l.rightNdv)})`,
       );
     } else if (node.ndvSource) {
-      lines.push(`${detailPad}Number of Distinct Values: ${node.ndvSource}`);
+      lines.push(`${detailPad}NDV: ${node.ndvSource}`);
     }
 
     if (node.mcvUsed) {
       const suffix =
         node.mcvKeyCount !== undefined ? `  (keys=${node.mcvKeyCount})` : "";
-      lines.push(`${detailPad}Most Common Value: both sides${suffix}`);
+      lines.push(`${detailPad}MCV: both sides${suffix}`);
     } else if (node.mcvFallback === "one-sided") {
       const suffix =
         node.mcvKeyCount !== undefined ? `  (keys=${node.mcvKeyCount})` : "";
-      lines.push(`${detailPad}Most Common Value: single side${suffix}`);
+      lines.push(`${detailPad}MCV: single side${suffix}`);
     } else if (node.mcvFallback === "suppressed") {
       const suffix =
         node.mcvKeyCount !== undefined ? `  (keys=${node.mcvKeyCount})` : "";
       lines.push(
-        `${detailPad}Most Common Value: suppressed by stats provenance${suffix}`,
+        `${detailPad}MCV: suppressed${suffix}`,
       );
     } else if (node.mcvFallback === "no-mcv") {
-      lines.push(`${detailPad}Most Common Value: not available`);
+      lines.push(`${detailPad}MCV: not available`);
     }
   }
 
