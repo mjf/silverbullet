@@ -304,6 +304,8 @@ export type ExplainNode = {
   aggregates?: AggregateDescription[];
   implicitGroup?: boolean;
   filterType?: "where" | "having";
+  pushedDownFilter?: boolean;
+  joinFilterType?: "join" | "join-residual";
 
   selectivity?: number;
   ndvSource?:
@@ -2579,6 +2581,10 @@ export function explainJoinTree(
     const rows = estimatedRows(tree.source);
     const width = estimatedWidth(tree.source);
     const isFnScan = tree.source.expression.type === "FunctionCall";
+    const pushedFilterExpr = pushedFilterExprBySource?.get(tree.source.name);
+    const predicatePushdownKind =
+      tree.source.stats?.executionCapabilities?.predicatePushdown;
+
     return {
       nodeType: isFnScan ? "FunctionScan" : "Scan",
       source: tree.source.name,
@@ -2590,11 +2596,14 @@ export function explainJoinTree(
       estimatedCost: rows,
       estimatedRows: rows,
       estimatedWidth: width,
-      filterExpr: pushedFilterExprBySource?.get(tree.source.name),
+      filterExpr: pushedFilterExpr,
+      pushedDownFilter:
+        !!pushedFilterExpr &&
+        predicatePushdownKind !== undefined &&
+        predicatePushdownKind !== "none",
       statsSource: tree.source.stats?.statsSource,
       executionScanKind: tree.source.stats?.executionCapabilities?.scanKind,
-      predicatePushdown:
-        tree.source.stats?.executionCapabilities?.predicatePushdown,
+      predicatePushdown: predicatePushdownKind,
       children: [],
     };
   }
@@ -2714,6 +2723,10 @@ export function explainJoinTree(
     hintUsed: hintLabel,
     equiPred: tree.equiPred,
     joinResidualExprs: tree.joinResiduals?.map(exprToString),
+    joinFilterType:
+      tree.joinResiduals && tree.joinResiduals.length > 0
+        ? "join-residual"
+        : "join",
     startupCost: Math.round(startupCost),
     estimatedCost: Math.round(totalCost),
     estimatedRows: Math.max(1, Math.round(estRows)),
@@ -3841,9 +3854,9 @@ function formatNode(
   if (node.equiPred) {
     const condLabel =
       node.method === "hash"
-        ? "Hash Cond"
+        ? "Hash Condition"
         : node.method === "merge"
-          ? "Merge Cond"
+          ? "Merge Condition"
           : "Join Filter";
     const ep = node.equiPred;
     lines.push(
@@ -3852,8 +3865,12 @@ function formatNode(
   }
 
   if (node.joinResidualExprs && node.joinResidualExprs.length > 0) {
+    const residualLabel =
+      node.joinFilterType === "join-residual"
+        ? "Residual Join Filter"
+        : "Join Filter";
     for (const expr of node.joinResidualExprs) {
-      lines.push(`${detailPad}Join Residual Filter: ${expr}`);
+      lines.push(`${detailPad}${residualLabel}: ${expr}`);
     }
   }
 
@@ -3888,8 +3905,12 @@ function formatNode(
   }
 
   if (node.filterExpr) {
-    const filterLabel =
-      node.filterType === "having" ? "Filter (Having)" : "Filter";
+    let filterLabel: string;
+    if (node.nodeType === "Scan" || node.nodeType === "FunctionScan") {
+      filterLabel = node.pushedDownFilter ? "Pushdown Filter" : "Filter";
+    } else {
+      filterLabel = node.filterType === "having" ? "Having Filter" : "Filter";
+    }
     lines.push(`${detailPad}${filterLabel}: ${node.filterExpr}`);
   }
   if (
@@ -3947,10 +3968,6 @@ function formatNode(
       lines.push(`${detailPad}Execution Capability: ${node.predicatePushdown}`);
     }
 
-    if (node.statsSource) {
-      lines.push(`${detailPad}Stats: ${node.statsSource}`);
-    }
-
     if (node.selectivity !== undefined) {
       const sel = node.selectivity;
       const formatted =
@@ -3960,30 +3977,36 @@ function formatNode(
       lines.push(`${detailPad}Selectivity: ${formatted}`);
     }
 
+    if (node.statsSource) {
+      lines.push(`${detailPad}Statistics: ${node.statsSource}`);
+    }
+
     if (node.ndvSource && node.joinKeyNdv) {
       const l = node.joinKeyNdv;
       const fmtNdv = (n: number) => (n < 0 ? "n/a" : String(n));
       lines.push(
-        `${detailPad}NDV: ${node.ndvSource}  (values ${l.left}=${fmtNdv(l.leftNdv)} ${l.right}=${fmtNdv(l.rightNdv)})`,
+        `${detailPad}Number of Distinct Values: ${node.ndvSource}  (values ${l.left}=${fmtNdv(l.leftNdv)} ${l.right}=${fmtNdv(l.rightNdv)})`,
       );
     } else if (node.ndvSource) {
-      lines.push(`${detailPad}NDV: ${node.ndvSource}`);
+      lines.push(`${detailPad}Number of Distinct Values: ${node.ndvSource}`);
     }
 
     if (node.mcvUsed) {
       const suffix =
         node.mcvKeyCount !== undefined ? `  (keys=${node.mcvKeyCount})` : "";
-      lines.push(`${detailPad}MCV: both sides${suffix}`);
+      lines.push(`${detailPad}Most Common Value: both sides${suffix}`);
     } else if (node.mcvFallback === "one-sided") {
       const suffix =
         node.mcvKeyCount !== undefined ? `  (keys=${node.mcvKeyCount})` : "";
-      lines.push(`${detailPad}MCV: single side${suffix}`);
+      lines.push(`${detailPad}Most Common Value: single side${suffix}`);
     } else if (node.mcvFallback === "suppressed") {
       const suffix =
         node.mcvKeyCount !== undefined ? `  (keys=${node.mcvKeyCount})` : "";
-      lines.push(`${detailPad}MCV: suppressed by stats provenance${suffix}`);
+      lines.push(
+        `${detailPad}Most Common Value: suppressed by stats provenance${suffix}`,
+      );
     } else if (node.mcvFallback === "no-mcv") {
-      lines.push(`${detailPad}MCV: not available`);
+      lines.push(`${detailPad}Most Common Value: not available`);
     }
   }
 
@@ -4018,13 +4041,13 @@ function formatNodeLabel(node: ExplainNode): string {
       return "Limit";
     case "GroupAggregate":
       return node.implicitGroup
-        ? "Group Aggregate (implicit)"
+        ? "Implicit Group Aggregate"
         : "Group Aggregate";
     case "Unique":
       return "Unique";
     case "Project": {
       const isImplicit = node.implicitGroup === false;
-      return isImplicit ? "Project (implicit)" : "Project";
+      return isImplicit ? "Implicit Project" : "Project";
     }
     default:
       return node.nodeType;

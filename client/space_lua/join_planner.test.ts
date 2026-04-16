@@ -448,9 +448,9 @@ describe("join residual predicate stripping and explain", () => {
     );
 
     expect(
-      rendered.includes("Join Residual Filter: (a.price > b.min_price)"),
+      rendered.includes("Residual Join Filter: (a.price > b.min_price)"),
     ).toBe(true);
-    expect(rendered.includes("Hash Cond: (a.id == b.id)")).toBe(true);
+    expect(rendered.includes("Hash Condition: (a.id == b.id)")).toBe(true);
   });
 
   it("multiple consumed residual conjuncts are all stripped from post-join WHERE", () => {
