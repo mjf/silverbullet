@@ -1745,6 +1745,8 @@ export function evalExpression(
                 explainQuery,
                 explainSourceStats,
                 joinRootNdv,
+                plannerConfig,
+                globalThis.client?.config,
               );
             }
 
@@ -2074,6 +2076,9 @@ export function evalExpression(
                 explainSingleSource(sourceName, objectExpression, stats),
                 explainQuery,
                 explainSourceStats,
+                undefined,
+                undefined,
+                globalThis.client?.config,
               );
             }
 
