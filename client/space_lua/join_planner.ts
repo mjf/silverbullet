@@ -3082,6 +3082,10 @@ export function exprToString(expr: LuaExpression): string {
     }
     case "TableAccess":
       return `${exprToString(expr.object)}[${exprToString(expr.key)}]`;
+    case "Parenthesized":
+      return exprToString(expr.expression);
+    case "FunctionDefinition":
+      return "<anonymous>";
     default:
       return "?";
   }
