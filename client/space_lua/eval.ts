@@ -1656,12 +1656,15 @@ export function evalExpression(
               planOrder,
               equiPreds,
               rangePreds,
+              pushdownResidualWhere,
               plannerConfig,
             );
 
-            // Remove equi-predicates already consumed by the join tree.
+            // Remove predicates already consumed by the join tree.
             // This is required for correct semi/anti semantics, where the
             // join predicate must not be re-applied as a post-join filter.
+            // It also strips residual join predicates attached to join nodes
+            // so they no longer appear in the post-join WHERE.
             const residualWhere = stripUsedJoinPredicates(
               pushdownResidualWhere,
               joinTree,

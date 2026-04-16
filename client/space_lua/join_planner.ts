@@ -199,6 +199,7 @@ export type JoinInner = {
   method: "hash" | "loop" | "merge";
   joinType: JoinType;
   equiPred?: EquiPredicate;
+  joinResiduals?: LuaExpression[];
   estimatedSelectivity?: number;
   estimatedRows?: number;
   estimatedNdv?: Map<string, Map<string, number>>;
@@ -238,7 +239,6 @@ type JoinStatsSummary = "exact" | "approximate" | "partial" | "unknown";
 
 // 6. Shared query-clause types
 
-// Single entry in an ORDER BY clause, with optional extensions.
 export type OrderByEntry = {
   expr: LuaExpression;
   desc: boolean;
@@ -282,13 +282,13 @@ export type ExplainNode = {
   rowsRemovedByJoinFilter?: number;
   rowsRemovedByUnique?: number;
   equiPred?: EquiPredicate;
+  joinResidualExprs?: string[];
   filterExpr?: string;
   sortKeys?: string[];
   limitCount?: number;
   offsetCount?: number;
   children: ExplainNode[];
 
-  // Wrapper plan metadata
   whereExpr?: LuaExpression;
   havingExpr?: LuaExpression;
   orderBySpec?: {
@@ -300,14 +300,9 @@ export type ExplainNode = {
   groupBySpec?: { expr: LuaExpression; alias?: string }[];
   distinctSpec?: boolean;
 
-  // Projection detail
   outputColumns?: string[];
-
-  // Aggregate detail
   aggregates?: AggregateDescription[];
   implicitGroup?: boolean;
-
-  // Filter classification
   filterType?: "where" | "having";
 
   selectivity?: number;
@@ -935,6 +930,7 @@ export function buildJoinTree(
   planOrder?: string[],
   equiPreds?: EquiPredicate[],
   rangePreds?: RangePredicate[],
+  residualWhere?: LuaExpression,
   config?: JoinPlannerConfig,
 ): JoinNode {
   if (sources.length === 1) {
@@ -1041,6 +1037,14 @@ export function buildJoinTree(
           : joinStatsSource === "approximate"
             ? "computed-sketch-large"
             : undefined;
+  }
+
+  if (residualWhere) {
+    assignResidualPredicatesToLowestCoveringJoin(
+      tree,
+      residualWhere,
+      equiPreds,
+    );
   }
 
   return tree;
@@ -1199,7 +1203,7 @@ function executionScanPenalty(
   return 1.0;
 }
 
-// 12. Physical operator selection ���
+// 12. Physical operator selection
 
 function selectPhysicalOperator(
   leftRowCount: number,
@@ -1458,21 +1462,54 @@ function loopPredicateLeftArg(leftNode: JoinNode, row: LuaTable): LuaValue {
   return row;
 }
 
-// 14. Join operators ���
+async function evaluateJoinResiduals(
+  leftRow: LuaTable,
+  rightName: string,
+  rightItem: any,
+  residuals: LuaExpression[] | undefined,
+  env: LuaEnv,
+  sf: LuaStackFrame,
+): Promise<boolean> {
+  if (!residuals || residuals.length === 0) return true;
+
+  const rowEnv = new LuaEnv(env);
+  for (const k of luaKeys(leftRow)) {
+    rowEnv.setLocal(String(k), leftRow.rawGet(k));
+  }
+  rowEnv.setLocal(rightName, rightItem);
+
+  for (const residual of residuals) {
+    const val = await evalExpression(residual, rowEnv, sf);
+    if (!luaTruthy(val)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// 14. Join operators
 
 async function hashSemiAntiJoin(
   leftRows: LuaTable[],
   rightItems: any[],
   joinType: "semi" | "anti",
   equiPred: EquiPredicate,
+  rightName: string,
+  residuals: LuaExpression[] | undefined,
+  env: LuaEnv,
+  sf: LuaStackFrame,
 ): Promise<LuaTable[]> {
-  const buildSet = new Set<string>();
+  const buildMap = new Map<string, any[]>();
   for (const rItem of rightItems) {
     const val = extractField(rItem, equiPred.rightColumn);
     const key = hashJoinKey(val);
-    if (key !== null) {
-      buildSet.add(key);
+    if (key === null) continue;
+    let bucket = buildMap.get(key);
+    if (!bucket) {
+      bucket = [];
+      buildMap.set(key, bucket);
     }
+    bucket.push(rItem);
   }
 
   const results: LuaTable[] = [];
@@ -1480,10 +1517,29 @@ async function hashSemiAntiJoin(
     const leftObj = lRow.rawGet(equiPred.leftSource);
     const val = extractField(leftObj, equiPred.leftColumn);
     const key = hashJoinKey(val);
-    const hasMatch = key !== null && buildSet.has(key);
 
-    if (joinType === "semi" && hasMatch) results.push(lRow);
-    else if (joinType === "anti" && !hasMatch) results.push(lRow);
+    let found = false;
+    if (key !== null) {
+      const bucket = buildMap.get(key) ?? [];
+      for (const rItem of bucket) {
+        if (
+          await evaluateJoinResiduals(
+            lRow,
+            rightName,
+            rItem,
+            residuals,
+            env,
+            sf,
+          )
+        ) {
+          found = true;
+          break;
+        }
+      }
+    }
+
+    if (joinType === "semi" && found) results.push(lRow);
+    else if (joinType === "anti" && !found) results.push(lRow);
   }
   return results;
 }
@@ -1494,6 +1550,9 @@ async function nestedLoopSemiAntiJoin(
   leftNode: JoinNode,
   predicate: LuaValue,
   joinType: "semi" | "anti",
+  rightName: string,
+  residuals: LuaExpression[] | undefined,
+  env: LuaEnv,
   sf: LuaStackFrame,
   equiPred?: EquiPredicate,
 ): Promise<LuaTable[]> {
@@ -1515,14 +1574,74 @@ async function nestedLoopSemiAntiJoin(
       const res = singleResult(
         await luaCall(predicate, [leftArg, rightItem], sf.astCtx ?? {}, sf),
       );
-      if (luaTruthy(res)) {
-        found = true;
-        break;
+      if (!luaTruthy(res)) continue;
+      if (
+        !(await evaluateJoinResiduals(
+          leftRow,
+          rightName,
+          rightItem,
+          residuals,
+          env,
+          sf,
+        ))
+      ) {
+        continue;
       }
+      found = true;
+      break;
     }
     if (joinType === "semi" && found) results.push(leftRow);
     else if (joinType === "anti" && !found) results.push(leftRow);
   }
+  return results;
+}
+
+async function residualLoopJoin(
+  leftRows: LuaTable[],
+  rightItems: any[],
+  rightName: string,
+  residuals: LuaExpression[],
+  env: LuaEnv,
+  sf: LuaStackFrame,
+  config?: JoinPlannerConfig,
+): Promise<LuaTable[]> {
+  const limit = getWatchdogLimit(config);
+  const chunk = getYieldChunk(config);
+  const results: LuaTable[] = [];
+  let processed = 0;
+
+  for (const leftRow of leftRows) {
+    for (const rightItem of rightItems) {
+      if (
+        !(await evaluateJoinResiduals(
+          leftRow,
+          rightName,
+          rightItem,
+          residuals,
+          env,
+          sf,
+        ))
+      ) {
+        continue;
+      }
+
+      if (++processed > limit) {
+        throw new LuaRuntimeError(
+          `Query watchdog: intermediate result exceeded ${limit} rows`,
+          sf,
+        );
+      }
+
+      const newRow = cloneRow(leftRow);
+      void newRow.rawSet(rightName, rightItem);
+      results.push(newRow);
+
+      if (processed % chunk === 0) {
+        await cooperativeYield();
+      }
+    }
+  }
+
   return results;
 }
 
@@ -1559,6 +1678,8 @@ async function hashInnerJoin(
   rightItems: any[],
   rightName: string,
   equiPred: EquiPredicate,
+  residuals: LuaExpression[] | undefined,
+  env: LuaEnv,
   sf: LuaStackFrame,
   config?: JoinPlannerConfig,
 ): Promise<LuaTable[]> {
@@ -1587,6 +1708,18 @@ async function hashInnerJoin(
     const bucket = buildMap.get(key);
     if (!bucket) continue;
     for (const rItem of bucket) {
+      if (
+        !(await evaluateJoinResiduals(
+          lRow,
+          rightName,
+          rItem,
+          residuals,
+          env,
+          sf,
+        ))
+      ) {
+        continue;
+      }
       if (++processed > limit) {
         throw new LuaRuntimeError(
           `Query watchdog: intermediate result exceeded ${limit} rows`,
@@ -1607,6 +1740,8 @@ async function nestedLoopEquiJoin(
   rightItems: any[],
   rightName: string,
   equiPred: EquiPredicate,
+  residuals: LuaExpression[] | undefined,
+  env: LuaEnv,
   sf: LuaStackFrame,
   config?: JoinPlannerConfig,
 ): Promise<LuaTable[]> {
@@ -1626,6 +1761,18 @@ async function nestedLoopEquiJoin(
       const rightKey = hashJoinKey(rightVal);
       if (rightKey === null) continue;
       if (leftKey !== rightKey) continue;
+      if (
+        !(await evaluateJoinResiduals(
+          lRow,
+          rightName,
+          rightItem,
+          residuals,
+          env,
+          sf,
+        ))
+      ) {
+        continue;
+      }
 
       if (++processed > limit) {
         throw new LuaRuntimeError(
@@ -1653,6 +1800,8 @@ async function predicateLoopJoin(
   rightName: string,
   leftNode: JoinNode,
   predicate: LuaValue,
+  residuals: LuaExpression[] | undefined,
+  env: LuaEnv,
   sf: LuaStackFrame,
   config?: JoinPlannerConfig,
 ): Promise<LuaTable[]> {
@@ -1667,6 +1816,18 @@ async function predicateLoopJoin(
         await luaCall(predicate, [leftArg, rightItem], sf.astCtx ?? {}, sf),
       );
       if (!luaTruthy(res)) continue;
+      if (
+        !(await evaluateJoinResiduals(
+          leftRow,
+          rightName,
+          rightItem,
+          residuals,
+          env,
+          sf,
+        ))
+      ) {
+        continue;
+      }
       if (++processed > limit) {
         throw new LuaRuntimeError(
           `Query watchdog: intermediate result exceeded ${limit} rows`,
@@ -1686,6 +1847,8 @@ async function sortMergeJoin(
   leftRows: LuaTable[],
   rightItems: any[],
   rightName: string,
+  residuals: LuaExpression[] | undefined,
+  env: LuaEnv,
   sf: LuaStackFrame,
   config?: JoinPlannerConfig,
   equiPred?: EquiPredicate,
@@ -1778,6 +1941,18 @@ async function sortMergeJoin(
 
     for (const leftRow of leftGroup) {
       for (const rightItem of rightGroup) {
+        if (
+          !(await evaluateJoinResiduals(
+            leftRow,
+            rightName,
+            rightItem,
+            residuals,
+            env,
+            sf,
+          ))
+        ) {
+          continue;
+        }
         if (++processed > limit) {
           throw new LuaRuntimeError(
             `Query watchdog: intermediate result exceeded ${limit} rows`,
@@ -1809,6 +1984,7 @@ async function dispatchJoin(
   const equiPred = tree.equiPred
     ? normalizeEquiPredicateForJoin(tree.equiPred, tree.left, rightSource)
     : undefined;
+  const residuals = tree.joinResiduals;
 
   if (joinType === "semi" || joinType === "anti") {
     if (tree.method === "loop") {
@@ -1824,13 +2000,25 @@ async function dispatchJoin(
         tree.left,
         predicate,
         joinType,
+        rightName,
+        residuals,
+        env,
         sf,
         equiPred,
       );
     }
 
     if (equiPred) {
-      return hashSemiAntiJoin(leftRows, rightItems, joinType, equiPred);
+      return hashSemiAntiJoin(
+        leftRows,
+        rightItems,
+        joinType,
+        equiPred,
+        rightName,
+        residuals,
+        env,
+        sf,
+      );
     }
 
     throw new LuaRuntimeError(
@@ -1846,6 +2034,8 @@ async function dispatchJoin(
       rightName,
       tree.left,
       predicate,
+      residuals,
+      env,
       sf,
       config,
     );
@@ -1859,6 +2049,8 @@ async function dispatchJoin(
           rightItems,
           rightName,
           equiPred,
+          residuals,
+          env,
           sf,
           config,
         );
@@ -1867,6 +2059,8 @@ async function dispatchJoin(
           leftRows,
           rightItems,
           rightName,
+          residuals,
+          env,
           sf,
           config,
           equiPred,
@@ -1877,6 +2071,8 @@ async function dispatchJoin(
           rightItems,
           rightName,
           equiPred,
+          residuals,
+          env,
           sf,
           config,
         );
@@ -1885,6 +2081,18 @@ async function dispatchJoin(
 
   if (tree.method !== "loop") {
     (tree as JoinInner).method = "loop";
+  }
+
+  if (residuals && residuals.length > 0) {
+    return residualLoopJoin(
+      leftRows,
+      rightItems,
+      rightName,
+      residuals,
+      env,
+      sf,
+      config,
+    );
   }
 
   return crossJoin(leftRows, rightItems, rightName, sf, config);
@@ -2294,7 +2502,7 @@ export async function applyPushedFiltersWithStats(
   return { result, removedCount: items.length - result.length };
 }
 
-// 18. Equi-predicate stripping
+// 18. Predicate stripping
 
 export function stripUsedJoinPredicates(
   expr: LuaExpression | undefined,
@@ -2302,7 +2510,8 @@ export function stripUsedJoinPredicates(
 ): LuaExpression | undefined {
   if (!expr) return undefined;
   const usedPreds = collectUsedEquiPredsFromJoinTree(tree);
-  return stripEquiPreds(expr, usedPreds);
+  const usedResiduals = collectUsedJoinResidualsFromJoinTree(tree);
+  return stripJoinPredicates(expr, usedPreds, usedResiduals);
 }
 
 function collectUsedEquiPredsFromJoinTree(node: JoinNode): EquiPredicate[] {
@@ -2311,6 +2520,17 @@ function collectUsedEquiPredsFromJoinTree(node: JoinNode): EquiPredicate[] {
   if (node.equiPred) result.push(node.equiPred);
   result.push(...collectUsedEquiPredsFromJoinTree(node.left));
   result.push(...collectUsedEquiPredsFromJoinTree(node.right));
+  return result;
+}
+
+function collectUsedJoinResidualsFromJoinTree(node: JoinNode): LuaExpression[] {
+  if (node.kind === "leaf") return [];
+  const result: LuaExpression[] = [];
+  if (node.joinResiduals) {
+    result.push(...node.joinResiduals);
+  }
+  result.push(...collectUsedJoinResidualsFromJoinTree(node.left));
+  result.push(...collectUsedJoinResidualsFromJoinTree(node.right));
   return result;
 }
 
@@ -2493,6 +2713,7 @@ export function explainJoinTree(
     method: tree.method,
     hintUsed: hintLabel,
     equiPred: tree.equiPred,
+    joinResidualExprs: tree.joinResiduals?.map(exprToString),
     startupCost: Math.round(startupCost),
     estimatedCost: Math.round(totalCost),
     estimatedRows: Math.max(1, Math.round(estRows)),
@@ -2508,9 +2729,6 @@ export function explainJoinTree(
   };
 }
 
-/**
- * Extract output column descriptions from a select expression AST
- */
 function collectOutputColumns(expr: LuaExpression): string[] {
   if (expr.type !== "TableConstructor") {
     return [exprToString(expr)];
@@ -2645,22 +2863,18 @@ export function wrapPlanWithQueryOps(
   const filterSel = getDefaultFilterSelectivity(config);
 
   if (query.where) {
-    const usedPreds = collectUsedEquiPreds(root);
-    const residual = stripEquiPreds(query.where, usedPreds);
-    if (residual) {
-      root = {
-        nodeType: "Filter",
-        startupCost: root.startupCost,
-        estimatedCost: root.estimatedCost,
-        estimatedRows: Math.max(1, Math.round(root.estimatedRows * filterSel)),
-        estimatedWidth: root.estimatedWidth,
-        filterExpr: exprToString(residual),
-        whereExpr: residual,
-        filterType: "where",
-        statsSource: root.statsSource,
-        children: [root],
-      };
-    }
+    root = {
+      nodeType: "Filter",
+      startupCost: root.startupCost,
+      estimatedCost: root.estimatedCost,
+      estimatedRows: Math.max(1, Math.round(root.estimatedRows * filterSel)),
+      estimatedWidth: root.estimatedWidth,
+      filterExpr: exprToString(query.where),
+      whereExpr: query.where,
+      filterType: "where",
+      statsSource: root.statsSource,
+      children: [root],
+    };
   }
 
   if (query.groupBy && query.groupBy.length > 0) {
@@ -3091,15 +3305,6 @@ export function exprToString(expr: LuaExpression): string {
   }
 }
 
-function collectUsedEquiPreds(node: ExplainNode): EquiPredicate[] {
-  const result: EquiPredicate[] = [];
-  if (node.equiPred) result.push(node.equiPred);
-  for (const child of node.children) {
-    result.push(...collectUsedEquiPreds(child));
-  }
-  return result;
-}
-
 function exprMatchesEquiPred(
   expr: LuaExpression,
   preds: EquiPredicate[],
@@ -3129,20 +3334,136 @@ function parseSourceColumnFromExpr(
   return { source: expr.object.name, column: expr.property };
 }
 
-function stripEquiPreds(
+function stripJoinPredicates(
   expr: LuaExpression,
   preds: EquiPredicate[],
+  residuals: LuaExpression[],
 ): LuaExpression | undefined {
   if (expr.type === "Binary" && expr.operator === "and") {
-    const left = stripEquiPreds(expr.left, preds);
-    const right = stripEquiPreds(expr.right, preds);
+    const left = stripJoinPredicates(expr.left, preds, residuals);
+    const right = stripJoinPredicates(expr.right, preds, residuals);
     if (!left && !right) return undefined;
     if (!left) return right;
     if (!right) return left;
     return { ...expr, left, right };
   }
   if (exprMatchesEquiPred(expr, preds)) return undefined;
+  if (residuals.some((r) => exprStructurallyEquals(expr, r))) return undefined;
   return expr;
+}
+
+function exprStructurallyEquals(a: LuaExpression, b: LuaExpression): boolean {
+  if (a.type !== b.type) return false;
+
+  switch (a.type) {
+    case "Nil":
+      return true;
+    case "Boolean":
+      return a.value === (b as typeof a).value;
+    case "Number":
+      return (
+        a.value === (b as typeof a).value &&
+        a.numericType === (b as typeof a).numericType
+      );
+    case "String":
+      return a.value === (b as typeof a).value;
+    case "Variable":
+      return a.name === (b as typeof a).name;
+    case "PropertyAccess":
+      return (
+        a.property === (b as typeof a).property &&
+        exprStructurallyEquals(a.object, (b as typeof a).object)
+      );
+    case "TableAccess":
+      return (
+        exprStructurallyEquals(a.object, (b as typeof a).object) &&
+        exprStructurallyEquals(a.key, (b as typeof a).key)
+      );
+    case "Unary":
+      return (
+        a.operator === (b as typeof a).operator &&
+        exprStructurallyEquals(a.argument, (b as typeof a).argument)
+      );
+    case "Binary":
+      return (
+        a.operator === (b as typeof a).operator &&
+        exprStructurallyEquals(a.left, (b as typeof a).left) &&
+        exprStructurallyEquals(a.right, (b as typeof a).right)
+      );
+    case "Parenthesized":
+      return exprStructurallyEquals(a.expression, (b as typeof a).expression);
+    case "FunctionCall": {
+      const bb = b as typeof a;
+      return (
+        exprStructurallyEquals(a.prefix, bb.prefix) &&
+        a.name === bb.name &&
+        a.args.length === bb.args.length &&
+        a.args.every((arg, i) => exprStructurallyEquals(arg, bb.args[i])) &&
+        (a.orderBy?.length ?? 0) === (bb.orderBy?.length ?? 0) &&
+        (a.orderBy ?? []).every((ob, i) => {
+          const other = bb.orderBy![i];
+          return (
+            ob.direction === other.direction &&
+            ob.nulls === other.nulls &&
+            exprStructurallyEquals(ob.expression, other.expression)
+          );
+        })
+      );
+    }
+    case "FilteredCall":
+      return (
+        exprStructurallyEquals(a.call, (b as typeof a).call) &&
+        exprStructurallyEquals(a.filter, (b as typeof a).filter)
+      );
+    case "AggregateCall": {
+      const bb = b as typeof a;
+      return (
+        exprStructurallyEquals(a.call, bb.call) &&
+        a.orderBy.length === bb.orderBy.length &&
+        a.orderBy.every((ob, i) => {
+          const other = bb.orderBy[i];
+          return (
+            ob.direction === other.direction &&
+            ob.nulls === other.nulls &&
+            exprStructurallyEquals(ob.expression, other.expression)
+          );
+        })
+      );
+    }
+    case "TableConstructor": {
+      const bb = b as typeof a;
+      return (
+        a.fields.length === bb.fields.length &&
+        a.fields.every((field, i) => {
+          const other = bb.fields[i];
+          if (field.type !== other.type) return false;
+          switch (field.type) {
+            case "PropField":
+              return (
+                other.type === "PropField" &&
+                field.key === other.key &&
+                exprStructurallyEquals(field.value, other.value)
+              );
+            case "ExpressionField":
+              return (
+                other.type === "ExpressionField" &&
+                exprStructurallyEquals(field.value, other.value)
+              );
+            case "DynamicField":
+              return (
+                other.type === "DynamicField" &&
+                exprStructurallyEquals(field.key, other.key) &&
+                exprStructurallyEquals(field.value, other.value)
+              );
+          }
+        })
+      );
+    }
+    case "FunctionDefinition":
+      return a === b;
+    default:
+      return false;
+  }
 }
 
 function collectAggregateDescriptions(
@@ -3306,8 +3627,7 @@ export async function executeAndInstrument(
   if (tree.kind === "leaf") {
     let items = await materializeSource(tree.source, env, sf, overrides);
     const unfilteredRowCount =
-      tree.source.stats?.unfilteredRowCount ??
-      tree.source.stats?.rowCount;
+      tree.source.stats?.unfilteredRowCount ?? tree.source.stats?.rowCount;
 
     let jsRemovedCount = 0;
     if (pushedFilters && pushedFilters.length > 0) {
@@ -3326,7 +3646,6 @@ export async function executeAndInstrument(
     plan.actualRows = rows.length;
     plan.actualLoops = 1;
 
-    // Combine source-level and JS-level removals
     const sourceLevelRemoved =
       unfilteredRowCount !== undefined && unfilteredRowCount > items.length
         ? unfilteredRowCount - items.length
@@ -3362,8 +3681,7 @@ export async function executeAndInstrument(
   }
   const rightSource = tree.right.source;
   const rightUnfilteredRowCount =
-    rightSource.stats?.unfilteredRowCount ??
-    rightSource.stats?.rowCount;
+    rightSource.stats?.unfilteredRowCount ?? rightSource.stats?.rowCount;
   const rightT0 = opts.analyze && opts.timing ? performance.now() : 0;
   let rightItems = await materializeSource(rightSource, env, sf, overrides);
 
@@ -3383,7 +3701,6 @@ export async function executeAndInstrument(
   plan.children[1].actualRows = rightItems.length;
   plan.children[1].actualLoops = 1;
 
-  // Combine source-level and JS-level removals for right side
   const rightSourceLevelRemoved =
     rightUnfilteredRowCount !== undefined &&
     rightUnfilteredRowCount > rightItems.length
@@ -3532,6 +3849,12 @@ function formatNode(
     lines.push(
       `${detailPad}${condLabel}: (${ep.leftSource}.${ep.leftColumn} == ${ep.rightSource}.${ep.rightColumn})`,
     );
+  }
+
+  if (node.joinResidualExprs && node.joinResidualExprs.length > 0) {
+    for (const expr of node.joinResidualExprs) {
+      lines.push(`${detailPad}Join Residual Filter: ${expr}`);
+    }
   }
 
   if (node.sortKeys && node.sortKeys.length > 0) {
@@ -3708,13 +4031,89 @@ function formatNodeLabel(node: ExplainNode): string {
   }
 }
 
-// 24. Config bridge
+// 24. Join residual helpers
 
-/**
- * Build a JoinPlannerConfig from the SilverBullet Config object.
- * Call sites should invoke this once and pass the result through
- * to buildJoinTree / executeJoinTree / wrapPlanWithQueryOps.
- */
+function assignResidualPredicatesToLowestCoveringJoin(
+  tree: JoinNode,
+  expr: LuaExpression,
+  equiPreds?: EquiPredicate[],
+): void {
+  const allSourceNames = collectSourceNames(tree);
+  const conjuncts = flattenAnd(expr);
+
+  for (const conjunct of conjuncts) {
+    if (exprMatchesEquiPred(conjunct, equiPreds ?? [])) {
+      continue;
+    }
+
+    const refs = collectReferencedSources(conjunct, allSourceNames);
+
+    // Residual join predicates must reference at least two sources.
+    if (refs.size < 2) {
+      continue;
+    }
+
+    assignResidualPredicateToLowestCoveringJoin(tree, conjunct, refs);
+  }
+}
+
+function assignResidualPredicateToLowestCoveringJoin(
+  node: JoinNode,
+  predicate: LuaExpression,
+  refs: Set<string>,
+): boolean {
+  if (node.kind === "leaf") {
+    return false;
+  }
+
+  const leftSources = collectSourceNames(node.left);
+  const rightSources = collectSourceNames(node.right);
+
+  const leftCoversAll = isSubsetOf(refs, leftSources);
+  const rightCoversAll = isSubsetOf(refs, rightSources);
+
+  // Prefer the lowest covering join node.
+  if (leftCoversAll) {
+    return assignResidualPredicateToLowestCoveringJoin(
+      node.left,
+      predicate,
+      refs,
+    );
+  }
+  if (rightCoversAll) {
+    return assignResidualPredicateToLowestCoveringJoin(
+      node.right,
+      predicate,
+      refs,
+    );
+  }
+
+  // This is the lowest join node whose source-set covers the predicate.
+  if (!node.joinResiduals) {
+    node.joinResiduals = [];
+  }
+
+  if (!node.joinResiduals.some((r) => exprStructurallyEquals(r, predicate))) {
+    node.joinResiduals.push(predicate);
+  }
+
+  return true;
+}
+
+function isSubsetOf(
+  values: Set<string>,
+  candidateSuperset: Set<string>,
+): boolean {
+  for (const value of values) {
+    if (!candidateSuperset.has(value)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// 25. Config bridge
+
 export function joinPlannerConfigFromConfig(config: Config): JoinPlannerConfig {
   return {
     watchdogLimit:
