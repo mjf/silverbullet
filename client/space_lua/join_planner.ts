@@ -2266,6 +2266,34 @@ export async function applyPushedFilters(
   return result;
 }
 
+export async function applyPushedFiltersWithStats(
+  items: any[],
+  sourceName: string,
+  filters: SingleSourceFilter[],
+  env: LuaEnv,
+  sf: LuaStackFrame,
+): Promise<{ result: any[]; removedCount: number }> {
+  if (filters.length === 0) return { result: items, removedCount: 0 };
+
+  const relevant = filters.filter((f) => f.sourceName === sourceName);
+  if (relevant.length === 0) return { result: items, removedCount: 0 };
+
+  let result = items;
+  for (const filter of relevant) {
+    const filtered: any[] = [];
+    for (const item of result) {
+      const filterEnv = new LuaEnv(env);
+      filterEnv.setLocal(sourceName, item);
+      const val = await evalExpression(filter.expression, filterEnv, sf);
+      if (luaTruthy(val)) {
+        filtered.push(item);
+      }
+    }
+    result = filtered;
+  }
+  return { result, removedCount: items.length - result.length };
+}
+
 // 18. Equi-predicate stripping
 
 export function stripUsedJoinPredicates(
@@ -3267,14 +3295,43 @@ export async function executeAndInstrument(
   config?: JoinPlannerConfig,
   overrides?: MaterializedSourceOverrides,
   originMs?: number,
+  pushedFilters?: SingleSourceFilter[],
 ): Promise<LuaTable[]> {
   const t0 = originMs ?? (opts.analyze && opts.timing ? performance.now() : 0);
 
   if (tree.kind === "leaf") {
-    const items = await materializeSource(tree.source, env, sf, overrides);
+    let items = await materializeSource(tree.source, env, sf, overrides);
+    const unfilteredRowCount =
+      tree.source.stats?.unfilteredRowCount ??
+      tree.source.stats?.rowCount;
+
+    let jsRemovedCount = 0;
+    if (pushedFilters && pushedFilters.length > 0) {
+      const { result, removedCount } = await applyPushedFiltersWithStats(
+        items,
+        tree.source.name,
+        pushedFilters,
+        env,
+        sf,
+      );
+      items = result;
+      jsRemovedCount = removedCount;
+    }
+
     const rows = items.map((item) => rowToTable(tree.source.name, item));
     plan.actualRows = rows.length;
     plan.actualLoops = 1;
+
+    // Combine source-level and JS-level removals
+    const sourceLevelRemoved =
+      unfilteredRowCount !== undefined && unfilteredRowCount > items.length
+        ? unfilteredRowCount - items.length
+        : 0;
+    const totalRemoved = sourceLevelRemoved + jsRemovedCount;
+    if (totalRemoved > 0) {
+      plan.rowsRemovedByFilter = totalRemoved;
+    }
+
     if (opts.analyze && opts.timing) {
       const elapsed = Math.round((performance.now() - t0) * 1000) / 1000;
       plan.actualStartupTimeMs = elapsed;
@@ -3292,6 +3349,7 @@ export async function executeAndInstrument(
     config,
     overrides,
     t0,
+    pushedFilters,
   );
   if (tree.right.kind !== "leaf") {
     throw new Error(
@@ -3299,10 +3357,39 @@ export async function executeAndInstrument(
     );
   }
   const rightSource = tree.right.source;
+  const rightUnfilteredRowCount =
+    rightSource.stats?.unfilteredRowCount ??
+    rightSource.stats?.rowCount;
   const rightT0 = opts.analyze && opts.timing ? performance.now() : 0;
-  const rightItems = await materializeSource(rightSource, env, sf, overrides);
+  let rightItems = await materializeSource(rightSource, env, sf, overrides);
+
+  let rightJsRemoved = 0;
+  if (pushedFilters && pushedFilters.length > 0) {
+    const { result, removedCount } = await applyPushedFiltersWithStats(
+      rightItems,
+      rightSource.name,
+      pushedFilters,
+      env,
+      sf,
+    );
+    rightItems = result;
+    rightJsRemoved = removedCount;
+  }
+
   plan.children[1].actualRows = rightItems.length;
   plan.children[1].actualLoops = 1;
+
+  // Combine source-level and JS-level removals for right side
+  const rightSourceLevelRemoved =
+    rightUnfilteredRowCount !== undefined &&
+    rightUnfilteredRowCount > rightItems.length
+      ? rightUnfilteredRowCount - rightItems.length
+      : 0;
+  const rightTotalRemoved = rightSourceLevelRemoved + rightJsRemoved;
+  if (rightTotalRemoved > 0) {
+    plan.children[1].rowsRemovedByFilter = rightTotalRemoved;
+  }
+
   if (opts.analyze && opts.timing) {
     plan.children[1].actualStartupTimeMs =
       Math.round((rightT0 - t0) * 1000) / 1000;

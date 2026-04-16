@@ -70,6 +70,8 @@ export type CollectionExecutionCapabilities = {
 // Collection statistics for the cost-based planner
 export type CollectionStats = {
   rowCount: number;
+  // Row count set when `statsSource` is `recomputed-filtered-exact`
+  unfilteredRowCount?: number;
   ndv: Map<string, number>;
   avgColumnCount?: number;
   statsSource?: StatsSource;

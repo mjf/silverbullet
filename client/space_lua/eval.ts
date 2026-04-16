@@ -1604,9 +1604,11 @@ export function evalExpression(
                 sf,
               );
 
+              const originalRowCount = src.stats?.rowCount;
               const filteredStats = computeStatsFromArray(filtered);
               src.stats = {
                 ...filteredStats,
+                unfilteredRowCount: originalRowCount,
                 statsSource: "recomputed-filtered-exact",
                 executionCapabilities: {
                   ...(src.stats?.executionCapabilities ?? {}),
