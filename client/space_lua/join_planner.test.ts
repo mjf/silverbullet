@@ -935,3 +935,145 @@ describe("join residual execution", () => {
     expect(residualWhere).toBeUndefined();
   });
 });
+
+describe("aggregate detection uses configured aggregate registry", () => {
+  it("treats config-defined aggregate functions as aggregates in explain planning", () => {
+    const plan: ExplainNode = {
+      nodeType: "Scan",
+      source: "t",
+      startupCost: 0,
+      estimatedCost: 100,
+      estimatedRows: 100,
+      estimatedWidth: 5,
+      children: [],
+    };
+
+    const query = {
+      select: parseExpressionString("myagg(t.value)"),
+    };
+
+    const config = {
+      get(path: string, defaultValue?: any) {
+        if (path === "aggregates.myagg") {
+          return {
+            name: "myagg",
+            initialize: () => 0,
+            iterate: () => 0,
+          };
+        }
+        return defaultValue;
+      },
+    };
+
+    const wrapped = wrapPlanWithQueryOps(
+      plan,
+      query,
+      undefined,
+      undefined,
+      undefined,
+      config as any,
+    );
+
+    expect(wrapped.nodeType).toBe("Project");
+    expect(wrapped.children).toHaveLength(1);
+
+    const aggNode = wrapped.children[0];
+    expect(aggNode.nodeType).toBe("GroupAggregate");
+    expect(aggNode.implicitGroup).toBe(true);
+    expect(aggNode.estimatedRows).toBe(1);
+    expect(aggNode.outputColumns).toEqual(["myagg(t.value)"]);
+    expect(aggNode.aggregates).toEqual([
+      {
+        name: "myagg",
+        args: "t.value",
+      },
+    ]);
+  });
+
+  it("treats configured aggregate aliases as aggregates in explain planning", () => {
+    const plan: ExplainNode = {
+      nodeType: "Scan",
+      source: "t",
+      startupCost: 0,
+      estimatedCost: 100,
+      estimatedRows: 100,
+      estimatedWidth: 5,
+      children: [],
+    };
+
+    const query = {
+      select: parseExpressionString("aliasagg(t.value)"),
+    };
+
+    const config = {
+      get(path: string, defaultValue?: any) {
+        if (path === "aggregates.aliasagg") {
+          return {
+            alias: "sum",
+          };
+        }
+        return defaultValue;
+      },
+    };
+
+    const wrapped = wrapPlanWithQueryOps(
+      plan,
+      query,
+      undefined,
+      undefined,
+      undefined,
+      config as any,
+    );
+
+    expect(wrapped.nodeType).toBe("Project");
+    expect(wrapped.children).toHaveLength(1);
+
+    const aggNode = wrapped.children[0];
+    expect(aggNode.nodeType).toBe("GroupAggregate");
+    expect(aggNode.implicitGroup).toBe(true);
+    expect(aggNode.estimatedRows).toBe(1);
+    expect(aggNode.aggregates).toEqual([
+      {
+        name: "aliasagg",
+        args: "t.value",
+      },
+    ]);
+  });
+
+  it("does not classify unknown functions as aggregates", () => {
+    const plan: ExplainNode = {
+      nodeType: "Scan",
+      source: "t",
+      startupCost: 0,
+      estimatedCost: 100,
+      estimatedRows: 100,
+      estimatedWidth: 5,
+      children: [],
+    };
+
+    const query = {
+      select: parseExpressionString("unknown_fn(t.value)"),
+    };
+
+    const config = {
+      get(_path: string, defaultValue?: any) {
+        return defaultValue;
+      },
+    };
+
+    const wrapped = wrapPlanWithQueryOps(
+      plan,
+      query,
+      undefined,
+      undefined,
+      undefined,
+      config as any,
+    );
+
+    expect(wrapped.nodeType).toBe("Project");
+    expect(wrapped.children).toHaveLength(1);
+
+    const child = wrapped.children[0];
+    expect(child.nodeType).not.toBe("GroupAggregate");
+  });
+});

@@ -20,6 +20,7 @@ import {
   singleResult,
 } from "./runtime.ts";
 import { MCVList } from "./mcv.ts";
+import { getAggregateSpec } from "./aggregates.ts";
 import type { Config } from "../config.ts";
 
 // 1. Constants
@@ -2768,25 +2769,14 @@ function collectOutputColumns(expr: LuaExpression): string[] {
   return outputs;
 }
 
-const KNOWN_AGGREGATE_NAMES = new Set([
-  "count",
-  "sum",
-  "avg",
-  "min",
-  "max",
-  "array_agg",
-  "string_agg",
-  "group_concat",
-  "bool_and",
-  "bool_or",
-  "every",
-  "percentile_cont",
-  "percentile_disc",
-  "json_agg",
-  "json_object_agg",
-]);
+function isAggregateFunctionName(name: string, config?: Config): boolean {
+  return getAggregateSpec(name, config) !== null;
+}
 
-function selectContainsAggregate(expr: LuaExpression): boolean {
+function selectContainsAggregate(
+  expr: LuaExpression,
+  runtimeConfig?: Config,
+): boolean {
   switch (expr.type) {
     case "FilteredCall":
       return true;
@@ -2795,32 +2785,35 @@ function selectContainsAggregate(expr: LuaExpression): boolean {
     case "FunctionCall":
       if (
         expr.prefix.type === "Variable" &&
-        KNOWN_AGGREGATE_NAMES.has(expr.prefix.name)
+        isAggregateFunctionName(expr.prefix.name, runtimeConfig)
       ) {
         return true;
       }
-      return expr.args.some(selectContainsAggregate);
+      return expr.args.some((arg) =>
+        selectContainsAggregate(arg, runtimeConfig)
+      );
     case "TableConstructor":
       return expr.fields.some((f) => {
         switch (f.type) {
           case "PropField":
           case "ExpressionField":
-            return selectContainsAggregate(f.value);
+            return selectContainsAggregate(f.value, runtimeConfig);
           case "DynamicField":
             return (
-              selectContainsAggregate(f.key) || selectContainsAggregate(f.value)
+              selectContainsAggregate(f.key, runtimeConfig) ||
+              selectContainsAggregate(f.value, runtimeConfig)
             );
         }
       });
     case "Binary":
       return (
-        selectContainsAggregate(expr.left) ||
-        selectContainsAggregate(expr.right)
+        selectContainsAggregate(expr.left, runtimeConfig) ||
+        selectContainsAggregate(expr.right, runtimeConfig)
       );
     case "Unary":
-      return selectContainsAggregate(expr.argument);
+      return selectContainsAggregate(expr.argument, runtimeConfig);
     case "Parenthesized":
-      return selectContainsAggregate(expr.expression);
+      return selectContainsAggregate(expr.expression, runtimeConfig);
     default:
       return false;
   }
@@ -2841,6 +2834,7 @@ export function wrapPlanWithQueryOps(
   sourceStats?: Map<string, CollectionStats>,
   accumulatedNdv?: Map<string, Map<string, number>>,
   config?: JoinPlannerConfig,
+  runtimeConfig?: Config,
 ): ExplainNode {
   let root = plan;
   const filterSel = getDefaultFilterSelectivity(config);
@@ -2873,10 +2867,10 @@ export function wrapPlanWithQueryOps(
 
     const aggDescs: AggregateDescription[] = [];
     if (query.select) {
-      aggDescs.push(...collectAggregateDescriptions(query.select));
+      aggDescs.push(...collectAggregateDescriptions(query.select, runtimeConfig));
     }
     if (query.having) {
-      aggDescs.push(...collectAggregateDescriptions(query.having));
+      aggDescs.push(...collectAggregateDescriptions(query.having, runtimeConfig));
     }
 
     const seen = new Set<string>();
@@ -2925,11 +2919,11 @@ export function wrapPlanWithQueryOps(
   const isImplicitAggregate =
     query.select &&
     !hasExplicitGroupBy &&
-    selectContainsAggregate(query.select);
+    selectContainsAggregate(query.select, runtimeConfig);
 
   if (isImplicitAggregate) {
     const cols = collectOutputColumns(query.select!);
-    const aggDescs = collectAggregateDescriptions(query.select!);
+    const aggDescs = collectAggregateDescriptions(query.select!, runtimeConfig);
     root = {
       nodeType: "GroupAggregate",
       startupCost: root.estimatedCost,
@@ -3451,21 +3445,26 @@ function exprStructurallyEquals(a: LuaExpression, b: LuaExpression): boolean {
 
 function collectAggregateDescriptions(
   expr: LuaExpression | undefined,
+  runtimeConfig?: Config,
 ): AggregateDescription[] {
   if (!expr) return [];
   const result: AggregateDescription[] = [];
-  walkAggregates(expr, result);
+  walkAggregates(expr, result, runtimeConfig);
   return result;
 }
 
 function walkAggregates(
   expr: LuaExpression,
   out: AggregateDescription[],
+  runtimeConfig?: Config,
 ): void {
   switch (expr.type) {
     case "FilteredCall": {
       const fc = expr.call;
-      if (fc.prefix.type === "Variable") {
+      if (
+        fc.prefix.type === "Variable" &&
+        isAggregateFunctionName(fc.prefix.name, runtimeConfig)
+      ) {
         const args = fc.args.map(exprToString).join(", ");
         out.push({
           name: fc.prefix.name,
@@ -3474,13 +3473,16 @@ function walkAggregates(
         });
         return;
       }
-      walkAggregates(fc, out);
-      walkAggregates(expr.filter, out);
+      walkAggregates(fc, out, runtimeConfig);
+      walkAggregates(expr.filter, out, runtimeConfig);
       return;
     }
     case "AggregateCall": {
       const fc = expr.call;
-      if (fc.prefix.type === "Variable") {
+      if (
+        fc.prefix.type === "Variable" &&
+        isAggregateFunctionName(fc.prefix.name, runtimeConfig)
+      ) {
         const args = fc.args.map(exprToString).join(", ");
         const ob = expr.orderBy
           .map(
@@ -3496,13 +3498,13 @@ function walkAggregates(
         });
         return;
       }
-      walkAggregates(fc, out);
+      walkAggregates(fc, out, runtimeConfig);
       return;
     }
     case "FunctionCall": {
       if (
         expr.prefix.type === "Variable" &&
-        KNOWN_AGGREGATE_NAMES.has(expr.prefix.name)
+        isAggregateFunctionName(expr.prefix.name, runtimeConfig)
       ) {
         const args = expr.args.map(exprToString).join(", ");
         const desc: AggregateDescription = { name: expr.prefix.name, args };
@@ -3518,32 +3520,32 @@ function walkAggregates(
         out.push(desc);
         return;
       }
-      walkAggregates(expr.prefix, out);
+      walkAggregates(expr.prefix, out, runtimeConfig);
       for (const arg of expr.args) {
-        walkAggregates(arg, out);
+        walkAggregates(arg, out, runtimeConfig);
       }
       return;
     }
     case "Binary":
-      walkAggregates(expr.left, out);
-      walkAggregates(expr.right, out);
+      walkAggregates(expr.left, out, runtimeConfig);
+      walkAggregates(expr.right, out, runtimeConfig);
       return;
     case "Unary":
-      walkAggregates(expr.argument, out);
+      walkAggregates(expr.argument, out, runtimeConfig);
       return;
     case "Parenthesized":
-      walkAggregates(expr.expression, out);
+      walkAggregates(expr.expression, out, runtimeConfig);
       return;
     case "TableConstructor":
       for (const field of expr.fields) {
         switch (field.type) {
           case "DynamicField":
-            walkAggregates(field.key, out);
-            walkAggregates(field.value, out);
+            walkAggregates(field.key, out, runtimeConfig);
+            walkAggregates(field.value, out, runtimeConfig);
             break;
           case "PropField":
           case "ExpressionField":
-            walkAggregates(field.value, out);
+            walkAggregates(field.value, out, runtimeConfig);
             break;
         }
       }
