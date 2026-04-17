@@ -3808,9 +3808,9 @@ do
   end
 end
 
--- 102. plan order by
+-- 102. leading
 
--- 102a. Two-source with plan order by
+-- 102a. Two-source with leading
 do
   local xs = { { x = 1 }, { x = 2 } }
   local ys = { { y = 10 }, { y = 20 } }
@@ -3818,7 +3818,7 @@ do
     from
       a = xs,
       b = ys
-    plan order by b, a
+    leading b, a
     select {
       x = a.x,
       y = b.y,
@@ -3827,7 +3827,7 @@ do
   assertEquals(#r, 4, "102a: row count")
 end
 
--- 102b. Three-source with plan order by
+-- 102b. Three-source with leading
 do
   local xs = { { v = 1 } }
   local ys = { { v = 20 }, { v = 30 } }
@@ -3837,7 +3837,7 @@ do
       a = xs,
       b = ys,
       c = zs
-    plan order by c, a, b
+    leading c, a, b
     select {
       s = a.v + b.v + c.v,
     }
@@ -3849,7 +3849,7 @@ do
   assertEquals(r[2].s, 431, "102b: second") -- 1+30+400
 end
 
--- 102c. plan order by with join hint
+-- 102c. leading with join hint
 do
   local xs = { { x = 1 }, { x = 2 } }
   local ys = { { y = 10 }, { y = 20 } }
@@ -3857,7 +3857,7 @@ do
     from
       a = xs hash,
       b = ys loop
-    plan order by b, a
+    leading b, a
     select {
       x = a.x,
       y = b.y,
@@ -3866,7 +3866,7 @@ do
   assertEquals(#r, 4, "102c: row count")
 end
 
--- 102d. plan order by with where filter
+-- 102d. leading with where filter
 do
   local xs = { { x = 1 }, { x = 2 }, { x = 3 } }
   local ys = { { y = 10 }, { y = 20 } }
@@ -3874,7 +3874,7 @@ do
     from
       a = xs,
       b = ys
-    plan order by a, b
+    leading a, b
     where
       a.x > 1
     select {
@@ -3889,7 +3889,7 @@ do
   assertEquals(r[1].y, 10, "102d: r1.y")
 end
 
--- 102e. plan order by partial (only some sources named)
+-- 102e. leading partial (only some sources named)
 do
   local xs = { { v = 1 }, { v = 2 } }
   local ys = { { v = 100 } }
@@ -3899,7 +3899,7 @@ do
       a = xs,
       b = ys,
       c = zs
-    plan order by c
+    leading c
     select {
       s = a.v + b.v + c.v,
     }
@@ -4327,9 +4327,9 @@ do
   assertEquals(r[2].n, 4, "105b: r2.n")
 end
 
--- 106. plan order by + full pipeline
+-- 106. leading + full pipeline
 
--- 106a. plan order by + where + select + order by + limit
+-- 106a. leading + where + select + order by + limit
 do
   local xs = { { x = 1 }, { x = 2 }, { x = 3 } }
   local ys = { { y = 100 }, { y = 200 }, { y = 300 } }
@@ -4337,7 +4337,7 @@ do
     from
       a = xs,
       b = ys
-    plan order by b, a
+    leading b, a
     where
       a.x + b.y <= 202
     select {

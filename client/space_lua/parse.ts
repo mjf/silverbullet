@@ -38,7 +38,7 @@ const luaStyleTags = styleTags({
   CompareOp: t.operator,
   "true false": t.bool,
   Comment: t.lineComment,
-  "return break goto do end while repeat until function local if then else elseif in for nil or and not query from where limit offset select order by desc asc nulls first last group having filter using plan semi anti hash loop merge all distinct explain analyze costs summary timing verbose":
+  "return break goto do end while repeat until function local if then else elseif in for nil or and not query from where limit offset select order by desc asc nulls first last group having filter using leading semi anti hash loop merge all distinct explain analyze costs summary timing verbose":
     t.keyword,
 });
 
@@ -131,7 +131,7 @@ function expressionHasFunctionDef(e: LuaExpression): boolean {
           case "From":
           case "Select":
           case "GroupBy":
-          case "PlanOrderBy":
+          case "Leading":
             for (const f of c.fields) {
               switch (f.type) {
                 case "DynamicField":
@@ -252,7 +252,7 @@ function exprReferencesNames(e: LuaExpression, names: Set<string>): boolean {
           case "From":
           case "Select":
           case "GroupBy":
-          case "PlanOrderBy":
+          case "Leading":
             for (const f of c.fields) {
               switch (f.type) {
                 case "DynamicField":
@@ -588,7 +588,7 @@ function exprCapturesNames(e: LuaExpression, names: Set<string>): boolean {
           case "From":
           case "Select":
           case "GroupBy":
-          case "PlanOrderBy":
+          case "Leading":
             for (const f of c.fields) {
               switch (f.type) {
                 case "DynamicField":
@@ -1325,12 +1325,12 @@ function parseExpression(t: ParseTree, ctx: ASTCtx): LuaExpression {
       const clauses = t
         .children!.slice(2, -1)
         .map((c) => parseQueryClause(c, ctx));
-      const hasPlanOrderBy = clauses.some((c) => c.type === "PlanOrderBy");
-      if (hasPlanOrderBy) {
+      const hasLeading = clauses.some((c) => c.type === "Leading");
+      if (hasLeading) {
         const fromClause = clauses.find((c) => c.type === "From");
         if (!fromClause || fromClause.fields.length < 2) {
           throw new Error(
-            "'plan order by' only valid for multi-source 'from' clause",
+            "'leading' only valid for multi-source 'from' clause",
           );
         }
       }
@@ -1464,14 +1464,14 @@ function parseQueryClause(t: ParseTree, ctx: ASTCtx): LuaQueryClause {
         ctx: context(t, ctx),
       };
     }
-    case "PlanOrderByClause": {
-      // children: ckw<"plan">, ckw<"order">, ckw<"by">, FieldList
+    case "LeadingClause": {
+      // children: ckw<"leading">, FieldList
       const fieldListNode = t.children!.find((c) => c.type === "FieldList");
       if (!fieldListNode) {
-        throw new Error("PlanOrderByClause missing FieldList");
+        throw new Error("LeadingClause missing FieldList");
       }
       return {
-        type: "PlanOrderBy",
+        type: "Leading",
         fields: parseFieldList(fieldListNode, ctx),
         ctx: context(t, ctx),
       };

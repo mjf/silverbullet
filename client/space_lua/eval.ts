@@ -4,7 +4,7 @@ import type {
   LuaExpression,
   LuaFromField,
   LuaLValue,
-  LuaPlanOrderByClause,
+  LuaLeadingClause,
   LuaStatement,
   LuaTableField,
   NumericType,
@@ -1502,8 +1502,8 @@ export function evalExpression(
 
             // Check for plan order hint
             const planClause = q.clauses.find(
-              (c) => c.type === "PlanOrderBy",
-            ) as LuaPlanOrderByClause | undefined;
+              (c) => c.type === "Leading",
+            ) as LuaLeadingClause | undefined;
             const planOrder = planClause?.fields.map((f) => {
               if (f.type === "ExpressionField" && f.value.type === "Variable") {
                 return f.value.name;

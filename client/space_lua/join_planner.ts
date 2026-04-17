@@ -930,7 +930,7 @@ function computeJoinCost(
 
 export function buildJoinTree(
   sources: JoinSource[],
-  planOrder?: string[],
+  leading?: string[],
   equiPreds?: EquiPredicate[],
   rangePreds?: RangePredicate[],
   residualWhere?: LuaExpression,
@@ -942,7 +942,7 @@ export function buildJoinTree(
 
   const ordered = orderSources(
     sources,
-    planOrder,
+    leading,
     equiPreds,
     rangePreds,
     config,
@@ -1055,15 +1055,15 @@ export function buildJoinTree(
 
 function orderSources(
   sources: JoinSource[],
-  planOrder?: string[],
+  leading?: string[],
   equiPreds?: EquiPredicate[],
   rangePreds?: RangePredicate[],
   config?: JoinPlannerConfig,
 ): JoinSource[] {
-  if (planOrder && planOrder.length > 0) {
+  if (leading && leading.length > 0) {
     const byName = new Map(sources.map((s) => [s.name, s]));
     const ordered: JoinSource[] = [];
-    for (const n of planOrder) {
+    for (const n of leading) {
       const s = byName.get(n);
       if (s) {
         ordered.push(s);

@@ -102,7 +102,7 @@ QueryClause {
   OffsetClause |
   GroupByClause |
   HavingClause |
-  PlanOrderByClause |
+  LeadingClause |
   ExplainClause
 }
 
@@ -144,7 +144,7 @@ fromField[@isGroup=Field] {
   FieldExp { exp JoinHint? }
 }
 
-PlanOrderByClause { ckw<"plan"> ckw<"order"> ckw<"by"> FieldList }
+LeadingClause { ckw<"leading"> FieldList }
 
 WhereClause { ckw<"where"> exp }
 LimitClause { ckw<"limit"> exp ("," exp)? }

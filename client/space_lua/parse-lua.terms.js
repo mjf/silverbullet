@@ -32,7 +32,7 @@ export const
   OffsetClause = 98,
   GroupByClause = 100,
   HavingClause = 102,
-  PlanOrderByClause = 104,
+  LeadingClause = 104,
   ExplainClause = 106,
   ExplainBareEntry = 108,
   ExplainOptionName = 109,

@@ -336,7 +336,7 @@ export type LuaQueryClause =
   | LuaSelectClause
   | LuaGroupByClause
   | LuaHavingClause
-  | LuaPlanOrderByClause
+  | LuaLeadingClause
   | LuaExplainClause;
 
 // Field list used by `from`, `select` and `group by` clauses
@@ -345,8 +345,8 @@ export type LuaFromClause = {
   fields: LuaFromField[];
 } & ASTContext;
 
-export type LuaPlanOrderByClause = {
-  type: "PlanOrderBy";
+export type LuaLeadingClause = {
+  type: "Leading";
   fields: LuaTableField[];
 } & ASTContext;
 
