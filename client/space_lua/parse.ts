@@ -38,7 +38,7 @@ const luaStyleTags = styleTags({
   CompareOp: t.operator,
   "true false": t.bool,
   Comment: t.lineComment,
-  "return break goto do end while repeat until function local if then else elseif in for nil or and not query from materialized where limit offset select order by desc asc nulls first last group having filter using leading inner semi anti hash loop merge all distinct explain analyze costs summary timing verbose":
+  "return break goto do end while repeat until function local if then else elseif in for nil or and not query from materialized with rows width cost where limit offset select order by desc asc nulls first last group having filter using leading inner semi anti hash loop merge all distinct explain analyze costs summary timing verbose hints":
     t.keyword,
 });
 

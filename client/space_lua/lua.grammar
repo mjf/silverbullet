@@ -139,13 +139,36 @@ ExplainBoolValue {
 
 FromClause { ckw<"from"> FromFieldList }
 FromFieldList { fromField ("," fromField)* }
+
 fromField[@isGroup=Field] {
-  FieldDynamicMaterialized { kw<"materialized"> "[" exp "]" "=" exp JoinHint? } |
-  FieldPropMaterialized { kw<"materialized"> Name "=" exp JoinHint? } |
-  FieldExpMaterialized { kw<"materialized"> exp JoinHint? } |
-  FieldDynamic { "[" exp "]" "=" exp JoinHint? } |
-  FieldProp { Name "=" exp JoinHint? } |
-  FieldExp { exp JoinHint? }
+  FieldDynamicMaterialized { kw<"materialized"> "[" exp "]" "=" exp WithClause? JoinHint? } |
+  FieldPropMaterialized { kw<"materialized"> Name "=" exp WithClause? JoinHint? } |
+  FieldExpMaterialized { kw<"materialized"> exp WithClause? JoinHint? } |
+  FieldDynamic { "[" exp "]" "=" exp WithClause? JoinHint? } |
+  FieldProp { Name "=" exp WithClause? JoinHint? } |
+  FieldExp { exp WithClause? JoinHint? }
+}
+
+WithClause { ckw<"with"> WithBareEntry+ WithOptionList? }
+
+WithBareEntry { WithOptionName WithValue? }
+
+WithOptionList {
+  "(" list<WithParenEntry> ")"
+}
+
+WithParenEntry { WithOptionName WithValue? }
+
+WithOptionName {
+  ckw<"rows"> |
+  ckw<"width"> |
+  ckw<"cost">
+}
+
+WithValue {
+  kw<"true"> | kw<"false"> | ckw<"on"> | ckw<"off"> |
+  Number |
+  LiteralString
 }
 
 LeadingClause { ckw<"leading"> FieldList }
