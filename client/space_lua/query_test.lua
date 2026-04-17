@@ -6465,3 +6465,83 @@ do
     "105: expected execution time, got: " .. tostring(plan)
   )
 end
+
+-- 147. materialized sources
+
+do
+  local r = query [[
+    from
+      materialized 1
+    select all
+      _
+  ]]
+  assertEquals(#r, 1)
+  assertEquals(r[1], 1)
+end
+
+do
+  local r = query [[
+    from
+      materialized {{a = 1}, {a = 2}, {a = 3}}
+    select all
+      _.a
+    order by
+      _.a
+  ]]
+  assertEquals(#r, 3)
+  assertEquals(r[1], 1)
+  assertEquals(r[2], 2)
+  assertEquals(r[3], 3)
+end
+
+do
+  local rows = {
+    { id = 2, name = "b" },
+    { id = 1, name = "a" },
+    { id = 3, name = "c" },
+  }
+
+  local r = query [[
+    from
+      materialized rows
+    select all
+      _.name
+    order by
+      _.id
+  ]]
+  assertEquals(#r, 3)
+  assertEquals(r[1], "a")
+  assertEquals(r[2], "b")
+  assertEquals(r[3], "c")
+end
+
+do
+  local xs = {
+    { id = 1, name = "a" },
+    { id = 2, name = "b" },
+    { id = 3, name = "c" },
+  }
+  local ys = {
+    { fk = 2, val = "x" },
+    { fk = 3, val = "y" },
+  }
+
+  local r = query [[
+    from
+      materialized x = xs,
+      y = ys hash
+    where
+      x.id == y.fk
+    select all {
+      name = x.name,
+      val = y.val,
+    }
+    order by
+      x.name
+  ]]
+  assertEquals(#r, 2)
+  assertEquals(r[1].name, "b")
+  assertEquals(r[1].val, "x")
+  assertEquals(r[2].name, "c")
+  assertEquals(r[2].val, "y")
+end
