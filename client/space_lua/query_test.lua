@@ -3719,7 +3719,7 @@ do
   local r = query [[
     from
       a = xs,
-      b = ys hash
+      hash b = ys
     select {
       x = a.x,
       y = b.y,
@@ -3735,7 +3735,7 @@ do
   local r = query [[
     from
       a = xs,
-      b = ys loop
+      loop b = ys
     select {
       x = a.x,
       y = b.y,
@@ -3752,8 +3752,8 @@ do
   local r = query [[
     from
       a = xs,
-      b = ys hash,
-      c = zs loop
+      hash b = ys,
+      loop c = zs
     select {
       x = a.x,
       y = b.y,
@@ -3769,7 +3769,7 @@ do
   local ys = { { y = 2 } }
   local r = query [[
     from
-      a = xs hash,
+      hash a = xs,
       b = ys
     select {
       x = a.x,
@@ -3784,12 +3784,12 @@ do
   local xs = { { x = 1 }, { x = 2 } }
   local ys = { { y = 10 }, { y = 20 } }
   local rh = query [[
-    from a = xs, b = ys hash
+    from a = xs, hash b = ys
     select { x = a.x, y = b.y }
     order by a.x, b.y
   ]]
   local rl = query [[
-    from a = xs, b = ys loop
+    from a = xs, loop b = ys
     select { x = a.x, y = b.y }
     order by a.x, b.y
   ]]
@@ -3855,8 +3855,8 @@ do
   local ys = { { y = 10 }, { y = 20 } }
   local r = query [[
     from
-      a = xs hash,
-      b = ys loop
+      hash a = xs,
+      loop b = ys
     leading b, a
     select {
       x = a.x,
@@ -4533,9 +4533,9 @@ do
   local joined = query [[
     from
       a = xs,
-      b = ys loop using function(a, b)
+      loop using function(a, b)
         return a.id == b.fk
-      end
+      end b = ys
     select {
       a_name = a.name,
       b_val  = b.val,
@@ -4574,7 +4574,7 @@ do
   local joined = query [[
     from
       a = xs,
-      b = ys loop using matchById
+      loop using matchById b = ys
     select {
       a_name = a.name,
       b_val  = b.val,
@@ -4606,9 +4606,9 @@ do
   local joined = query [[
     from
       a = xs,
-      b = ys loop using function(a, b)
+      loop using function(a, b)
         return a.id == b.fk
-      end
+      end b = ys
     select {
       x = a.id,
       y = b.fk,
@@ -4632,9 +4632,9 @@ do
   local joined = query [[
     from
       a = xs,
-      b = ys loop using function(a, b)
+      loop using function(a, b)
         return true
-      end
+      end b = ys
     select {
       s = a.v + b.v,
     }
@@ -4666,9 +4666,9 @@ do
   local joined = query [[
     from
       a = xs,
-      b = ys loop using function(a, b)
+      loop using function(a, b)
         return a.id == b.fk
-      end
+      end b = ys
     where
       a.name ~= "Bob"
     select {
@@ -4706,9 +4706,9 @@ do
   local joined = query [[
     from
       d = depts,
-      e = employees loop using function(d, e)
+      loop using function(d, e)
         return d.dept == e.dept
-      end
+      end e = employees
     group by
       d.dept
     select {
@@ -4749,9 +4749,9 @@ do
   local joined = query [[
     from
       a = xs,
-      b = ys loop using function(a, b)
+      loop using function(a, b)
         return a.id == b.fk
-      end
+      end b = ys
     select {
       a_name = a.name,
       b_val  = b.val,
@@ -4786,9 +4786,9 @@ do
   local joined = query [[
     from
       a = xs,
-      b = ys loop using function(a, b)
+      loop using function(a, b)
         return a.v < b.v
-      end
+      end b = ys
     select {
       av = a.v,
       bv = b.v,
@@ -4815,9 +4815,9 @@ do
   local joined = query [[
     from
       a = xs,
-      b = ys loop using function(a, b)
+      loop using function(a, b)
         return true
-      end
+      end b = ys
     select {
       bv = b.val,
     }
@@ -4841,9 +4841,9 @@ do
   local r_using = query [[
     from
       a = xs,
-      b = ys loop using function(a, b)
+      loop using function(a, b)
         return a.id == b.fk
-      end
+      end b = ys
     select {
       n = a.name,
       v = b.val,
@@ -4855,7 +4855,7 @@ do
   local r_where = query [[
     from
       a = xs,
-      b = ys loop
+      loop b = ys
     where
       a.id == b.fk
     select {
@@ -5213,9 +5213,9 @@ do
   local r = query [[
     from
       a = xs,
-      b = ys loop using function(a, b)
+      loop using function(a, b)
         return a.id == b.fk
-      end
+      end b = ys
     select all {
       n = a.name,
       v = b.val,
@@ -5240,9 +5240,9 @@ do
   local r = query [[
     from
       a = xs,
-      b = ys loop using function(a, b)
+      loop using function(a, b)
         return a.id == b.fk
-      end
+      end b = ys
     select distinct {
       n = a.name,
       v = b.val,
@@ -5273,12 +5273,12 @@ do
   local r = query [[
     from
       a = as,
-      b = bs loop using function(a, b)
+      loop using function(a, b)
         return a.aid == b.aid
-      end,
-      c = cs loop using function(left, c)
+      end b = bs,
+      loop using function(left, c)
         return left.b.bid == c.bid
-      end
+      end c = cs
     select {
       aid = a.aid,
       bid = b.bid,
@@ -5317,12 +5317,12 @@ do
   local r = query [[
     from
       u = users,
-      m = memberships loop using function(u, m)
+      loop using function(u, m)
         return u.uid == m.uid
-      end,
-      p = permissions loop using function(left, p)
+      end m = memberships,
+      loop using function(left, p)
         return left.u.org == p.org and left.m.team == p.team
-      end
+      end p = permissions
     select {
       uid = u.uid,
       team = m.team,
@@ -5357,9 +5357,9 @@ do
   local r = query [[
     from
       a = xs,
-      b = ys loop using function(a, b)
+      loop using function(a, b)
         return a.id == b.fk
-      end
+      end b = ys
     select {
       n = a.name,
       v = b.val,
@@ -5454,7 +5454,7 @@ do
   local r = query [[
     from
       x = xs,
-      y = ys hash
+      hash y = ys
     where
       x.ok == y.ok
     select {
@@ -5487,7 +5487,7 @@ do
   local r = query [[
     from
       x = xs,
-      y = ys hash
+      hash y = ys
     where
       x.id == y.fk
     select {
@@ -5519,9 +5519,9 @@ do
   local joined = query [[
     from
       a = xs,
-      b = ys loop using function(a, b)
+      loop using function(a, b)
         return a.v < b.v
-      end
+      end b = ys
     select {
       pair = a.v .. ":" .. b.v,
     }
@@ -5556,9 +5556,9 @@ do
   local r = query [[
     from
       u = users,
-      e = events loop using function(u, e)
+      loop using function(u, e)
         return u.uid == e.uid
-      end
+      end e = events
     where
       u.active
     select {
@@ -5621,12 +5621,12 @@ do
   local r = query [[
     from
       a = arows,
-      b = brows loop using function(a, b)
+      loop using function(a, b)
         return a.id == b.aid
-      end,
-      c = crows loop using function(left, c)
+      end b = brows,
+      loop using function(left, c)
         return left.a.id == 1 and left.b.bid == c.bid
-      end
+      end c = crows
     select {
       pair = a.name .. ":" .. c.label,
     }
@@ -5650,7 +5650,7 @@ do
     local _r = query [[
       from
         a = xs,
-        b = ys loop using missingPredicate
+        loop using missingPredicate b = ys
       select {
         id = a.id,
       }
@@ -5680,7 +5680,7 @@ do
   local r = query [[
     from
       x = xs,
-      y = ys semi hash
+      semi hash y = ys
     where
       x.id == y.fk
     select {
@@ -5711,7 +5711,7 @@ do
   local r = query [[
     from
       x = xs,
-      y = ys anti hash
+      anti hash y = ys
     where
       x.id == y.fk
     select {
@@ -5741,9 +5741,9 @@ do
   local r = query [[
     from
       x = xs,
-      y = ys semi loop using function(x, y)
+      semi loop using function(x, y)
         return x.id == y.fk
-      end
+      end y = ys
     select {
       name = x.name,
     }
@@ -5773,9 +5773,9 @@ do
     explain
     from
       x = xs,
-      y = ys semi loop using function(x, y)
+      semi loop using function(x, y)
         return x.id == y.fk
-      end
+      end y = ys
     select {
       name = x.name,
     }
@@ -5804,9 +5804,9 @@ do
     explain
     from
       x = xs,
-      y = ys anti loop using function(x, y)
+      anti loop using function(x, y)
         return x.id == y.fk
-      end
+      end y = ys
     select {
       name = x.name,
     }
@@ -5834,9 +5834,9 @@ do
   local r = query [[
     from
       x = xs,
-      y = ys anti loop using function(x, y)
+      anti loop using function(x, y)
         return x.id == y.fk
-      end
+      end y = ys
     select {
       name = x.name,
     }
@@ -5864,7 +5864,7 @@ do
   local r = query [[
     from
       x = xs,
-      y = ys semi hash
+      semi hash y = ys
     where
       x.id == y.fk
     select all {
@@ -5895,7 +5895,7 @@ do
   local r = query [[
     from
       x = xs,
-      y = ys anti hash
+      anti hash y = ys
     where
       x.id == y.fk
     select all {
@@ -5929,12 +5929,12 @@ do
   local r = query [[
     from
       u = users,
-      m = memberships loop using function(u, m)
+      loop using function(u, m)
         return u.uid == m.uid
-      end,
-      p = permissions semi loop using function(left, p)
+      end m = memberships,
+      semi loop using function(left, p)
         return left.u.org == p.org and left.m.team == p.team
-      end
+      end p = permissions
     select {
       pair = u.uid .. ":" .. m.team,
     }
@@ -5964,12 +5964,12 @@ do
   local r = query [[
     from
       u = users,
-      m = memberships loop using function(u, m)
+      loop using function(u, m)
         return u.uid == m.uid
-      end,
-      p = permissions anti loop using function(left, p)
+      end m = memberships,
+      anti loop using function(left, p)
         return left.u.org == p.org and left.m.team == p.team
-      end
+      end p = permissions
     select {
       pair = u.uid .. ":" .. m.team,
     }
@@ -5996,7 +5996,7 @@ do
     local _r = query [[
       from
         x = xs,
-        y = ys semi loop
+        semi loop y = ys
       select {
         id = x.id,
       }
@@ -6025,7 +6025,7 @@ do
     local _r = query [[
       from
         x = xs,
-        y = ys anti hash
+        anti hash y = ys
       select {
         id = x.id,
       }
@@ -6055,7 +6055,7 @@ do
   local r = query [[
     from
       x = xs,
-      y = ys hash
+      hash y = ys
     where
       x.ok == y.ok
     select {
@@ -6350,7 +6350,7 @@ do
   local r = query [[
     from
       x = xs,
-      y = ys semi hash
+      semi hash y = ys
     where
       x.id == y.fk
     select {
@@ -6381,7 +6381,7 @@ do
   local r = query [[
     from
       x = xs,
-      y = ys anti hash
+      anti hash y = ys
     where
       x.id == y.fk
     select {
@@ -6391,26 +6391,6 @@ do
 
   assertEquals(#r, 1)
   assertEquals(r[1].name, "a")
-end
-
--- 103. Single-source explain works
-
-do
-  local plan = query [[
-    explain
-    from
-      p = pages
-    select {
-      name = p.name,
-    }
-  ]]
-
-  plan = tostring(plan)
-
-  assertTrue(
-    string.find(plan, "Scan on p", 1, true) ~= nil,
-    "103: expected single-source explain scan, got: " .. tostring(plan)
-  )
 end
 
 -- 145. Explain works for from {}
@@ -6435,6 +6415,27 @@ do
     "104: expected row estimate, got: " .. tostring(plan)
   )
 end
+
+-- 145b. Single-source explain works
+
+do
+  local plan = query [[
+    explain
+    from
+      p = pages
+    select {
+      name = p.name,
+    }
+  ]]
+
+  plan = tostring(plan)
+
+  assertTrue(
+    string.find(plan, "Scan on p", 1, true) ~= nil,
+    "103: expected single-source explain scan, got: " .. tostring(plan)
+  )
+end
+
 
 -- 146. Distinct explain analyze works
 
@@ -6466,54 +6467,7 @@ do
   )
 end
 
--- 147. materialized sources
-
-do
-  local r = query [[
-    from
-      materialized 1
-    select all
-      _
-  ]]
-  assertEquals(#r, 1)
-  assertEquals(r[1], 1)
-end
-
-do
-  local r = query [[
-    from
-      materialized {{a = 1}, {a = 2}, {a = 3}}
-    select all
-      _.a
-    order by
-      _.a
-  ]]
-  assertEquals(#r, 3)
-  assertEquals(r[1], 1)
-  assertEquals(r[2], 2)
-  assertEquals(r[3], 3)
-end
-
-do
-  local rows = {
-    { id = 2, name = "b" },
-    { id = 1, name = "a" },
-    { id = 3, name = "c" },
-  }
-
-  local r = query [[
-    from
-      materialized rows
-    select all
-      _.name
-    order by
-      _.id
-  ]]
-  assertEquals(#r, 3)
-  assertEquals(r[1], "a")
-  assertEquals(r[2], "b")
-  assertEquals(r[3], "c")
-end
+-- 147. materialized join source with hash hint
 
 do
   local xs = {
@@ -6529,7 +6483,7 @@ do
   local r = query [[
     from
       materialized x = xs,
-      y = ys hash
+      hash y = ys
     where
       x.id == y.fk
     select all {
