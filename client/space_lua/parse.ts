@@ -1635,9 +1635,11 @@ function parseWithClause(t: ParseTree): LuaWithHints {
     const valueNode = entry.children?.find((c) => c.type === "WithValue");
 
     const key = nameNode?.children?.[0]?.children?.[0]?.text
-      ?? nameNode?.children?.[0]?.text;
+      ?? nameNode?.children?.[0]?.text
+      ?? nameNode?.text;
     const valueText = valueNode?.children?.[0]?.children?.[0]?.text
-      ?? valueNode?.children?.[0]?.text;
+      ?? valueNode?.children?.[0]?.text
+      ?? valueNode?.text;
 
     if (!key || !valueText) {
       throw new Error("with entry requires a name and numeric value");
@@ -1667,16 +1669,25 @@ function parseWithClause(t: ParseTree): LuaWithHints {
     throw new Error(`unknown with hint '${key}'`);
   };
 
-  for (const child of t.children ?? []) {
-    if (child.type === "WithBareEntry") {
-      parseEntry(child);
-    } else if (child.type === "WithOptionList") {
-      for (const opt of child.children ?? []) {
-        if (opt.type === "WithParenEntry") {
-          parseEntry(opt);
-        }
-      }
+  const walk = (node: ParseTree) => {
+    if (node.type === "WithBareEntry" || node.type === "WithParenEntry") {
+      parseEntry(node);
+      return;
     }
+
+    for (const child of node.children ?? []) {
+      walk(child);
+    }
+  };
+
+  walk(t);
+
+  if (
+    hints.rows === undefined &&
+    hints.width === undefined &&
+    hints.cost === undefined
+  ) {
+    throw new Error("with clause requires at least one hint");
   }
 
   return hints;

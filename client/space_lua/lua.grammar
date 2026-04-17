@@ -149,15 +149,20 @@ fromField[@isGroup=Field] {
   FieldExp { exp WithClause? JoinHint? }
 }
 
-WithClause { ckw<"with"> WithBareEntry+ WithOptionList? }
+WithClause { ckw<"with"> WithHintGroup+ }
 
-WithBareEntry { WithOptionName WithValue? }
+WithHintGroup {
+  WithBareEntry |
+  WithOptionList
+}
+
+WithBareEntry { WithOptionName WithValue }
 
 WithOptionList {
   "(" list<WithParenEntry> ")"
 }
 
-WithParenEntry { WithOptionName WithValue? }
+WithParenEntry { WithOptionName WithValue }
 
 WithOptionName {
   ckw<"rows"> |
