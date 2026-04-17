@@ -1575,26 +1575,26 @@ function parseJoinHint(t: ParseTree, ctx: ASTCtx): LuaJoinHint {
     throw new Error(`Expected JoinHint, got ${t.type}`);
   }
 
-  let joinType: "semi" | "anti" | undefined;
+  let joinType: "inner" | "semi" | "anti" | undefined;
   let kind: "hash" | "loop" | "merge" | undefined;
   let using: string | LuaFunctionBody | undefined;
 
   const visit = (node: ParseTree) => {
-    const text = node.children?.[0]?.text ?? node.text;
-
-    if (text === "semi") {
-      joinType = "semi";
-    } else if (text === "anti") {
-      joinType = "anti";
-    } else if (text === "hash") {
-      kind = "hash";
-    } else if (text === "loop") {
-      kind = "loop";
-    } else if (text === "merge") {
-      kind = "merge";
-    }
-
-    if (node.type === "UsingClause") {
+    if (node.type === "JoinType") {
+      const text = node.children?.[0]?.children?.[0]?.text
+        ?? node.children?.[0]?.text
+        ?? node.text;
+      if (text === "inner" || text === "semi" || text === "anti") {
+        joinType = text;
+      }
+    } else if (node.type === "JoinMethod") {
+      const text = node.children?.[0]?.children?.[0]?.text
+        ?? node.children?.[0]?.text
+        ?? node.text;
+      if (text === "hash" || text === "loop" || text === "merge") {
+        kind = text;
+      }
+    } else if (node.type === "UsingClause") {
       using = parseUsingClause(node, ctx);
     }
 
@@ -1621,6 +1621,70 @@ function parseJoinHint(t: ParseTree, ctx: ASTCtx): LuaJoinHint {
   if (joinType) hint.joinType = joinType;
   if (using !== undefined) hint.using = using;
   return hint;
+}
+
+function parseFromFieldList(t: ParseTree, ctx: ASTCtx): LuaFromField[] {
+  if (t.type !== "FromFieldList") {
+    throw new Error(`Expected FromFieldList, got ${t.type}`);
+  }
+
+  const fromFieldTypes = new Set([
+    "FieldExp",
+    "FieldProp",
+    "FieldDynamic",
+    "FieldExpMaterialized",
+    "FieldPropMaterialized",
+    "FieldDynamicMaterialized",
+  ]);
+
+  const fields: LuaFromField[] = t
+    .children!.filter((c) => fromFieldTypes.has(c.type!))
+    .map((c) => {
+      const fieldType = c.type!;
+      const materialized = fieldType.endsWith("Materialized");
+
+      const joinHintNode = c.children?.find((ch) => ch.type === "JoinHint");
+      const withNode = c.children?.find((ch) => ch.type === "WithClause");
+
+      const baseChildren = c.children!.filter((ch) =>
+        ch.type !== "materialized" &&
+        ch.type !== "JoinHint" &&
+        ch.type !== "WithClause"
+      );
+
+      const baseNode = {
+        ...c,
+        type: materialized
+          ? fieldType.replace("Materialized", "")
+          : fieldType,
+        children: baseChildren,
+      } as ParseTree;
+
+      const base = parseTableField(baseNode, ctx);
+      const joinHint = joinHintNode
+        ? parseJoinHint(joinHintNode, ctx)
+        : undefined;
+      const withHints = withNode ? parseWithClause(withNode) : undefined;
+
+      return {
+        ...base,
+        materialized,
+        joinHint,
+        withHints,
+      };
+    });
+
+  if (fields.length < 2) {
+    for (const f of fields) {
+      if (f.joinHint) {
+        throw new Error(
+          "Join hint is only valid for multi-source 'from' clauses",
+        );
+      }
+    }
+  }
+
+  return fields;
 }
 
 function parseWithClause(t: ParseTree): LuaWithHints {
@@ -1691,80 +1755,6 @@ function parseWithClause(t: ParseTree): LuaWithHints {
   }
 
   return hints;
-}
-
-function parseFromFieldList(t: ParseTree, ctx: ASTCtx): LuaFromField[] {
-  if (t.type !== "FromFieldList") {
-    throw new Error(`Expected FromFieldList, got ${t.type}`);
-  }
-  const fields: LuaFromField[] = t
-    .children!.filter(
-      (c) =>
-        c.type === "FieldExp" ||
-        c.type === "FieldProp" ||
-        c.type === "FieldDynamic" ||
-        c.type === "FieldExpMaterialized" ||
-        c.type === "FieldPropMaterialized" ||
-        c.type === "FieldDynamicMaterialized",
-    )
-    .map((c) => {
-      const fieldType = c.type!;
-      const materialized = fieldType.endsWith("Materialized");
-      const hintNode = c.children?.find((ch) => ch.type === "JoinHint");
-      const withNode = c.children?.find((ch) => ch.type === "WithClause");
-
-      const baseNode = materialized
-        ? ({
-            ...c,
-            type: fieldType.replace("Materialized", ""),
-            children: c.children!.filter((ch) => ch.type !== "materialized"),
-          } as ParseTree)
-        : c;
-
-      const base = parseTableField(baseNode, ctx);
-      const withHints = withNode ? parseWithClause(withNode) : undefined;
-
-      if (hintNode) {
-        const joinHint = parseJoinHint(hintNode, ctx);
-
-        if (!joinHint.joinType) {
-          const texts: string[] = [];
-          const visit = (node: ParseTree) => {
-            const text = node.children?.[0]?.text ?? node.text;
-            if (typeof text === "string") {
-              texts.push(text);
-            }
-            for (const child of node.children ?? []) {
-              visit(child);
-            }
-          };
-          visit(c);
-
-          if (texts.includes("inner")) {
-            joinHint.joinType = "inner";
-          } else if (texts.includes("semi")) {
-            joinHint.joinType = "semi";
-          } else if (texts.includes("anti")) {
-            joinHint.joinType = "anti";
-          }
-        }
-
-        return { ...base, joinHint, materialized, withHints };
-      }
-      return { ...base, materialized, withHints };
-    });
-
-  if (fields.length < 2) {
-    for (const f of fields) {
-      if (f.joinHint) {
-        throw new Error(
-          "Join hint is only valid for multi-source 'from' clauses",
-        );
-      }
-    }
-  }
-
-  return fields;
 }
 
 // Parse a single OrderBy node (shared by query OrderByClause and AggOrderBy)

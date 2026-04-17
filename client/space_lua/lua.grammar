@@ -141,12 +141,12 @@ FromClause { ckw<"from"> FromFieldList }
 FromFieldList { fromField ("," fromField)* }
 
 fromField[@isGroup=Field] {
-  FieldDynamicMaterialized { kw<"materialized"> "[" exp "]" "=" exp WithClause? JoinHint? } |
-  FieldPropMaterialized { kw<"materialized"> Name "=" exp WithClause? JoinHint? } |
-  FieldExpMaterialized { kw<"materialized"> exp WithClause? JoinHint? } |
-  FieldDynamic { "[" exp "]" "=" exp WithClause? JoinHint? } |
-  FieldProp { Name "=" exp WithClause? JoinHint? } |
-  FieldExp { exp WithClause? JoinHint? }
+  FieldDynamicMaterialized { kw<"materialized"> JoinHint? "[" exp "]" "=" exp WithClause? } |
+  FieldPropMaterialized { kw<"materialized"> JoinHint? Name "=" exp WithClause? } |
+  FieldExpMaterialized { kw<"materialized"> JoinHint? exp WithClause? } |
+  FieldDynamic { JoinHint? "[" exp "]" "=" exp WithClause? } |
+  FieldProp { JoinHint? Name "=" exp WithClause? } |
+  FieldExp { JoinHint? exp WithClause? }
 }
 
 WithClause { ckw<"with"> WithHintGroup+ }
