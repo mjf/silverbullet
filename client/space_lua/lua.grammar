@@ -140,9 +140,12 @@ ExplainBoolValue {
 FromClause { ckw<"from"> FromFieldList }
 FromFieldList { fromField ("," fromField)* }
 fromField[@isGroup=Field] {
-  FieldDynamic { ckw<"materialized">? "[" exp "]" "=" exp JoinHint? } |
-  FieldProp { ckw<"materialized">? Name "=" exp JoinHint? } |
-  FieldExp { ckw<"materialized">? exp JoinHint? }
+  FieldDynamicMaterialized { kw<"materialized"> "[" exp "]" "=" exp JoinHint? } |
+  FieldPropMaterialized { kw<"materialized"> Name "=" exp JoinHint? } |
+  FieldExpMaterialized { kw<"materialized"> exp JoinHint? } |
+  FieldDynamic { "[" exp "]" "=" exp JoinHint? } |
+  FieldProp { Name "=" exp JoinHint? } |
+  FieldExp { exp JoinHint? }
 }
 
 LeadingClause { ckw<"leading"> FieldList }

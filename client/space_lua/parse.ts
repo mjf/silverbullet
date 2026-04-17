@@ -1631,21 +1631,25 @@ function parseFromFieldList(t: ParseTree, ctx: ASTCtx): LuaFromField[] {
       (c) =>
         c.type === "FieldExp" ||
         c.type === "FieldProp" ||
-        c.type === "FieldDynamic",
+        c.type === "FieldDynamic" ||
+        c.type === "FieldExpMaterialized" ||
+        c.type === "FieldPropMaterialized" ||
+        c.type === "FieldDynamicMaterialized",
     )
     .map((c) => {
-      const materialized =
-        c.children?.[0]?.type === "materialized";
+      const fieldType = c.type!;
+      const materialized = fieldType.endsWith("Materialized");
+      const hintNode = c.children?.find((ch) => ch.type === "JoinHint");
 
       const baseNode = materialized
         ? ({
             ...c,
+            type: fieldType.replace("Materialized", ""),
             children: c.children!.filter((ch) => ch.type !== "materialized"),
           } as ParseTree)
         : c;
 
       const base = parseTableField(baseNode, ctx);
-      const hintNode = c.children?.find((ch) => ch.type === "JoinHint");
 
       if (hintNode) {
         const joinHint = parseJoinHint(hintNode, ctx);
