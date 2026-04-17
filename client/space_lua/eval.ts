@@ -1115,11 +1115,6 @@ function explainSingleSource(
     sourceHints.push(`cost=${withHints.cost}`);
   }
 
-  const isHinted =
-    withHints?.rows !== undefined ||
-    withHints?.width !== undefined ||
-    withHints?.cost !== undefined;
-
   return {
     nodeType: isFnScan ? "FunctionScan" : "Scan",
     source: sourceName,
@@ -1129,7 +1124,7 @@ function explainSingleSource(
     estimatedCost: cost,
     estimatedRows: rows,
     estimatedWidth: width,
-    statsSource: isHinted ? "hinted" : stats?.statsSource,
+    statsSource: stats?.statsSource,
     executionScanKind: stats?.executionCapabilities?.scanKind,
     predicatePushdown: stats?.executionCapabilities?.predicatePushdown,
     children: [],

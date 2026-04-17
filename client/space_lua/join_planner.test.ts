@@ -1081,3 +1081,226 @@ describe("aggregate detection uses configured aggregate registry", () => {
     expect(child.nodeType).not.toBe("GroupAggregate");
   });
 });
+
+describe("source with-hints in explain and planning", () => {
+  it("leaf explain uses rows, width, and cost hints", () => {
+    const source: JoinSource = {
+      name: "p",
+      expression: parseExpressionString("p"),
+      stats: {
+        rowCount: 100,
+        ndv: new Map([["id", 100]]),
+        avgColumnCount: 8,
+        statsSource: "computed-exact-small",
+        executionCapabilities: {
+          predicatePushdown: "none",
+          scanKind: "materialized",
+        },
+      },
+      withHints: {
+        rows: 7,
+        width: 3,
+        cost: 11,
+      } as any,
+    };
+
+    const plan = explainJoinTree(
+      { kind: "leaf", source },
+      {
+        analyze: false,
+        verbose: true,
+        summary: false,
+        costs: true,
+        timing: false,
+        hints: true,
+      },
+    );
+
+    expect(plan.nodeType).toBe("Scan");
+    expect(plan.estimatedRows).toBe(7);
+    expect(plan.estimatedWidth).toBe(3);
+    expect(plan.estimatedCost).toBe(11);
+    expect(plan.statsSource).toBe("computed-exact-small");
+    expect(plan.sourceHints).toEqual(["rows=7", "width=3", "cost=11"]);
+  });
+
+  it("leaf explain includes materialized together with source hints", () => {
+    const source: JoinSource = {
+      name: "p",
+      expression: parseExpressionString("p"),
+      materialized: true,
+      stats: {
+        rowCount: 100,
+        ndv: new Map([["id", 100]]),
+        avgColumnCount: 8,
+        statsSource: "computed-exact-small",
+        executionCapabilities: {
+          predicatePushdown: "none",
+          scanKind: "materialized",
+        },
+      },
+      withHints: {
+        rows: 5,
+        width: 2,
+        cost: 13,
+      } as any,
+    };
+
+    const rendered = formatExplainOutput(
+      {
+        plan: explainJoinTree(
+          { kind: "leaf", source },
+          {
+            analyze: false,
+            verbose: true,
+            summary: false,
+            costs: true,
+            timing: false,
+            hints: true,
+          },
+        ),
+        planningTimeMs: 0,
+      },
+      {
+        analyze: false,
+        verbose: true,
+        summary: false,
+        costs: true,
+        timing: false,
+        hints: true,
+      },
+    );
+
+    expect(rendered.includes("Hints: materialized, rows=5, width=2, cost=13")).toBe(true);
+    expect(rendered.includes("Stats: computed-exact-small")).toBe(true);
+  });
+
+  it("does not render Hints line when hints option is disabled", () => {
+    const source: JoinSource = {
+      name: "p",
+      expression: parseExpressionString("p"),
+      stats: {
+        rowCount: 100,
+        ndv: new Map([["id", 100]]),
+        avgColumnCount: 8,
+        statsSource: "computed-exact-small",
+        executionCapabilities: {
+          predicatePushdown: "none",
+          scanKind: "materialized",
+        },
+      },
+      withHints: {
+        rows: 7,
+        width: 3,
+        cost: 11,
+      } as any,
+    };
+
+    const rendered = formatExplainOutput(
+      {
+        plan: explainJoinTree(
+          { kind: "leaf", source },
+          {
+            analyze: false,
+            verbose: true,
+            summary: false,
+            costs: true,
+            timing: false,
+            hints: false,
+          },
+        ),
+        planningTimeMs: 0,
+      },
+      {
+        analyze: false,
+        verbose: true,
+        summary: false,
+        costs: true,
+        timing: false,
+        hints: false,
+      },
+    );
+
+    expect(rendered.includes("Hints:")).toBe(false);
+    expect(rendered.includes("Stats: computed-exact-small")).toBe(true);
+  });
+
+  it("join tree estimation uses hinted rows on leaf sources", () => {
+    const left: JoinSource = {
+      ...makeSource("a"),
+      withHints: {
+        rows: 5,
+        width: 2,
+      } as any,
+    };
+    const right: JoinSource = makeSource("b");
+
+    const tree = buildJoinTree([left, right]);
+
+    expect(tree.kind).toBe("join");
+    if (tree.kind !== "join") {
+      throw new Error("expected join");
+    }
+
+    const leftPlan = explainJoinTree(
+      tree,
+      {
+        analyze: false,
+        verbose: true,
+        summary: false,
+        costs: true,
+        timing: false,
+        hints: true,
+      },
+    ).children[0];
+
+    expect(leftPlan.estimatedRows).toBe(5);
+    expect(leftPlan.estimatedWidth).toBe(2);
+    expect(leftPlan.statsSource).toBe("computed-exact-small");
+  });
+
+  it("hinted source cost affects join estimated cost", () => {
+    const sourceA: JoinSource = {
+      ...makeSource("a"),
+      withHints: {
+        rows: 10,
+        width: 2,
+        cost: 1,
+      } as any,
+    };
+    const sourceB: JoinSource = {
+      ...makeSource("b"),
+      withHints: {
+        rows: 10,
+        width: 2,
+        cost: 1000,
+      } as any,
+    };
+
+    const planA = explainJoinTree(
+      { kind: "leaf", source: sourceA },
+      {
+        analyze: false,
+        verbose: true,
+        summary: false,
+        costs: true,
+        timing: false,
+        hints: true,
+      },
+    );
+    const planB = explainJoinTree(
+      { kind: "leaf", source: sourceB },
+      {
+        analyze: false,
+        verbose: true,
+        summary: false,
+        costs: true,
+        timing: false,
+        hints: true,
+      },
+    );
+
+    expect(planA.estimatedCost).toBe(1);
+    expect(planB.estimatedCost).toBe(1000);
+  });
+});

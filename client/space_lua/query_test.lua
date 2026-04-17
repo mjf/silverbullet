@@ -6545,3 +6545,75 @@ do
   assertEquals(r[2].name, "c")
   assertEquals(r[2].val, "y")
 end
+
+-- 148. with rows/width/cost hints appear in explain
+
+do
+  local plan = query [[
+    explain verbose hints
+    from
+      p = pages with rows 7 width 3 cost 11
+    select {
+      name = p.name,
+    }
+  ]]
+
+  plan = tostring(plan)
+
+  assertTrue(
+    string.find(plan, "Scan on p", 1, true) ~= nil,
+    "148: expected scan on p, got: " .. tostring(plan)
+  )
+  assertTrue(
+    string.find(plan, "Hints: rows=7, width=3, cost=11", 1, true) ~= nil,
+    "148: expected hinted source metadata, got: " .. tostring(plan)
+  )
+  assertTrue(
+    string.find(plan, "Stats: computed-exact-small", 1, true) ~= nil,
+    "148: expected hinted stats source, got: " .. tostring(plan)
+  )
+end
+
+-- 149. materialized + with hints both appear in explain
+
+do
+  local plan = query [[
+    explain verbose hints
+    from
+      materialized p = pages with rows 5 width 2 cost 13
+    select {
+      name = p.name,
+    }
+  ]]
+
+  plan = tostring(plan)
+
+  assertTrue(
+    string.find(plan, "Hints: materialized, rows=5, width=2, cost=13", 1, true) ~= nil,
+    "149: expected materialized+hints metadata, got: " .. tostring(plan)
+  )
+  assertTrue(
+    string.find(plan, "Stats: computed-exact-small", 1, true) ~= nil,
+    "149: expected hinted stats source, got: " .. tostring(plan)
+  )
+end
+
+-- 150. later with-hint entries override earlier ones
+
+do
+  local plan = query [[
+    explain verbose hints
+    from
+      p = pages with rows 7 rows 9 width 3 width 4 cost 11 cost 12
+    select {
+      name = p.name,
+    }
+  ]]
+
+  plan = tostring(plan)
+
+  assertTrue(
+    string.find(plan, "Hints: rows=9, width=4, cost=12", 1, true) ~= nil,
+    "150: expected last with-hints to win, got: " .. tostring(plan)
+  )
+end

@@ -2613,11 +2613,6 @@ export function explainJoinTree(
       sourceHints.push(`cost=${tree.source.withHints.cost}`);
     }
 
-    const isHinted =
-      tree.source.withHints?.rows !== undefined ||
-      tree.source.withHints?.width !== undefined ||
-      tree.source.withHints?.cost !== undefined;
-
     return {
       nodeType: isFnScan ? "FunctionScan" : "Scan",
       source: tree.source.name,
@@ -2632,7 +2627,7 @@ export function explainJoinTree(
       estimatedWidth: width,
       filterExpr: pushedFilterExpr,
       pushedDownFilter: !!pushedFilterExpr,
-      statsSource: isHinted ? "hinted" : tree.source.stats?.statsSource,
+      statsSource: tree.source.stats?.statsSource,
       executionScanKind: tree.source.stats?.executionCapabilities?.scanKind,
       predicatePushdown: predicatePushdownKind,
       children: [],
@@ -2773,35 +2768,6 @@ export function explainJoinTree(
   };
 }
 
-function collectOutputColumns(expr: LuaExpression): string[] {
-  if (expr.type !== "TableConstructor") {
-    return [exprToString(expr)];
-  }
-
-  const outputs: string[] = [];
-
-  for (const field of expr.fields) {
-    switch (field.type) {
-      case "PropField": {
-        outputs.push(`${field.key} = ${exprToString(field.value)}`);
-        break;
-      }
-      case "DynamicField": {
-        const keyStr = exprToString(field.key);
-        const valStr = exprToString(field.value);
-        outputs.push(`[${keyStr}] = ${valStr}`);
-        break;
-      }
-      case "ExpressionField": {
-        outputs.push(exprToString(field.value));
-        break;
-      }
-    }
-  }
-
-  return outputs;
-}
-
 function isAggregateFunctionName(name: string, config?: Config): boolean {
   return getAggregateSpec(name, config) !== null;
 }
@@ -2849,6 +2815,104 @@ function selectContainsAggregate(
       return selectContainsAggregate(expr.expression, runtimeConfig);
     default:
       return false;
+  }
+}
+
+function collectOutputColumns(
+  expr: LuaExpression,
+  runtimeConfig?: Config,
+): string[] {
+  if (expr.type !== "TableConstructor") {
+    return [formatOutputExpression(expr, runtimeConfig)];
+  }
+
+  const outputs: string[] = [];
+
+  for (const field of expr.fields) {
+    switch (field.type) {
+      case "PropField": {
+        outputs.push(
+          `${field.key} = ${formatOutputExpression(field.value, runtimeConfig)}`,
+        );
+        break;
+      }
+      case "DynamicField": {
+        const keyStr = formatOutputExpression(field.key, runtimeConfig);
+        const valStr = formatOutputExpression(field.value, runtimeConfig);
+        outputs.push(`[${keyStr}] = ${valStr}`);
+        break;
+      }
+      case "ExpressionField": {
+        outputs.push(formatOutputExpression(field.value, runtimeConfig));
+        break;
+      }
+    }
+  }
+
+  return outputs;
+}
+
+function formatOutputExpression(
+  expr: LuaExpression,
+  runtimeConfig?: Config,
+): string {
+  const agg = formatAggregateExpression(expr, runtimeConfig);
+  return agg ?? exprToString(expr);
+}
+
+function formatAggregateExpression(
+  expr: LuaExpression,
+  runtimeConfig?: Config,
+): string | undefined {
+  switch (expr.type) {
+    case "FilteredCall": {
+      const inner = formatAggregateExpression(expr.call, runtimeConfig);
+      if (!inner) return undefined;
+      return `${inner} filter(${exprToString(expr.filter)})`;
+    }
+
+    case "AggregateCall": {
+      const inner = formatAggregateExpression(expr.call, runtimeConfig);
+      if (!inner) return undefined;
+      if (expr.orderBy.length === 0) {
+        return inner;
+      }
+      const orderBy = expr.orderBy
+        .map((o) => {
+          let s = exprToString(o.expression);
+          if (o.direction === "desc") s += " desc";
+          if (o.nulls) s += ` nulls ${o.nulls}`;
+          return s;
+        })
+        .join(", ");
+      return `${inner} order by ${orderBy}`;
+    }
+
+    case "FunctionCall": {
+      if (
+        expr.prefix.type === "Variable" &&
+        isAggregateFunctionName(expr.prefix.name, runtimeConfig)
+      ) {
+        const args = expr.args.map(exprToString).join(", ");
+        let s = `${expr.prefix.name}(${args})`;
+        if (expr.orderBy && expr.orderBy.length > 0) {
+          const orderBy = expr.orderBy
+            .map((o) => {
+              let part = exprToString(o.expression);
+              if (o.direction === "desc") part += " desc";
+              if (o.nulls) part += ` nulls ${o.nulls}`;
+              return part;
+            })
+            .join(", ");
+          s += ` order by ${orderBy}`;
+        }
+        return s;
+      }
+      return undefined;
+    }
+
+    default:
+      return undefined;
   }
 }
 
@@ -2955,7 +3019,7 @@ export function wrapPlanWithQueryOps(
     selectContainsAggregate(query.select, runtimeConfig);
 
   if (isImplicitAggregate) {
-    const cols = collectOutputColumns(query.select!);
+    const cols = collectOutputColumns(query.select!, runtimeConfig);
     const aggDescs = collectAggregateDescriptions(query.select!, runtimeConfig);
     root = {
       nodeType: "GroupAggregate",
@@ -2973,7 +3037,7 @@ export function wrapPlanWithQueryOps(
   }
 
   if (query.select) {
-    const cols = collectOutputColumns(query.select);
+    const cols = collectOutputColumns(query.select, runtimeConfig);
     root = {
       nodeType: "Project",
       startupCost: root.startupCost,
