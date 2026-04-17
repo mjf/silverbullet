@@ -4,7 +4,12 @@
  * Transforms a multi-source `from` clause into an optimized join tree,
  * then executes it using hash join, nested loop, or sort-merge operators.
  */
-import type { LuaExpression, LuaFunctionBody, LuaJoinHint } from "./ast.ts";
+import type {
+  LuaExpression,
+  LuaFunctionBody,
+  LuaJoinHint,
+  LuaWithHints,
+} from "./ast.ts";
 import { evalExpression } from "./eval.ts";
 import type { CollectionStats, StatsSource } from "./query_collection.ts";
 import {
@@ -185,6 +190,7 @@ export type JoinSource = {
   stats?: CollectionStats;
   joinType?: JoinType;
   materialized?: boolean;
+  withHints?: LuaWithHints;
 };
 
 export type JoinNode = JoinLeaf | JoinInner;
@@ -415,11 +421,15 @@ function ndvConfidenceMultiplier(
 // 9. Cardinality and selectivity estimation
 
 function estimatedRows(s: JoinSource): number {
-  return s.stats?.rowCount ?? DEFAULT_ESTIMATED_ROWS;
+  return s.withHints?.rows ?? s.stats?.rowCount ?? DEFAULT_ESTIMATED_ROWS;
 }
 
 function estimatedWidth(s: JoinSource): number {
-  return s.stats?.avgColumnCount ?? DEFAULT_ESTIMATED_WIDTH;
+  return s.withHints?.width ?? s.stats?.avgColumnCount ?? DEFAULT_ESTIMATED_WIDTH;
+}
+
+function estimatedSourceCost(s: JoinSource): number {
+  return s.withHints?.cost ?? estimatedRows(s);
 }
 
 function clampWidth(width: number): number {
@@ -1129,7 +1139,7 @@ function orderSources(
       const candidatePenalty = executionScanPenalty(candidate, config);
 
       const cost =
-        (outputRows + estimatedRows(candidate)) *
+        (outputRows + estimatedSourceCost(candidate)) *
         candidatePenalty *
         (getWidthWeight(config) * clampWidth(joinedWidth) +
           getCandidateWidthWeight(config) * candidateWidth);
@@ -2589,6 +2599,25 @@ export function explainJoinTree(
     const predicatePushdownKind =
       tree.source.stats?.executionCapabilities?.predicatePushdown;
 
+    const sourceHints: string[] = [];
+    if (tree.source.materialized) {
+      sourceHints.push("materialized");
+    }
+    if (tree.source.withHints?.rows !== undefined) {
+      sourceHints.push(`rows=${tree.source.withHints.rows}`);
+    }
+    if (tree.source.withHints?.width !== undefined) {
+      sourceHints.push(`width=${tree.source.withHints.width}`);
+    }
+    if (tree.source.withHints?.cost !== undefined) {
+      sourceHints.push(`cost=${tree.source.withHints.cost}`);
+    }
+
+    const isHinted =
+      tree.source.withHints?.rows !== undefined ||
+      tree.source.withHints?.width !== undefined ||
+      tree.source.withHints?.cost !== undefined;
+
     return {
       nodeType: isFnScan ? "FunctionScan" : "Scan",
       source: tree.source.name,
@@ -2596,14 +2625,14 @@ export function explainJoinTree(
       hintUsed: tree.source.hint
         ? formatHintLabel(tree.source.hint)
         : undefined,
-      sourceHints: tree.source.materialized ? ["materialized"] : undefined,
+      sourceHints: sourceHints.length > 0 ? sourceHints : undefined,
       startupCost: 0,
-      estimatedCost: rows,
+      estimatedCost: estimatedSourceCost(tree.source),
       estimatedRows: rows,
       estimatedWidth: width,
       filterExpr: pushedFilterExpr,
       pushedDownFilter: !!pushedFilterExpr,
-      statsSource: tree.source.stats?.statsSource,
+      statsSource: isHinted ? "hinted" : tree.source.stats?.statsSource,
       executionScanKind: tree.source.stats?.executionCapabilities?.scanKind,
       predicatePushdown: predicatePushdownKind,
       children: [],

@@ -307,10 +307,17 @@ export type LuaJoinHint = {
   using?: string | LuaFunctionBody;
 } & ASTContext;
 
+export type LuaWithHints = {
+  rows?: number;
+  width?: number;
+  cost?: number;
+};
+
 // From-clause field: a table field extended with optional source modifiers
 export type LuaFromField = LuaTableField & {
   joinHint?: LuaJoinHint;
   materialized?: boolean;
+  withHints?: LuaWithHints;
 };
 
 // Query stuff

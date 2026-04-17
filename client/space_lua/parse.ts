@@ -26,6 +26,7 @@ import type {
   LuaQueryClause,
   LuaStatement,
   LuaTableField,
+  LuaWithHints,
 } from "./ast.ts";
 import { LuaAttribute } from "./ast.ts";
 import { getBlockGotoMeta } from "./labels.ts";
@@ -1622,6 +1623,65 @@ function parseJoinHint(t: ParseTree, ctx: ASTCtx): LuaJoinHint {
   return hint;
 }
 
+function parseWithClause(t: ParseTree): LuaWithHints {
+  if (t.type !== "WithClause") {
+    throw new Error(`Expected WithClause, got ${t.type}`);
+  }
+
+  const hints: LuaWithHints = {};
+
+  const parseEntry = (entry: ParseTree) => {
+    const nameNode = entry.children?.find((c) => c.type === "WithOptionName");
+    const valueNode = entry.children?.find((c) => c.type === "WithValue");
+
+    const key = nameNode?.children?.[0]?.children?.[0]?.text
+      ?? nameNode?.children?.[0]?.text;
+    const valueText = valueNode?.children?.[0]?.children?.[0]?.text
+      ?? valueNode?.children?.[0]?.text;
+
+    if (!key || !valueText) {
+      throw new Error("with entry requires a name and numeric value");
+    }
+
+    const value = Number(valueText);
+    if (!Number.isFinite(value)) {
+      throw new Error(`with hint '${key}' must be numeric`);
+    }
+    if (value <= 0) {
+      throw new Error(`with hint '${key}' must be > 0`);
+    }
+
+    if (key === "rows" || key === "width") {
+      if (!Number.isInteger(value)) {
+        throw new Error(`with hint '${key}' must be an integer`);
+      }
+      hints[key] = value;
+      return;
+    }
+
+    if (key === "cost") {
+      hints.cost = value;
+      return;
+    }
+
+    throw new Error(`unknown with hint '${key}'`);
+  };
+
+  for (const child of t.children ?? []) {
+    if (child.type === "WithBareEntry") {
+      parseEntry(child);
+    } else if (child.type === "WithOptionList") {
+      for (const opt of child.children ?? []) {
+        if (opt.type === "WithParenEntry") {
+          parseEntry(opt);
+        }
+      }
+    }
+  }
+
+  return hints;
+}
+
 function parseFromFieldList(t: ParseTree, ctx: ASTCtx): LuaFromField[] {
   if (t.type !== "FromFieldList") {
     throw new Error(`Expected FromFieldList, got ${t.type}`);
@@ -1640,6 +1700,7 @@ function parseFromFieldList(t: ParseTree, ctx: ASTCtx): LuaFromField[] {
       const fieldType = c.type!;
       const materialized = fieldType.endsWith("Materialized");
       const hintNode = c.children?.find((ch) => ch.type === "JoinHint");
+      const withNode = c.children?.find((ch) => ch.type === "WithClause");
 
       const baseNode = materialized
         ? ({
@@ -1650,6 +1711,7 @@ function parseFromFieldList(t: ParseTree, ctx: ASTCtx): LuaFromField[] {
         : c;
 
       const base = parseTableField(baseNode, ctx);
+      const withHints = withNode ? parseWithClause(withNode) : undefined;
 
       if (hintNode) {
         const joinHint = parseJoinHint(hintNode, ctx);
@@ -1676,9 +1738,9 @@ function parseFromFieldList(t: ParseTree, ctx: ASTCtx): LuaFromField[] {
           }
         }
 
-        return { ...base, joinHint, materialized };
+        return { ...base, joinHint, materialized, withHints };
       }
-      return { ...base, materialized };
+      return { ...base, materialized, withHints };
     });
 
   if (fields.length < 2) {

@@ -785,6 +785,7 @@ type FromSource =
       objectVariable?: string;
       expression: LuaExpression;
       materialized?: boolean;
+      withHints?: LuaFromField["withHints"];
     }
   | {
       kind: "cross";
@@ -799,6 +800,7 @@ function fromFieldsToSource(fields: LuaFromField[], ctx: ASTCtx): FromSource {
         kind: "single",
         expression: f.value,
         materialized: f.materialized === true,
+        withHints: f.withHints,
       };
     }
     if (f.type === "PropField") {
@@ -807,6 +809,7 @@ function fromFieldsToSource(fields: LuaFromField[], ctx: ASTCtx): FromSource {
         objectVariable: f.key,
         expression: f.value,
         materialized: f.materialized === true,
+        withHints: f.withHints,
       };
     }
   }
@@ -823,6 +826,7 @@ function fromFieldsToSource(fields: LuaFromField[], ctx: ASTCtx): FromSource {
       expression: f.value,
       hint: f.joinHint,
       materialized: f.materialized === true,
+      withHints: f.withHints,
     });
   }
   return { kind: "cross", sources };
@@ -1089,20 +1093,43 @@ function explainSingleSource(
   sourceName: string,
   sourceExpression: LuaExpression,
   stats?: CollectionStats,
+  withHints?: LuaFromField["withHints"],
+  materialized?: boolean,
 ): ExplainNode {
-  const rows = stats?.rowCount ?? 100;
-  const width = stats?.avgColumnCount ?? 5;
+  const rows = withHints?.rows ?? stats?.rowCount ?? 100;
+  const width = withHints?.width ?? stats?.avgColumnCount ?? 5;
+  const cost = withHints?.cost ?? rows;
   const isFnScan = sourceExpression.type === "FunctionCall";
+
+  const sourceHints: string[] = [];
+  if (materialized) {
+    sourceHints.push("materialized");
+  }
+  if (withHints?.rows !== undefined) {
+    sourceHints.push(`rows=${withHints.rows}`);
+  }
+  if (withHints?.width !== undefined) {
+    sourceHints.push(`width=${withHints.width}`);
+  }
+  if (withHints?.cost !== undefined) {
+    sourceHints.push(`cost=${withHints.cost}`);
+  }
+
+  const isHinted =
+    withHints?.rows !== undefined ||
+    withHints?.width !== undefined ||
+    withHints?.cost !== undefined;
 
   return {
     nodeType: isFnScan ? "FunctionScan" : "Scan",
     source: sourceName,
     functionCall: isFnScan ? exprToString(sourceExpression) : undefined,
+    sourceHints: sourceHints.length > 0 ? sourceHints : undefined,
     startupCost: 0,
-    estimatedCost: rows,
+    estimatedCost: cost,
     estimatedRows: rows,
     estimatedWidth: width,
-    statsSource: stats?.statsSource,
+    statsSource: isHinted ? "hinted" : stats?.statsSource,
     executionScanKind: stats?.executionCapabilities?.scanKind,
     predicatePushdown: stats?.executionCapabilities?.predicatePushdown,
     children: [],
@@ -2112,7 +2139,13 @@ export function evalExpression(
                 [sourceName, stats],
               ]);
               explainPlan = wrapPlanWithQueryOps(
-                explainSingleSource(sourceName, objectExpression, stats),
+                explainSingleSource(
+                  sourceName,
+                  objectExpression,
+                  stats,
+                  fromSource.withHints,
+                  fromSource.materialized,
+                ),
                 explainQuery,
                 explainSourceStats,
                 undefined,

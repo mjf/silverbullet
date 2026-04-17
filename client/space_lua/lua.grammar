@@ -165,11 +165,7 @@ WithOptionName {
   ckw<"cost">
 }
 
-WithValue {
-  kw<"true"> | kw<"false"> | ckw<"on"> | ckw<"off"> |
-  Number |
-  LiteralString
-}
+WithValue { Number }
 
 LeadingClause { ckw<"leading"> FieldList }
 
