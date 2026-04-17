@@ -184,6 +184,7 @@ export type JoinSource = {
   hint?: LuaJoinHint;
   stats?: CollectionStats;
   joinType?: JoinType;
+  materialized?: boolean;
 };
 
 export type JoinNode = JoinLeaf | JoinInner;
@@ -269,6 +270,7 @@ export type ExplainNode = {
   functionCall?: string;
   method?: "hash" | "loop" | "merge";
   hintUsed?: string;
+  sourceHints?: string[];
   startupCost: number;
   estimatedCost: number;
   estimatedRows: number;
@@ -341,6 +343,7 @@ export type ExplainOptions = {
   summary: boolean;
   costs: boolean;
   timing: boolean;
+  hints: boolean;
 };
 
 export type ExplainResult = {
@@ -2593,6 +2596,7 @@ export function explainJoinTree(
       hintUsed: tree.source.hint
         ? formatHintLabel(tree.source.hint)
         : undefined,
+      sourceHints: tree.source.materialized ? ["materialized"] : undefined,
       startupCost: 0,
       estimatedCost: rows,
       estimatedRows: rows,
@@ -3938,6 +3942,10 @@ function formatNode(
 
     if (node.hintUsed) {
       lines.push(`${detailPad}Join Hint: ${node.hintUsed}`);
+    }
+
+    if (opts.hints && node.sourceHints && node.sourceHints.length > 0) {
+      lines.push(`${detailPad}Hints: ${node.sourceHints.join(", ")}`);
     }
 
     if (node.executionScanKind) {

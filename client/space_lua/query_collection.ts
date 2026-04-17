@@ -57,6 +57,7 @@ export type StatsSource =
   | "computed-exact-small"
   | "computed-sketch-large"
   | "recomputed-filtered-exact"
+  | "recomputed-materialized-exact"
   | "source-provided-exact"
   | "source-provided-unknown"
   | "computed-empty"

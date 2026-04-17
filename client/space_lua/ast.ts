@@ -302,14 +302,15 @@ export type JoinHintKind = "hash" | "loop" | "merge";
 export type LuaJoinHint = {
   type: "JoinHint";
   kind: JoinHintKind;
-  joinType?: "semi" | "anti";
+  joinType?: "inner" | "semi" | "anti";
   // Only valid for the loop physical operator
   using?: string | LuaFunctionBody;
 } & ASTContext;
 
-// From-clause field: a table field extended with an optional join hint
+// From-clause field: a table field extended with optional source modifiers
 export type LuaFromField = LuaTableField & {
   joinHint?: LuaJoinHint;
+  materialized?: boolean;
 };
 
 // Query stuff
@@ -325,6 +326,7 @@ export type LuaExplainClause = {
   summary: boolean;
   costs: boolean;
   timing: boolean;
+  hints: boolean;
 } & ASTContext;
 
 export type LuaQueryClause =

@@ -780,7 +780,12 @@ function fieldsToGroupByEntries(fields: LuaTableField[]): LuaGroupByEntry[] {
 }
 
 type FromSource =
-  | { kind: "single"; objectVariable?: string; expression: LuaExpression }
+  | {
+      kind: "single";
+      objectVariable?: string;
+      expression: LuaExpression;
+      materialized?: boolean;
+    }
   | {
       kind: "cross";
       sources: JoinSource[];
@@ -790,10 +795,19 @@ function fromFieldsToSource(fields: LuaFromField[], ctx: ASTCtx): FromSource {
   if (fields.length === 1) {
     const f = fields[0];
     if (f.type === "ExpressionField") {
-      return { kind: "single", expression: f.value };
+      return {
+        kind: "single",
+        expression: f.value,
+        materialized: f.materialized === true,
+      };
     }
     if (f.type === "PropField") {
-      return { kind: "single", objectVariable: f.key, expression: f.value };
+      return {
+        kind: "single",
+        objectVariable: f.key,
+        expression: f.value,
+        materialized: f.materialized === true,
+      };
     }
   }
 
@@ -808,6 +822,7 @@ function fromFieldsToSource(fields: LuaFromField[], ctx: ASTCtx): FromSource {
       name: f.key,
       expression: f.value,
       hint: f.joinHint,
+      materialized: f.materialized === true,
     });
   }
   return { kind: "cross", sources };
@@ -1493,6 +1508,7 @@ export function evalExpression(
               summary: explainClause.summary,
               timing: explainClause.timing,
               verbose: explainClause.verbose,
+              hints: explainClause.hints,
             }
           : undefined;
 
@@ -1514,10 +1530,28 @@ export function evalExpression(
               );
             });
 
+            const materializedOverrides = new Map<string, any[]>();
+
             // Gather planning stats only. This is planner metadata gathering,
-            // not execution of the actual query pipeline.
+            // not execution of the actual query pipeline, except for sources
+            // explicitly marked `materialized`, which are eagerly realized once.
             for (const src of fromSource.sources) {
               const val = await evalExpression(src.expression, env, sf);
+
+              if (src.materialized) {
+                const items = await materializeValueAsItems(val, env, sf);
+                materializedOverrides.set(src.name, items);
+                src.stats = {
+                  ...computeStatsFromArray(items),
+                  statsSource: "recomputed-materialized-exact",
+                  executionCapabilities: {
+                    predicatePushdown: "none",
+                    scanKind: "materialized",
+                  },
+                };
+                continue;
+              }
+
               if (
                 val &&
                 typeof val === "object" &&
@@ -1581,8 +1615,6 @@ export function evalExpression(
 
               pushedFilterExprBySource.set(src.name, combined);
             }
-
-            const materializedOverrides = new Map<string, any[]>();
 
             // Materialize and filter single-source pushdown inputs before join
             // planning so both stats and execution use the filtered sources.
@@ -1964,7 +1996,11 @@ export function evalExpression(
         }
 
         // Single-source
-        const { objectVariable, expression: objectExpression } = fromSource;
+        const {
+          objectVariable,
+          expression: objectExpression,
+          materialized: forceMaterialized,
+        } = fromSource;
         return Promise.resolve(evalExpression(objectExpression, env, sf)).then(
           async (collection: LuaValue) => {
             const planT0 = performance.now();
@@ -1975,7 +2011,10 @@ export function evalExpression(
 
             // If already a queryable collection (e.g. DataStoreQueryCollection),
             // use directly - skip all LuaTable/JS conversion.
-            if (
+            if (forceMaterialized) {
+              const items = await materializeValueAsItems(collection, env, sf);
+              collection = toCollection(items);
+            } else if (
               typeof collection === "object" &&
               collection !== null &&
               "query" in collection &&

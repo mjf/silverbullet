@@ -429,6 +429,7 @@ describe("join residual predicate stripping and explain", () => {
       summary: false,
       costs: true,
       timing: false,
+      hints: false,
     });
 
     expect(explain.joinResidualExprs).toEqual(["(a.price > b.min_price)"]);
@@ -444,6 +445,7 @@ describe("join residual predicate stripping and explain", () => {
         summary: false,
         costs: true,
         timing: false,
+        hints: false,
       },
     );
 
@@ -510,6 +512,7 @@ describe("join residual predicate stripping and explain", () => {
       summary: false,
       costs: true,
       timing: false,
+      hints: false,
     });
 
     expect(explain.joinResidualExprs).toEqual([
@@ -762,6 +765,7 @@ describe("join residual execution", () => {
         summary: false,
         costs: true,
         timing: false,
+        hints: false,
       }),
       {
         where: residualWhere,

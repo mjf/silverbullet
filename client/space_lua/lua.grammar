@@ -127,7 +127,8 @@ ExplainOptionName {
   ckw<"costs">   |
   ckw<"summary"> |
   ckw<"timing">  |
-  ckw<"verbose">
+  ckw<"verbose"> |
+  ckw<"hints">
 }
 
 ExplainBoolValue {
@@ -139,9 +140,9 @@ ExplainBoolValue {
 FromClause { ckw<"from"> FromFieldList }
 FromFieldList { fromField ("," fromField)* }
 fromField[@isGroup=Field] {
-  FieldDynamic { "[" exp "]" "=" exp JoinHint? } |
-  FieldProp { Name "=" exp JoinHint? } |
-  FieldExp { exp JoinHint? }
+  FieldDynamic { ckw<"materialized">? "[" exp "]" "=" exp JoinHint? } |
+  FieldProp { ckw<"materialized">? Name "=" exp JoinHint? } |
+  FieldExp { ckw<"materialized">? exp JoinHint? }
 }
 
 LeadingClause { ckw<"leading"> FieldList }
@@ -164,7 +165,7 @@ JoinHint {
   JoinMethod JoinType?
 }
 
-JoinType { ckw<"semi"> | ckw<"anti"> }
+JoinType { ckw<"inner"> | ckw<"semi"> | ckw<"anti"> }
 JoinMethod { ckw<"hash"> | ckw<"merge"> | ckw<"loop"> UsingClause? }
 
 field[@isGroup=Field] {

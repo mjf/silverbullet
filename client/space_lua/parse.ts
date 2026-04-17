@@ -38,7 +38,7 @@ const luaStyleTags = styleTags({
   CompareOp: t.operator,
   "true false": t.bool,
   Comment: t.lineComment,
-  "return break goto do end while repeat until function local if then else elseif in for nil or and not query from where limit offset select order by desc asc nulls first last group having filter using leading semi anti hash loop merge all distinct explain analyze costs summary timing verbose":
+  "return break goto do end while repeat until function local if then else elseif in for nil or and not query from materialized where limit offset select order by desc asc nulls first last group having filter using leading inner semi anti hash loop merge all distinct explain analyze costs summary timing verbose":
     t.keyword,
 });
 
@@ -1484,6 +1484,7 @@ function parseQueryClause(t: ParseTree, ctx: ASTCtx): LuaQueryClause {
         summary: false,
         timing: false,
         verbose: false,
+        hints: false,
       };
 
       const parseBoolValue = (node: ParseTree): boolean => {
@@ -1542,6 +1543,7 @@ function parseQueryClause(t: ParseTree, ctx: ASTCtx): LuaQueryClause {
         summary: options.summary,
         costs: options.costs,
         timing: options.timing,
+        hints: options.hints,
         ctx: context(t, ctx),
       };
     }
