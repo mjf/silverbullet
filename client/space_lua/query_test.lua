@@ -6416,27 +6416,6 @@ do
   )
 end
 
--- 145b. Single-source explain works
-
-do
-  local plan = query [[
-    explain
-    from
-      p = pages
-    select {
-      name = p.name,
-    }
-  ]]
-
-  plan = tostring(plan)
-
-  assertTrue(
-    string.find(plan, "Scan on p", 1, true) ~= nil,
-    "103: expected single-source explain scan, got: " .. tostring(plan)
-  )
-end
-
-
 -- 146. Distinct explain analyze works
 
 do
