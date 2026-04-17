@@ -1622,8 +1622,6 @@ function parseJoinHint(t: ParseTree, ctx: ASTCtx): LuaJoinHint {
   return hint;
 }
 
-// Parse `FromFieldList` (like `parseFieldList` but extracts `JoinHint`,
-// validate that `JoinHint` is present on multi-source `from` only)
 function parseFromFieldList(t: ParseTree, ctx: ASTCtx): LuaFromField[] {
   if (t.type !== "FromFieldList") {
     throw new Error(`Expected FromFieldList, got ${t.type}`);
@@ -1636,8 +1634,19 @@ function parseFromFieldList(t: ParseTree, ctx: ASTCtx): LuaFromField[] {
         c.type === "FieldDynamic",
     )
     .map((c) => {
-      const base = parseTableField(c, ctx);
+      const materialized =
+        c.children?.[0]?.type === "materialized";
+
+      const baseNode = materialized
+        ? ({
+            ...c,
+            children: c.children!.filter((ch) => ch.type !== "materialized"),
+          } as ParseTree)
+        : c;
+
+      const base = parseTableField(baseNode, ctx);
       const hintNode = c.children?.find((ch) => ch.type === "JoinHint");
+
       if (hintNode) {
         const joinHint = parseJoinHint(hintNode, ctx);
 
@@ -1654,16 +1663,18 @@ function parseFromFieldList(t: ParseTree, ctx: ASTCtx): LuaFromField[] {
           };
           visit(c);
 
-          if (texts.includes("semi")) {
+          if (texts.includes("inner")) {
+            joinHint.joinType = "inner";
+          } else if (texts.includes("semi")) {
             joinHint.joinType = "semi";
           } else if (texts.includes("anti")) {
             joinHint.joinType = "anti";
           }
         }
 
-        return { ...base, joinHint };
+        return { ...base, joinHint, materialized };
       }
-      return base;
+      return { ...base, materialized };
     });
 
   if (fields.length < 2) {
