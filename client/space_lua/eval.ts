@@ -53,6 +53,7 @@ import {
   extractRangePredicates,
   extractSingleSourceFilters,
   formatExplainOutput,
+  generateTransitivePredicates,
   type JoinPlannerConfig,
   type JoinSource,
   stripUsedJoinPredicates,
@@ -105,6 +106,7 @@ import {
   luaFormatNumber,
   luaGet,
   luaIndexValue,
+  luaKeys,
   luaMarkToBeClosed,
   luaSet,
   luaTruthy,
@@ -1238,6 +1240,30 @@ export function luaTableToArray(t: LuaTable): any[] {
   return [t];
 }
 
+/**
+ * Flatten cross-join rows: merge all source sub-tables into a single flat row.
+ * Later sources win on key conflicts (like SQL SELECT * column ordering).
+ */
+function flattenJoinedRows(rows: any[], sourceNames: string[]): any[] {
+  return rows.map((row) => {
+    if (!(row instanceof LuaTable)) return row;
+    const flat = new LuaTable();
+    for (const srcName of sourceNames) {
+      const srcObj = row.rawGet(srcName);
+      if (srcObj instanceof LuaTable) {
+        for (const key of luaKeys(srcObj)) {
+          void flat.rawSet(key, srcObj.rawGet(key));
+        }
+      } else if (typeof srcObj === "object" && srcObj !== null) {
+        for (const key of Object.keys(srcObj)) {
+          void flat.rawSet(key, (srcObj as any)[key]);
+        }
+      }
+    }
+    return flat;
+  });
+}
+
 async function materializeValueAsItems(
   val: LuaValue,
   env: LuaEnv,
@@ -1523,9 +1549,9 @@ export function evalExpression(
             const planT0 = performance.now();
 
             // Check for plan order hint
-            const planClause = q.clauses.find(
-              (c) => c.type === "Leading",
-            ) as LuaLeadingClause | undefined;
+            const planClause = q.clauses.find((c) => c.type === "Leading") as
+              | LuaLeadingClause
+              | undefined;
             const planOrder = planClause?.fields.map((f) => {
               if (f.type === "ExpressionField" && f.value.type === "Variable") {
                 return f.value.name;
@@ -1593,6 +1619,17 @@ export function evalExpression(
             // exactly one source and apply them before the join.
             const { pushed: pushedFilters, residual: pushdownResidualWhere } =
               extractSingleSourceFilters(whereClause?.expression, sourceNames);
+
+            // Transitive predicate generation — propagate single-source
+            // filters through equi-predicates to filter the other joined source.
+            const transitiveFilters = generateTransitivePredicates(
+              pushedFilters,
+              equiPreds,
+              sourceNames,
+            );
+            if (transitiveFilters.length > 0) {
+              pushedFilters.push(...transitiveFilters);
+            }
 
             const pushedFilterExprBySource = new Map<string, string>();
             for (const src of fromSource.sources) {
@@ -1856,8 +1893,18 @@ export function evalExpression(
             });
             query.objectVariable = undefined;
 
+            const hasExplicitSelect = q.clauses.some(
+              (c) => c.type === "Select",
+            );
+            const sourceNameList = fromSource.sources.map((s) => s.name);
+
             return joinedCollection
               .query(query, env, sf, globalThis.client?.config)
+              .then((rows) =>
+                hasExplicitSelect
+                  ? rows
+                  : flattenJoinedRows(rows, sourceNameList),
+              )
               .then(jsToLuaValue);
           })();
         }

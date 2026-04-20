@@ -2508,6 +2508,226 @@ export async function applyPushedFiltersWithStats(
   return { result, removedCount: items.length - result.length };
 }
 
+// Transitive predicate generation
+
+/**
+ * Generate new single-source filters by propagating existing pushed filters
+ * through equi-predicates.
+ *
+ * Example: given filter `a.name > 'M'` and equi-pred `a.name == b.name`,
+ * generates `b.name > 'M'` as a new pushed filter for source `b`.
+ *
+ * Only propagates simple comparison predicates (column op literal) where
+ * the column participates in an equi-join.
+ */
+export function generateTransitivePredicates(
+  pushedFilters: SingleSourceFilter[],
+  equiPreds: EquiPredicate[],
+  sourceNames: Set<string>,
+): SingleSourceFilter[] {
+  if (pushedFilters.length === 0 || equiPreds.length === 0) return [];
+
+  const generated: SingleSourceFilter[] = [];
+
+  for (const filter of pushedFilters) {
+    const candidates = extractTransitiveCandidates(
+      filter.expression,
+      filter.sourceName,
+    );
+
+    for (const candidate of candidates) {
+      // Find equi-predicates that link this column to another source
+      for (const ep of equiPreds) {
+        let targetSource: string | null = null;
+        let targetColumn: string | null = null;
+
+        if (
+          ep.leftSource === filter.sourceName &&
+          ep.leftColumn === candidate.column
+        ) {
+          targetSource = ep.rightSource;
+          targetColumn = ep.rightColumn;
+        } else if (
+          ep.rightSource === filter.sourceName &&
+          ep.rightColumn === candidate.column
+        ) {
+          targetSource = ep.leftSource;
+          targetColumn = ep.leftColumn;
+        }
+
+        if (!targetSource || !targetColumn) continue;
+        if (!sourceNames.has(targetSource)) continue;
+
+        // Don't generate duplicates
+        const alreadyExists = pushedFilters.some(
+          (f) =>
+            f.sourceName === targetSource &&
+            isStructurallyEquivalentFilter(
+              f.expression,
+              targetSource!,
+              targetColumn!,
+              candidate.op,
+              candidate.literalExpr,
+            ),
+        );
+        if (alreadyExists) continue;
+
+        const alreadyGenerated = generated.some(
+          (f) =>
+            f.sourceName === targetSource &&
+            isStructurallyEquivalentFilter(
+              f.expression,
+              targetSource!,
+              targetColumn!,
+              candidate.op,
+              candidate.literalExpr,
+            ),
+        );
+        if (alreadyGenerated) continue;
+
+        // Build the transitive predicate AST: targetSource.targetColumn op literal
+        const newExpr: LuaExpression = {
+          type: "Binary",
+          operator: candidate.op,
+          left: {
+            type: "PropertyAccess",
+            object: { type: "Variable", name: targetSource, ctx: {} },
+            property: targetColumn,
+            ctx: {},
+          } as LuaExpression,
+          right: candidate.literalExpr,
+          ctx: filter.expression.ctx,
+        } as LuaExpression;
+
+        generated.push({
+          sourceName: targetSource,
+          expression: newExpr,
+        });
+      }
+    }
+  }
+
+  return generated;
+}
+
+type TransitiveCandidate = {
+  column: string;
+  op: string;
+  literalExpr: LuaExpression;
+};
+
+/**
+ * Extract simple `source.column op literal` patterns from a filter expression
+ * that can be propagated transitively.
+ */
+function extractTransitiveCandidates(
+  expr: LuaExpression,
+  sourceName: string,
+): TransitiveCandidate[] {
+  const results: TransitiveCandidate[] = [];
+
+  // Handle AND conjunctions
+  if (expr.type === "Binary" && expr.operator === "and") {
+    results.push(...extractTransitiveCandidates(expr.left, sourceName));
+    results.push(...extractTransitiveCandidates(expr.right, sourceName));
+    return results;
+  }
+
+  if (expr.type !== "Binary") return results;
+
+  const op = expr.operator;
+  if (
+    op !== "==" &&
+    op !== "~=" &&
+    op !== "!=" &&
+    op !== "<" &&
+    op !== "<=" &&
+    op !== ">" &&
+    op !== ">="
+  ) {
+    return results;
+  }
+
+  // Try: source.column op literal
+  const leftCol = extractSourceColumn(expr.left, sourceName);
+  if (leftCol && isLiteralExpr(expr.right)) {
+    results.push({ column: leftCol, op, literalExpr: expr.right });
+    return results;
+  }
+
+  // Try: literal op source.column (flip)
+  const rightCol = extractSourceColumn(expr.right, sourceName);
+  if (rightCol && isLiteralExpr(expr.left)) {
+    const flipped = flipOp(op);
+    if (flipped) {
+      results.push({ column: rightCol, op: flipped, literalExpr: expr.left });
+    }
+  }
+
+  return results;
+}
+
+function extractSourceColumn(
+  expr: LuaExpression,
+  sourceName: string,
+): string | null {
+  if (
+    expr.type === "PropertyAccess" &&
+    expr.object.type === "Variable" &&
+    expr.object.name === sourceName
+  ) {
+    return expr.property;
+  }
+  return null;
+}
+
+function isLiteralExpr(expr: LuaExpression): boolean {
+  return (
+    expr.type === "String" ||
+    expr.type === "Number" ||
+    expr.type === "Boolean" ||
+    expr.type === "Nil"
+  );
+}
+
+function flipOp(op: string): string | null {
+  switch (op) {
+    case "==":
+      return "==";
+    case "~=":
+      return "~=";
+    case "!=":
+      return "!=";
+    case "<":
+      return ">";
+    case "<=":
+      return ">=";
+    case ">":
+      return "<";
+    case ">=":
+      return "<=";
+    default:
+      return null;
+  }
+}
+
+function isStructurallyEquivalentFilter(
+  expr: LuaExpression,
+  sourceName: string,
+  column: string,
+  op: string,
+  literalExpr: LuaExpression,
+): boolean {
+  if (expr.type !== "Binary" || expr.operator !== op) return false;
+
+  // Check left is source.column
+  const leftCol = extractSourceColumn(expr.left, sourceName);
+  if (leftCol !== column) return false;
+
+  // Check right is same literal
+  return exprStructurallyEquals(expr.right, literalExpr);
+}
+
 // 18. Predicate stripping
 
 export function stripUsedJoinPredicates(
