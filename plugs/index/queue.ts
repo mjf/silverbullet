@@ -12,30 +12,32 @@ import type { IndexTreeEvent } from "@silverbulletmd/silverbullet/type/event";
 /// QUEUE PROCESSING
 
 export async function processIndexQueue(messages: MQMessage[]) {
-  for (const message of messages) {
-    const path: string = message.body;
-    console.log("[index]", `Indexing file ${path}`);
-    await indexFile(path);
-  }
-}
+  // Read all files in parallel
+  const fileContents = await Promise.all(
+    messages.map(async (message) => {
+      const path: string = message.body;
+      if (!path.endsWith(".md")) {
+        return { path, kind: "document" as const, text: "", meta: null, tree: null };
+      }
+      const name = path.slice(0, -3);
+      const { text, meta } = await space.readPageWithMeta(name);
+      const tree = await markdown.parseMarkdown(text);
+      return { path, kind: "page" as const, name, text, meta, tree };
+    }),
+  );
 
-async function indexFile(path: string) {
-  if (path.endsWith(".md")) {
-    // Page
-    const name = path.slice(0, -3);
-    // Read and parse the file
-    const { text, meta } = await space.readPageWithMeta(name);
-    const tree = await markdown.parseMarkdown(text);
-
-    // Emit the event which will be picked up by indexers
-    await events.dispatchEvent("page:index", {
-      name,
-      meta,
-      tree,
-      text,
-    } as IndexTreeEvent);
-  } else {
-    await events.dispatchEvent("document:index", path);
+  // Run indexers
+  for (const file of fileContents) {
+    if (file.kind === "document") {
+      await events.dispatchEvent("document:index", file.path);
+    } else {
+      await events.dispatchEvent("page:index", {
+        name: file.name,
+        meta: file.meta,
+        tree: file.tree,
+        text: file.text,
+      } as IndexTreeEvent);
+    }
   }
 }
 
