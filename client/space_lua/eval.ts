@@ -1686,9 +1686,31 @@ export function evalExpression(
               }
 
               const originalRowCount = src.stats?.rowCount;
+              const originalNdv = src.stats?.ndv;
+              const originalMcv = src.stats?.mcv;
               const filteredStats = computeStatsFromArray(filtered);
+
+              // Preserve bitmap-index NDV/MCV when available,
+	      // capped to filtered row count
+              const filteredRowCount = filteredStats.rowCount;
+              let finalNdv = filteredStats.ndv;
+              let finalMcv = filteredStats.mcv;
+
+              if (originalNdv && originalNdv.size > 0) {
+                finalNdv = new Map<string, number>();
+                for (const [col, ndv] of originalNdv) {
+                  finalNdv.set(col, Math.min(ndv, filteredRowCount));
+                }
+              }
+
+              if (originalMcv && originalMcv.size > 0) {
+                finalMcv = originalMcv;
+              }
+
               src.stats = {
                 ...filteredStats,
+                ndv: finalNdv,
+                mcv: finalMcv,
                 unfilteredRowCount: originalRowCount,
                 statsSource: "recomputed-filtered-exact",
                 executionCapabilities: {
@@ -1696,7 +1718,7 @@ export function evalExpression(
                   scanKind: canDelegate ? "delegated-bitmap" : "materialized",
                 },
               };
-              // Originally persisted, but re-computed after pushed filter
+
               materializedOverrides.set(src.name, filtered);
             }
 

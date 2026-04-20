@@ -397,9 +397,9 @@ function canUseMcvForPlanning(
   leftSource: StatsSource | undefined,
   rightSource: StatsSource | undefined,
 ): boolean {
-  return (
-    leftSource === "persisted-complete" && rightSource === "persisted-complete"
-  );
+  const trusted = (s: StatsSource | undefined) =>
+    s === "persisted-complete" || s === "recomputed-filtered-exact";
+  return trusted(leftSource) && trusted(rightSource);
 }
 
 function ndvConfidenceMultiplier(
@@ -2787,7 +2787,9 @@ function explainNdvSource(
   if (!(hasObservedLeftNdv || hasObservedRightNdv)) {
     return "row-count heuristic";
   }
-  if (leftSS === "persisted-complete" || rightSS === "persisted-complete") {
+  const isBitmapSource = (s: StatsSource | undefined) =>
+    s === "persisted-complete" || s === "recomputed-filtered-exact";
+  if (isBitmapSource(leftSS) || isBitmapSource(rightSS)) {
     return "roaring-bitmap index";
   }
   if (
