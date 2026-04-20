@@ -425,7 +425,9 @@ function estimatedRows(s: JoinSource): number {
 }
 
 function estimatedWidth(s: JoinSource): number {
-  return s.withHints?.width ?? s.stats?.avgColumnCount ?? DEFAULT_ESTIMATED_WIDTH;
+  return (
+    s.withHints?.width ?? s.stats?.avgColumnCount ?? DEFAULT_ESTIMATED_WIDTH
+  );
 }
 
 function estimatedSourceCost(s: JoinSource): number {
@@ -953,13 +955,7 @@ export function buildJoinTree(
     return { kind: "leaf", source: sources[0] };
   }
 
-  const ordered = orderSources(
-    sources,
-    leading,
-    equiPreds,
-    rangePreds,
-    config,
-  );
+  const ordered = orderSources(sources, leading, equiPreds, rangePreds, config);
 
   if (ordered[0].hint) {
     ordered[0] = { ...ordered[0], hint: undefined };
@@ -1891,31 +1887,35 @@ async function sortMergeJoin(
   leftKeyed.sort((a, b) => compareSortKeys(a.key, b.key));
   rightKeyed.sort((a, b) => compareSortKeys(a.key, b.key));
 
+  let leftStart = 0;
+  let rightStart = 0;
+
   if (equiPred) {
     while (
-      leftKeyed.length > 0 &&
+      leftStart < leftKeyed.length &&
       hashJoinKey(
         extractField(
-          leftKeyed[0].row.rawGet(equiPred.leftSource),
+          leftKeyed[leftStart].row.rawGet(equiPred.leftSource),
           equiPred.leftColumn,
         ),
       ) === null
     ) {
-      leftKeyed.shift();
+      leftStart++;
     }
     while (
-      rightKeyed.length > 0 &&
-      hashJoinKey(extractField(rightKeyed[0].item, equiPred.rightColumn)) ===
-        null
+      rightStart < rightKeyed.length &&
+      hashJoinKey(
+        extractField(rightKeyed[rightStart].item, equiPred.rightColumn),
+      ) === null
     ) {
-      rightKeyed.shift();
+      rightStart++;
     }
   }
 
   const results: LuaTable[] = [];
   let processed = 0;
-  let li = 0;
-  let ri = 0;
+  let li = leftStart;
+  let ri = rightStart;
 
   while (li < leftKeyed.length && ri < rightKeyed.length) {
     const cmp = compareSortKeys(leftKeyed[li].key, rightKeyed[ri].key);
@@ -2087,10 +2087,7 @@ async function dispatchJoin(
     }
   }
 
-  if (tree.method !== "loop") {
-    (tree as JoinInner).method = "loop";
-  }
-
+  // No equi-pred: fall back to loop join
   if (residuals && residuals.length > 0) {
     return residualLoopJoin(
       leftRows,
@@ -2781,7 +2778,7 @@ function selectContainsAggregate(
         return true;
       }
       return expr.args.some((arg) =>
-        selectContainsAggregate(arg, runtimeConfig)
+        selectContainsAggregate(arg, runtimeConfig),
       );
     case "TableConstructor":
       return expr.fields.some((f) => {
@@ -2956,10 +2953,14 @@ export function wrapPlanWithQueryOps(
 
     const aggDescs: AggregateDescription[] = [];
     if (query.select) {
-      aggDescs.push(...collectAggregateDescriptions(query.select, runtimeConfig));
+      aggDescs.push(
+        ...collectAggregateDescriptions(query.select, runtimeConfig),
+      );
     }
     if (query.having) {
-      aggDescs.push(...collectAggregateDescriptions(query.having, runtimeConfig));
+      aggDescs.push(
+        ...collectAggregateDescriptions(query.having, runtimeConfig),
+      );
     }
 
     const seen = new Set<string>();
@@ -4075,9 +4076,7 @@ function formatNode(
     } else if (node.mcvFallback === "suppressed") {
       const suffix =
         node.mcvKeyCount !== undefined ? `  (keys=${node.mcvKeyCount})` : "";
-      lines.push(
-        `${detailPad}MCV: suppressed${suffix}`,
-      );
+      lines.push(`${detailPad}MCV: suppressed${suffix}`);
     } else if (node.mcvFallback === "no-mcv") {
       lines.push(`${detailPad}MCV: not available`);
     }
