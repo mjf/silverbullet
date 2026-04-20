@@ -289,6 +289,7 @@ export type ExplainNode = {
   hashBuckets?: number;
   rowsRemovedByFilter?: number;
   rowsRemovedByJoinFilter?: number;
+  rowsRemovedByInlineFilter?: number;
   rowsRemovedByUnique?: number;
   equiPred?: EquiPredicate;
   joinResidualExprs?: string[];
@@ -3990,6 +3991,16 @@ function formatNode(
 
     lines.push(
       `${detailPad}${removedByFilterLabel}: ${node.rowsRemovedByFilter}`,
+    );
+  }
+
+  if (
+    opts.analyze &&
+    node.rowsRemovedByInlineFilter !== undefined &&
+    node.rowsRemovedByInlineFilter > 0
+  ) {
+    lines.push(
+      `${detailPad}Rows Removed by Inline Filter: ${node.rowsRemovedByInlineFilter}`,
     );
   }
 

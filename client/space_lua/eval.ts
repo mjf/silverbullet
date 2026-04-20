@@ -927,6 +927,10 @@ function annotateExplainWrappersFromStageStats(
       node.rowsRemovedByFilter = stat.rowsRemoved;
     }
 
+    if (wantedStage === "where" && stat.inlineFilteredRows) {
+      node.rowsRemovedByInlineFilter = stat.inlineFilteredRows;
+    }
+
     if (wantedStage === "distinct") {
       node.rowsRemovedByUnique = stat.rowsRemoved;
     }

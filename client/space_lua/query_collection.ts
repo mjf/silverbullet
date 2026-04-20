@@ -98,6 +98,7 @@ export type QueryStageStat = {
   elapsedMs: number;
   rowsRemoved?: number;
   memoryRows?: number;
+  inlineFilteredRows?: number;
 };
 
 export type QueryInstrumentation = {
@@ -239,6 +240,7 @@ function emitStageStat(
   extra: {
     rowsRemoved?: number;
     memoryRows?: number;
+    inlineFilteredRows?: number;
   } = {},
 ): void {
   if (!instrumentation?.onStage) return;
@@ -252,6 +254,7 @@ function emitStageStat(
     elapsedMs: Math.round((endTimeMs - startTimeMs) * 1000) / 1000,
     rowsRemoved: extra.rowsRemoved,
     memoryRows: extra.memoryRows,
+    inlineFilteredRows: extra.inlineFilteredRows,
   });
 }
 
@@ -1005,22 +1008,49 @@ export async function applyQuery(
   if (query.where) {
     const stageStart = nowMs();
     const inputRows = results.length;
-    const filteredResults = [];
-    for (const value of results) {
-      const itemEnv = buildItemEnvLocal(query.objectVariable, value, env, sf);
-      const whereResult = await evalExpression(query.where, itemEnv, sf);
-      if (luaTruthy(whereResult)) {
-        filteredResults.push(value);
+
+    // P2: Extract simple column-vs-literal comparisons that can be
+    // evaluated with fast JS property access — no LuaEnv allocation
+    // or evalExpression overhead per row.
+    const { filters: inlineFilters, residual: residualWhere } =
+      extractKvInlineFilters(query.where, query.objectVariable);
+
+    // Fast pre-filter pass: pure JS comparisons, no Lua overhead
+    let inlineFilteredRows = 0;
+    if (inlineFilters.length > 0) {
+      const preFiltered = [];
+      for (const value of results) {
+        if (matchesAllKvInlineFilters(value, inlineFilters)) {
+          preFiltered.push(value);
+        }
       }
+      inlineFilteredRows = results.length - preFiltered.length;
+      results = preFiltered;
     }
-    results = filteredResults;
+
+    // Residual pass: complex predicates still need full Lua eval
+    if (residualWhere) {
+      const filteredResults = [];
+      for (const value of results) {
+        const itemEnv = buildItemEnvLocal(query.objectVariable, value, env, sf);
+        const whereResult = await evalExpression(residualWhere, itemEnv, sf);
+        if (luaTruthy(whereResult)) {
+          filteredResults.push(value);
+        }
+      }
+      results = filteredResults;
+    }
+
     emitStageStat(
       instrumentation,
       "where",
       inputRows,
       results.length,
       stageStart,
-      { rowsRemoved: Math.max(0, inputRows - results.length) },
+      {
+        rowsRemoved: Math.max(0, inputRows - results.length),
+        inlineFilteredRows: inlineFilteredRows > 0 ? inlineFilteredRows : undefined,
+      },
     );
   }
 
