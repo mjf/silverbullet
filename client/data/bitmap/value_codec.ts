@@ -23,13 +23,6 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return proto === Object.prototype || proto === null;
 }
 
-function normalizeNumber(value: number): number {
-  if (Number.isNaN(value)) {
-    return NaN;
-  }
-  return value;
-}
-
 function ensureSupportedValue(value: unknown): asserts value is SupportedValue {
   if (
     value === null ||
@@ -57,50 +50,116 @@ function ensureSupportedValue(value: unknown): asserts value is SupportedValue {
   throw new Error(`Unsupported value type for value codec: ${typeof value}`);
 }
 
-function u32ToBytes(n: number): Uint8Array {
-  const buf = new Uint8Array(4);
-  const view = new DataView(buf.buffer);
-  view.setUint32(0, n, false);
-  return buf;
+// Growable buffer writer — eliminates per-value Uint8Array allocations
+class ByteWriter {
+  private buf: Uint8Array;
+  private pos = 0;
+
+  constructor(initialSize = 64) {
+    this.buf = new Uint8Array(initialSize);
+  }
+
+  private grow(needed: number): void {
+    if (this.pos + needed <= this.buf.length) return;
+    const next = new Uint8Array(
+      Math.max(this.buf.length * 2, this.pos + needed),
+    );
+    next.set(this.buf.subarray(0, this.pos));
+    this.buf = next;
+  }
+
+  writeByte(b: number): void {
+    this.grow(1);
+    this.buf[this.pos++] = b;
+  }
+
+  writeU32BE(n: number): void {
+    this.grow(4);
+    this.buf[this.pos++] = (n >>> 24) & 0xff;
+    this.buf[this.pos++] = (n >>> 16) & 0xff;
+    this.buf[this.pos++] = (n >>> 8) & 0xff;
+    this.buf[this.pos++] = n & 0xff;
+  }
+
+  writeF64BE(n: number): void {
+    this.grow(8);
+    const view = new DataView(
+      this.buf.buffer,
+      this.buf.byteOffset + this.pos,
+      8,
+    );
+    if (Number.isNaN(n)) {
+      view.setUint32(0, 0x7ff80000, false);
+      view.setUint32(4, 0x00000000, false);
+    } else {
+      view.setFloat64(0, n, false);
+    }
+    this.pos += 8;
+  }
+
+  writeBytes(data: Uint8Array): void {
+    this.grow(data.length);
+    this.buf.set(data, this.pos);
+    this.pos += data.length;
+  }
+
+  writeString(value: string): void {
+    const data = textEncoder.encode(value);
+    this.writeU32BE(data.length);
+    this.writeBytes(data);
+  }
+
+  finish(): Uint8Array {
+    return this.buf.subarray(0, this.pos);
+  }
 }
+
+function encodeValueInto(value: SupportedValue, w: ByteWriter): void {
+  if (value === null) {
+    w.writeByte(TAG_NULL);
+    return;
+  }
+  if (typeof value === "boolean") {
+    w.writeByte(value ? TAG_TRUE : TAG_FALSE);
+    return;
+  }
+  if (typeof value === "number") {
+    w.writeByte(TAG_NUMBER);
+    w.writeF64BE(Number.isNaN(value) ? NaN : value);
+    return;
+  }
+  if (typeof value === "string") {
+    w.writeByte(TAG_STRING);
+    w.writeString(value);
+    return;
+  }
+  if (Array.isArray(value)) {
+    w.writeByte(TAG_ARRAY);
+    w.writeU32BE(value.length);
+    for (const item of value) {
+      encodeValueInto(item, w);
+    }
+    return;
+  }
+  const keys = Object.keys(value).sort();
+  w.writeByte(TAG_OBJECT);
+  w.writeU32BE(keys.length);
+  for (const key of keys) {
+    w.writeString(key);
+    encodeValueInto(value[key], w);
+  }
+}
+
+// Decode helpers (unchanged — no allocations to optimize here)
 
 function bytesToU32(bytes: Uint8Array, offset: number): number {
   const view = new DataView(bytes.buffer, bytes.byteOffset + offset, 4);
   return view.getUint32(0, false);
 }
 
-function f64ToBytes(n: number): Uint8Array {
-  const buf = new Uint8Array(8);
-  const view = new DataView(buf.buffer);
-  if (Number.isNaN(n)) {
-    view.setUint32(0, 0x7ff80000, false);
-    view.setUint32(4, 0x00000000, false);
-  } else {
-    view.setFloat64(0, n, false);
-  }
-  return buf;
-}
-
 function bytesToF64(bytes: Uint8Array, offset: number): number {
   const view = new DataView(bytes.buffer, bytes.byteOffset + offset, 8);
   return view.getFloat64(0, false);
-}
-
-function concatBytes(parts: Uint8Array[]): Uint8Array {
-  let total = 0;
-  for (const p of parts) total += p.length;
-  const out = new Uint8Array(total);
-  let offset = 0;
-  for (const p of parts) {
-    out.set(p, offset);
-    offset += p.length;
-  }
-  return out;
-}
-
-function encodeStringPayload(value: string): Uint8Array {
-  const data = textEncoder.encode(value);
-  return concatBytes([u32ToBytes(data.length), data]);
 }
 
 function decodeStringPayload(
@@ -117,49 +176,6 @@ function decodeStringPayload(
   }
   const value = textDecoder.decode(bytes.subarray(offset, offset + len));
   return { value, nextOffset: offset + len };
-}
-
-function encodeValueInternal(value: SupportedValue): Uint8Array {
-  if (value === null) {
-    return Uint8Array.of(TAG_NULL);
-  }
-
-  if (typeof value === "boolean") {
-    return Uint8Array.of(value ? TAG_TRUE : TAG_FALSE);
-  }
-
-  if (typeof value === "number") {
-    return concatBytes([
-      Uint8Array.of(TAG_NUMBER),
-      f64ToBytes(normalizeNumber(value)),
-    ]);
-  }
-
-  if (typeof value === "string") {
-    return concatBytes([Uint8Array.of(TAG_STRING), encodeStringPayload(value)]);
-  }
-
-  if (Array.isArray(value)) {
-    const parts: Uint8Array[] = [
-      Uint8Array.of(TAG_ARRAY),
-      u32ToBytes(value.length),
-    ];
-    for (const item of value) {
-      parts.push(encodeValueInternal(item));
-    }
-    return concatBytes(parts);
-  }
-
-  const keys = Object.keys(value).sort();
-  const parts: Uint8Array[] = [
-    Uint8Array.of(TAG_OBJECT),
-    u32ToBytes(keys.length),
-  ];
-  for (const key of keys) {
-    parts.push(encodeStringPayload(key));
-    parts.push(encodeValueInternal(value[key]));
-  }
-  return concatBytes(parts);
 }
 
 function decodeValueInternal(
@@ -232,9 +248,13 @@ function decodeValueInternal(
   }
 }
 
+// Public API
+
 export function encodeCanonicalValue(value: unknown): Uint8Array {
   ensureSupportedValue(value);
-  return encodeValueInternal(value);
+  const w = new ByteWriter(64);
+  encodeValueInto(value, w);
+  return w.finish();
 }
 
 export function decodeCanonicalValue(bytes: Uint8Array): SupportedValue {

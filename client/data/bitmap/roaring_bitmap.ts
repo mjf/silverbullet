@@ -37,10 +37,9 @@ class ArrayContainer implements Container {
 
   add(lsb: number): Container {
     const pos = bsearch(this.data, this.cardinality, lsb);
-    if (pos >= 0) return this; // duplicate
+    if (pos >= 0) return this;
     const ins = ~pos;
     if (this.cardinality + 1 >= ARRAY_MAX) {
-      // Promote to Bitmap
       const bc = new BitmapContainer();
       for (let i = 0; i < this.cardinality; i++) bc.setBit(this.data[i]);
       bc.setBit(lsb);
@@ -51,7 +50,6 @@ class ArrayContainer implements Container {
       next.set(this.data);
       this.data = next;
     }
-    // Shift right
     this.data.copyWithin(ins + 1, ins, this.cardinality);
     this.data[ins] = lsb;
     this.cardinality++;
@@ -76,8 +74,7 @@ class ArrayContainer implements Container {
 
   and(other: Container): Container {
     if (other instanceof ArrayContainer) return andArrayArray(this, other);
-    if (other instanceof BitmapContainer) return andArrayBitmap(this, other);
-    return andArrayRun(this, other as RunContainer);
+    return filterArray(this, other, true);
   }
 
   or(other: Container): Container {
@@ -88,8 +85,7 @@ class ArrayContainer implements Container {
 
   andNot(other: Container): Container {
     if (other instanceof ArrayContainer) return andNotArrayArray(this, other);
-    if (other instanceof BitmapContainer) return andNotArrayBitmap(this, other);
-    return andNotArrayRun(this, other as RunContainer);
+    return filterArray(this, other, false);
   }
 
   toArray(): number[] {
@@ -153,22 +149,24 @@ class BitmapContainer implements Container {
   }
 
   and(other: Container): Container {
-    if (other instanceof BitmapContainer) return andBitmapBitmap(this, other);
-    if (other instanceof ArrayContainer) return andArrayBitmap(other, this);
-    return andBitmapRun(this, other as RunContainer);
+    if (other instanceof BitmapContainer)
+      return bitmapWordOp(this, other, (x, y) => x & y);
+    if (other instanceof ArrayContainer) return filterArray(other, this, true);
+    return bitmapRunOp(this, other as RunContainer, "and");
   }
 
   or(other: Container): Container {
-    if (other instanceof BitmapContainer) return orBitmapBitmap(this, other);
+    if (other instanceof BitmapContainer)
+      return bitmapWordOp(this, other, (x, y) => x | y);
     if (other instanceof ArrayContainer) return orArrayBitmap(other, this);
-    return orBitmapRun(this, other as RunContainer);
+    return bitmapRunOp(this, other as RunContainer, "or");
   }
 
   andNot(other: Container): Container {
     if (other instanceof BitmapContainer)
-      return andNotBitmapBitmap(this, other);
+      return bitmapWordOp(this, other, (x, y) => x & ~y);
     if (other instanceof ArrayContainer) return andNotBitmapArray(this, other);
-    return andNotBitmapRun(this, other as RunContainer);
+    return bitmapRunOp(this, other as RunContainer, "andnot");
   }
 
   toArray(): number[] {
@@ -176,7 +174,7 @@ class BitmapContainer implements Container {
     for (let w = 0; w < 2048; w++) {
       let word = this.data[w];
       while (word !== 0) {
-        const t = word & -word; // lowest set bit
+        const t = word & -word;
         out.push((w << 5) + popcount(t - 1));
         word ^= t;
       }
@@ -211,7 +209,6 @@ class BitmapContainer implements Container {
 
 class RunContainer implements Container {
   readonly containerType = ContainerType.Run;
-  // Flat pairs: [start0, length0, start1, length1, ...]
   runs: Uint16Array;
   numRuns: number;
   cardinality: number;
@@ -230,7 +227,6 @@ class RunContainer implements Container {
   }
 
   add(lsb: number): Container {
-    // Find run containing or after LSB
     let lo = 0;
     let hi = this.numRuns;
     while (lo < hi) {
@@ -239,14 +235,12 @@ class RunContainer implements Container {
       else hi = mid;
     }
 
-    // Check if LSB is already in run at lo
     if (lo < this.numRuns) {
       const s = this.runs[lo * 2];
       const l = this.runs[lo * 2 + 1];
-      if (lsb >= s && lsb <= s + l) return this; // already contained
+      if (lsb >= s && lsb <= s + l) return this;
     }
 
-    // Check if LSB extends run at lo-1
     const canExtendPrev =
       lo > 0 &&
       this.runs[(lo - 1) * 2] + this.runs[(lo - 1) * 2 + 1] + 1 === lsb;
@@ -254,12 +248,10 @@ class RunContainer implements Container {
     const canMerge = canExtendPrev && canExtendNext;
 
     if (canMerge) {
-      // Merge prev and next
       const prevIdx = lo - 1;
       const prevStart = this.runs[prevIdx * 2];
       const nextEnd = this.runs[lo * 2] + this.runs[lo * 2 + 1];
       this.runs[prevIdx * 2 + 1] = nextEnd - prevStart;
-      // Remove run at lo
       this.removeRun(lo);
       this.cardinality++;
     } else if (canExtendPrev) {
@@ -270,7 +262,6 @@ class RunContainer implements Container {
       this.runs[lo * 2 + 1]++;
       this.cardinality++;
     } else {
-      // Insert new run [lsb, 0]
       this.insertRun(lo, lsb, 0);
       this.cardinality++;
     }
@@ -281,13 +272,11 @@ class RunContainer implements Container {
     for (let i = 0; i < this.numRuns; i++) {
       const s = this.runs[i * 2];
       const l = this.runs[i * 2 + 1];
-      if (lsb < s) return this; // not found (runs are sorted)
+      if (lsb < s) return this;
       if (lsb > s + l) continue;
 
-      // Found in run i
       this.cardinality--;
       if (l === 0) {
-        // Single-element run, remove entirely
         this.removeRun(i);
       } else if (lsb === s) {
         this.runs[i * 2] = s + 1;
@@ -295,7 +284,6 @@ class RunContainer implements Container {
       } else if (lsb === s + l) {
         this.runs[i * 2 + 1] = l - 1;
       } else {
-        // Split: [s, lsb-1] and [lsb+1, s+l]
         const newLen1 = lsb - s - 1;
         const newStart2 = lsb + 1;
         const newLen2 = s + l - lsb - 1;
@@ -327,20 +315,19 @@ class RunContainer implements Container {
 
   and(other: Container): Container {
     if (other instanceof RunContainer) return andRunRun(this, other);
-    if (other instanceof ArrayContainer) return andArrayRun(other, this);
-    return andBitmapRun(other as BitmapContainer, this);
+    if (other instanceof ArrayContainer) return filterArray(other, this, true);
+    return bitmapRunOp(other as BitmapContainer, this, "and");
   }
 
   or(other: Container): Container {
     if (other instanceof RunContainer) return orRunRun(this, other);
     if (other instanceof ArrayContainer) return orArrayRun(other, this);
-    return orBitmapRun(other as BitmapContainer, this);
+    return bitmapRunOp(other as BitmapContainer, this, "or");
   }
 
   andNot(other: Container): Container {
     if (other instanceof RunContainer) return andNotRunRun(this, other);
-    if (other instanceof ArrayContainer) return andNotRunArray(this, other);
-    return andNotRunBitmap(this, other as BitmapContainer);
+    return filterRunThrough(this, other, false);
   }
 
   toArray(): number[] {
@@ -369,7 +356,6 @@ class RunContainer implements Container {
       next.set(this.runs);
       this.runs = next;
     }
-    // Shift right by 1 run (2 elements)
     for (let i = this.numRuns - 1; i >= pos; i--) {
       this.runs[(i + 1) * 2] = this.runs[i * 2];
       this.runs[(i + 1) * 2 + 1] = this.runs[i * 2 + 1];
@@ -419,7 +405,101 @@ class RunContainer implements Container {
   }
 }
 
-// Cross-container operations
+// Generic cross-container helpers
+
+/** Filter array elements by membership in another container */
+function filterArray(
+  a: ArrayContainer,
+  b: Container,
+  keep: boolean,
+): Container {
+  const out = new Uint16Array(a.cardinality);
+  let k = 0;
+  for (let i = 0; i < a.cardinality; i++) {
+    if (b.has(a.data[i]) === keep) out[k++] = a.data[i];
+  }
+  return new ArrayContainer(out.slice(0, k), k);
+}
+
+/** Word-wise binary op on two BitmapContainers */
+function bitmapWordOp(
+  a: BitmapContainer,
+  b: BitmapContainer,
+  op: (x: number, y: number) => number,
+): Container {
+  const data = new Uint32Array(2048);
+  let card = 0;
+  for (let i = 0; i < 2048; i++) {
+    const w = op(a.data[i], b.data[i]);
+    data[i] = w;
+    card += popcount(w);
+  }
+  if (card < ARRAY_MAX) return bitmapToArray(data, card);
+  return new BitmapContainer(data, card);
+}
+
+/** Per-bit operation between a Bitmap and Run container */
+function bitmapRunOp(
+  a: BitmapContainer,
+  b: RunContainer,
+  action: "and" | "or" | "andnot",
+): Container {
+  const data =
+    action === "and" ? new Uint32Array(2048) : new Uint32Array(a.data);
+  let card = action === "and" ? 0 : a.cardinality;
+
+  for (let i = 0; i < b.numRuns; i++) {
+    const s = b.runs[i * 2];
+    const e = s + b.runs[i * 2 + 1];
+    for (let v = s; v <= e; v++) {
+      const word = v >>> 5;
+      const bit = 1 << (v & 31);
+      if (action === "and") {
+        if (a.data[word] & bit) {
+          data[word] |= bit;
+          card++;
+        }
+      } else if (action === "or") {
+        if (!(data[word] & bit)) {
+          data[word] |= bit;
+          card++;
+        }
+      } else {
+        if (data[word] & bit) {
+          data[word] &= ~bit;
+          card--;
+        }
+      }
+    }
+  }
+
+  if (card < ARRAY_MAX) return bitmapToArray(data, card);
+  return new BitmapContainer(data, card);
+}
+
+/** Expand Run elements and filter through another container */
+function filterRunThrough(
+  a: RunContainer,
+  b: Container,
+  keep: boolean,
+): Container {
+  const out: number[] = [];
+  for (let i = 0; i < a.numRuns; i++) {
+    const s = a.runs[i * 2];
+    const l = a.runs[i * 2 + 1];
+    for (let v = s; v <= s + l; v++) {
+      if (b.has(v) === keep) out.push(v);
+    }
+  }
+  if (out.length >= ARRAY_MAX) {
+    const bc = new BitmapContainer();
+    for (const v of out) bc.setBit(v);
+    return bc;
+  }
+  return new ArrayContainer(new Uint16Array(out), out.length);
+}
+
+// Specific cross-container operations (unique logic, not generalizable)
 
 function andArrayArray(a: ArrayContainer, b: ArrayContainer): Container {
   const out = new Uint16Array(Math.min(a.cardinality, b.cardinality));
@@ -442,57 +522,8 @@ function andArrayArray(a: ArrayContainer, b: ArrayContainer): Container {
   return new ArrayContainer(out.slice(0, k), k);
 }
 
-function andArrayBitmap(a: ArrayContainer, b: BitmapContainer): Container {
-  const out = new Uint16Array(a.cardinality);
-  let k = 0;
-  for (let i = 0; i < a.cardinality; i++) {
-    if (b.has(a.data[i])) out[k++] = a.data[i];
-  }
-  return new ArrayContainer(out.slice(0, k), k);
-}
-
-function andArrayRun(a: ArrayContainer, b: RunContainer): Container {
-  const out = new Uint16Array(a.cardinality);
-  let k = 0;
-  for (let i = 0; i < a.cardinality; i++) {
-    if (b.has(a.data[i])) out[k++] = a.data[i];
-  }
-  return new ArrayContainer(out.slice(0, k), k);
-}
-
-function andBitmapBitmap(a: BitmapContainer, b: BitmapContainer): Container {
-  const data = new Uint32Array(2048);
-  let card = 0;
-  for (let i = 0; i < 2048; i++) {
-    const w = a.data[i] & b.data[i];
-    data[i] = w;
-    card += popcount(w);
-  }
-  if (card < ARRAY_MAX) return bitmapToArray(data, card);
-  return new BitmapContainer(data, card);
-}
-
-function andBitmapRun(a: BitmapContainer, b: RunContainer): Container {
-  const data = new Uint32Array(2048);
-  let card = 0;
-  for (let i = 0; i < b.numRuns; i++) {
-    const s = b.runs[i * 2];
-    const e = s + b.runs[i * 2 + 1];
-    for (let v = s; v <= e; v++) {
-      const word = v >>> 5;
-      const bit = 1 << (v & 31);
-      if (a.data[word] & bit) {
-        data[word] |= bit;
-        card++;
-      }
-    }
-  }
-  if (card < ARRAY_MAX) return bitmapToArray(data, card);
-  return new BitmapContainer(data, card);
-}
-
 function andRunRun(a: RunContainer, b: RunContainer): Container {
-  const out: number[] = []; // pairs: start, length
+  const out: number[] = [];
   let i = 0;
   let j = 0;
   while (i < a.numRuns && j < b.numRuns) {
@@ -558,7 +589,6 @@ function orArrayBitmap(a: ArrayContainer, b: BitmapContainer): Container {
 }
 
 function orArrayRun(a: ArrayContainer, b: RunContainer): Container {
-  // Convert run to bitmap/array, then union
   if (b.cardinality >= ARRAY_MAX) {
     return orArrayBitmap(a, b.toBitmap());
   }
@@ -567,37 +597,7 @@ function orArrayRun(a: ArrayContainer, b: RunContainer): Container {
   return orArrayArray(a, bc);
 }
 
-function orBitmapBitmap(a: BitmapContainer, b: BitmapContainer): Container {
-  const data = new Uint32Array(2048);
-  let card = 0;
-  for (let i = 0; i < 2048; i++) {
-    const w = a.data[i] | b.data[i];
-    data[i] = w;
-    card += popcount(w);
-  }
-  return new BitmapContainer(data, card);
-}
-
-function orBitmapRun(a: BitmapContainer, b: RunContainer): Container {
-  const data = new Uint32Array(a.data);
-  let card = a.cardinality;
-  for (let i = 0; i < b.numRuns; i++) {
-    const s = b.runs[i * 2];
-    const e = s + b.runs[i * 2 + 1];
-    for (let v = s; v <= e; v++) {
-      const word = v >>> 5;
-      const bit = 1 << (v & 31);
-      if (!(data[word] & bit)) {
-        data[word] |= bit;
-        card++;
-      }
-    }
-  }
-  return new BitmapContainer(data, card);
-}
-
 function orRunRun(a: RunContainer, b: RunContainer): Container {
-  // Merge sorted runs
   const merged: number[] = [];
   let i = 0;
   let j = 0;
@@ -616,7 +616,6 @@ function orRunRun(a: RunContainer, b: RunContainer): Container {
     if (merged.length > 0) {
       const prevEnd = merged[merged.length - 2] + merged[merged.length - 1];
       if (s <= prevEnd + 1) {
-        // Merge with previous
         const newEnd = Math.max(prevEnd, e);
         merged[merged.length - 1] = newEnd - merged[merged.length - 2];
         continue;
@@ -648,36 +647,6 @@ function andNotArrayArray(a: ArrayContainer, b: ArrayContainer): Container {
   return new ArrayContainer(out.slice(0, k), k);
 }
 
-function andNotArrayBitmap(a: ArrayContainer, b: BitmapContainer): Container {
-  const out = new Uint16Array(a.cardinality);
-  let k = 0;
-  for (let i = 0; i < a.cardinality; i++) {
-    if (!b.has(a.data[i])) out[k++] = a.data[i];
-  }
-  return new ArrayContainer(out.slice(0, k), k);
-}
-
-function andNotArrayRun(a: ArrayContainer, b: RunContainer): Container {
-  const out = new Uint16Array(a.cardinality);
-  let k = 0;
-  for (let i = 0; i < a.cardinality; i++) {
-    if (!b.has(a.data[i])) out[k++] = a.data[i];
-  }
-  return new ArrayContainer(out.slice(0, k), k);
-}
-
-function andNotBitmapBitmap(a: BitmapContainer, b: BitmapContainer): Container {
-  const data = new Uint32Array(2048);
-  let card = 0;
-  for (let i = 0; i < 2048; i++) {
-    const w = a.data[i] & ~b.data[i];
-    data[i] = w;
-    card += popcount(w);
-  }
-  if (card < ARRAY_MAX) return bitmapToArray(data, card);
-  return new BitmapContainer(data, card);
-}
-
 function andNotBitmapArray(a: BitmapContainer, b: ArrayContainer): Container {
   const data = new Uint32Array(a.data);
   let card = a.cardinality;
@@ -694,75 +663,11 @@ function andNotBitmapArray(a: BitmapContainer, b: ArrayContainer): Container {
   return new BitmapContainer(data, card);
 }
 
-function andNotBitmapRun(a: BitmapContainer, b: RunContainer): Container {
-  const data = new Uint32Array(a.data);
-  let card = a.cardinality;
-  for (let i = 0; i < b.numRuns; i++) {
-    const s = b.runs[i * 2];
-    const e = s + b.runs[i * 2 + 1];
-    for (let v = s; v <= e; v++) {
-      const word = v >>> 5;
-      const bit = 1 << (v & 31);
-      if (data[word] & bit) {
-        data[word] &= ~bit;
-        card--;
-      }
-    }
-  }
-  if (card < ARRAY_MAX) return bitmapToArray(data, card);
-  return new BitmapContainer(data, card);
-}
-
 function andNotRunRun(a: RunContainer, b: RunContainer): Container {
-  // Expand to bitmap for simplicity; runs can get complex with splits
   if (a.cardinality >= ARRAY_MAX || b.cardinality >= ARRAY_MAX) {
-    return andNotBitmapRun(a.toBitmap(), b);
+    return bitmapRunOp(a.toBitmap(), b, "andnot");
   }
-  // Both small — iterate
-  const out = new Uint16Array(a.cardinality);
-  let k = 0;
-  for (let i = 0; i < a.numRuns; i++) {
-    const s = a.runs[i * 2];
-    const l = a.runs[i * 2 + 1];
-    for (let v = s; v <= s + l; v++) {
-      if (!b.has(v)) out[k++] = v;
-    }
-  }
-  return new ArrayContainer(out.slice(0, k), k);
-}
-
-function andNotRunArray(a: RunContainer, b: ArrayContainer): Container {
-  const out: number[] = [];
-  for (let i = 0; i < a.numRuns; i++) {
-    const s = a.runs[i * 2];
-    const l = a.runs[i * 2 + 1];
-    for (let v = s; v <= s + l; v++) {
-      if (!b.has(v)) out.push(v);
-    }
-  }
-  if (out.length >= ARRAY_MAX) {
-    const bc = new BitmapContainer();
-    for (const v of out) bc.setBit(v);
-    return bc;
-  }
-  return new ArrayContainer(new Uint16Array(out), out.length);
-}
-
-function andNotRunBitmap(a: RunContainer, b: BitmapContainer): Container {
-  const out: number[] = [];
-  for (let i = 0; i < a.numRuns; i++) {
-    const s = a.runs[i * 2];
-    const l = a.runs[i * 2 + 1];
-    for (let v = s; v <= s + l; v++) {
-      if (!b.has(v)) out.push(v);
-    }
-  }
-  if (out.length >= ARRAY_MAX) {
-    const bc = new BitmapContainer();
-    for (const v of out) bc.setBit(v);
-    return bc;
-  }
-  return new ArrayContainer(new Uint16Array(out), out.length);
+  return filterRunThrough(a, b, false);
 }
 
 // Helpers
@@ -783,7 +688,7 @@ function bsearch(arr: Uint16Array, len: number, target: number): number {
     if (v < target) lo = mid + 1;
     else hi = mid - 1;
   }
-  return ~lo; // insertion point
+  return ~lo;
 }
 
 function bsearchInsert(arr: number[], value: number): number {
@@ -800,7 +705,6 @@ function bsearchInsert(arr: number[], value: number): number {
 function optimizeContainer(c: Container): Container {
   if (c instanceof RunContainer) {
     if (c.cardinality < ARRAY_MAX && 2 * c.numRuns >= c.cardinality) {
-      // Array is more compact
       const arr = c.toArray();
       return new ArrayContainer(new Uint16Array(arr), arr.length);
     }
@@ -986,11 +890,10 @@ export class RoaringBitmap {
   }
 
   serialize(): Uint8Array {
-    // Calculate size
-    let size = 2; // containerCount
+    let size = 2;
     for (const msb of this.keys) {
       const c = this.containers.get(msb)!;
-      size += 5; // key(2) + type(1) + cardinality/numRuns(2)
+      size += 5;
       if (c.containerType === ContainerType.Array) {
         size += c.cardinality * 2;
       } else if (c.containerType === ContainerType.Bitmap) {

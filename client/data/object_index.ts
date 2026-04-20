@@ -35,13 +35,11 @@ import { MCVList } from "../space_lua/mcv.ts";
 
 // KV key prefixes
 const indexKey = "idx";
-// Reverse key: [reverseKey, page, tag, refKey] → objectId
 const reverseKey = "ridx";
 
 const indexVersionKey = ["$indexVersion"];
 
 // Bump this every time a full reindex is needed
-// 14: $enc rename + reverse key restructure
 const desiredIndexVersion = 14;
 
 const textEncoder = new TextEncoder();
@@ -173,6 +171,8 @@ export class ObjectValidationError extends Error {
 
 export class ObjectIndex {
   private bitmapIndex: BitmapIndex;
+  // When true, batchSet skips reverse-key lookups (fresh insert only)
+  private _freshMode = false;
 
   constructor(
     private ds: DataStore,
@@ -183,7 +183,6 @@ export class ObjectIndex {
   ) {
     this.bitmapIndex = new BitmapIndex(bitmapConfig);
 
-    // Clear any entries for deleted files
     this.eventHook.addLocalListener("file:deleted", (path: string) => {
       return this.clearFileIndex(path);
     });
@@ -193,7 +192,6 @@ export class ObjectIndex {
       indexStarted = true;
     });
 
-    // Handle initial index completion
     void this.hasFullIndexCompleted().then((hasCompleted) => {
       if (!hasCompleted) {
         const emptyQueueHandler = async () => {
@@ -359,7 +357,14 @@ export class ObjectIndex {
               tagName,
               objectIds,
             );
-            return applyQuery(prefetched, query, env, sf, config, instrumentation);
+            return applyQuery(
+              prefetched,
+              query,
+              env,
+              sf,
+              config,
+              instrumentation,
+            );
           }
         }
 
@@ -610,14 +615,18 @@ export class ObjectIndex {
           const decoded = self.bitmapIndex.decodeObject(value as EncodedObject);
           results.push(self.enrichValue(tagName, decoded));
         }
-        return applyQuery(results, { ...query, where }, env, sf, config, instrumentation);
+        return applyQuery(
+          results,
+          { ...query, where },
+          env,
+          sf,
+          config,
+          instrumentation,
+        );
       },
     };
   }
 
-  /**
-   * Returns a queryable collection of all aggregate functions.
-   */
   aggregates(): LuaQueryCollection {
     const entries: Record<string, any>[] = [];
 
@@ -687,7 +696,6 @@ export class ObjectIndex {
     ref: string,
   ): Promise<any | null> {
     const refKey = this.cleanKey(ref, page);
-    // Reverse key: [reverseKey, page, tag, refKey]
     const objectId = await this.ds.get<number>([reverseKey, page, tag, refKey]);
     if (objectId === null || objectId === undefined) return null;
 
@@ -760,98 +768,122 @@ export class ObjectIndex {
   }
 
   private async batchSet(page: string, kvs: KV[]): Promise<void> {
-    // Phase 1: batch-read all reverse keys to find existing objectIds
-    const reverseKeys: KvKey[] = kvs.map(({ key }) => [
-      reverseKey,
-      page,
-      key[0] as string,
-      key[1] as string,
-    ]);
-    const existingObjectIds = await this.ds.batchGet<number>(reverseKeys);
-
-    // Phase 2: batch-read all existing encoded objects for those that exist
-    const encodedReadKeys: (KvKey | null)[] = existingObjectIds.map(
-      (objId, i) => {
-        if (objId !== null && objId !== undefined) {
-          return [indexKey, kvs[i].key[0] as string, String(objId)];
-        }
-        return null;
-      },
-    );
-    const nonNullEncodedKeys = encodedReadKeys.filter(
-      (k): k is KvKey => k !== null,
-    );
-    const nonNullIndices: number[] = [];
-    for (let i = 0; i < encodedReadKeys.length; i++) {
-      if (encodedReadKeys[i] !== null) nonNullIndices.push(i);
-    }
-    const fetchedEncoded =
-      nonNullEncodedKeys.length > 0
-        ? await this.ds.batchGet<EncodedObject>(nonNullEncodedKeys)
-        : [];
-
-    // Map fetched results back to their indices
-    const oldEncodedByIndex = new Map<number, EncodedObject>();
-    for (let j = 0; j < nonNullIndices.length; j++) {
-      const enc = fetchedEncoded[j];
-      if (enc) {
-        oldEncodedByIndex.set(nonNullIndices[j], enc);
-      }
-    }
-
-    // Phase 3: process all objects
     const writes: KV[] = [];
     const deletes: KvKey[] = [];
 
-    for (let i = 0; i < kvs.length; i++) {
-      const { key, value } = kvs[i];
-      const tag = key[0] as string;
-      const refKey = key[1] as string;
-      const existingObjectId = existingObjectIds[i];
+    if (this._freshMode) {
+      // Fast path during full reindex: no existing objects, skip lookups
+      for (const { key, value } of kvs) {
+        const tag = key[0] as string;
+        const refKey = key[1] as string;
+        const encoded = this.bitmapIndex.encodeObject(
+          value as Record<string, unknown>,
+        );
+        const { tagId, meta } = this.bitmapIndex.getTagMeta(tag);
+        const objectId = this.bitmapIndex.allocateObjectId(tagId);
+        this.bitmapIndex.indexObject(tagId, objectId, encoded, meta);
 
-      // Unindex old object if it exists
-      if (existingObjectId !== null && existingObjectId !== undefined) {
-        const oldEncoded = oldEncodedByIndex.get(i);
-        if (oldEncoded) {
-          const tagId = this.bitmapIndex.getDictionary().tryEncode(tag);
-          if (tagId !== undefined) {
-            const meta = this.bitmapIndex.getTagMetaById(tagId);
-            if (meta) {
-              this.bitmapIndex.unindexObject(
-                tagId,
-                existingObjectId,
-                oldEncoded,
-                meta,
-              );
+        writes.push({
+          key: [indexKey, tag, String(objectId)],
+          value: encoded,
+        });
+        writes.push({
+          key: [reverseKey, page, tag, refKey],
+          value: objectId,
+        });
+      }
+    } else {
+      // Normal path: look up existing objects, unindex old, index new
+
+      // Phase 1: batch-read all reverse keys to find existing objectIds
+      const reverseKeys: KvKey[] = kvs.map(({ key }) => [
+        reverseKey,
+        page,
+        key[0] as string,
+        key[1] as string,
+      ]);
+      const existingObjectIds = await this.ds.batchGet<number>(reverseKeys);
+
+      // Phase 2: batch-read all existing encoded objects
+      const encodedReadKeys: (KvKey | null)[] = existingObjectIds.map(
+        (objId, i) => {
+          if (objId !== null && objId !== undefined) {
+            return [indexKey, kvs[i].key[0] as string, String(objId)];
+          }
+          return null;
+        },
+      );
+      const nonNullEncodedKeys = encodedReadKeys.filter(
+        (k): k is KvKey => k !== null,
+      );
+      const nonNullIndices: number[] = [];
+      for (let i = 0; i < encodedReadKeys.length; i++) {
+        if (encodedReadKeys[i] !== null) nonNullIndices.push(i);
+      }
+      const fetchedEncoded =
+        nonNullEncodedKeys.length > 0
+          ? await this.ds.batchGet<EncodedObject>(nonNullEncodedKeys)
+          : [];
+
+      const oldEncodedByIndex = new Map<number, EncodedObject>();
+      for (let j = 0; j < nonNullIndices.length; j++) {
+        const enc = fetchedEncoded[j];
+        if (enc) {
+          oldEncodedByIndex.set(nonNullIndices[j], enc);
+        }
+      }
+
+      // Phase 3: process all objects
+      for (let i = 0; i < kvs.length; i++) {
+        const { key, value } = kvs[i];
+        const tag = key[0] as string;
+        const refKey = key[1] as string;
+        const existingObjectId = existingObjectIds[i];
+
+        // Unindex old object if it exists
+        if (existingObjectId !== null && existingObjectId !== undefined) {
+          const oldEncoded = oldEncodedByIndex.get(i);
+          if (oldEncoded) {
+            const tagId = this.bitmapIndex.getDictionary().tryEncode(tag);
+            if (tagId !== undefined) {
+              const meta = this.bitmapIndex.getTagMetaById(tagId);
+              if (meta) {
+                this.bitmapIndex.unindexObject(
+                  tagId,
+                  existingObjectId,
+                  oldEncoded,
+                  meta,
+                );
+              }
             }
           }
+          deletes.push([indexKey, tag, String(existingObjectId)]);
         }
-        deletes.push([indexKey, tag, String(existingObjectId)]);
+
+        // Encode and index new object
+        const encoded = this.bitmapIndex.encodeObject(
+          value as Record<string, unknown>,
+        );
+        const { tagId, meta } = this.bitmapIndex.getTagMeta(tag);
+        const objectId =
+          existingObjectId ?? this.bitmapIndex.allocateObjectId(tagId);
+
+        if (existingObjectId !== null && existingObjectId !== undefined) {
+          // allocateObjectId was not called, but unindex decremented count
+          meta.count++;
+        }
+
+        this.bitmapIndex.indexObject(tagId, objectId, encoded, meta);
+
+        writes.push({
+          key: [indexKey, tag, String(objectId)],
+          value: encoded,
+        });
+        writes.push({
+          key: [reverseKey, page, tag, refKey],
+          value: objectId,
+        });
       }
-
-      // Encode and index new object
-      const encoded = this.bitmapIndex.encodeObject(
-        value as Record<string, unknown>,
-      );
-      const { tagId, meta } = this.bitmapIndex.getTagMeta(tag);
-      const objectId =
-        existingObjectId ?? this.bitmapIndex.allocateObjectId(tagId);
-
-      if (existingObjectId !== null && existingObjectId !== undefined) {
-        // allocateObjectId was not called, but unindex decremented count
-        meta.count++;
-      }
-
-      this.bitmapIndex.indexObject(tagId, objectId, encoded, meta);
-
-      writes.push({
-        key: [indexKey, tag, String(objectId)],
-        value: encoded,
-      });
-      writes.push({
-        key: [reverseKey, page, tag, refKey],
-        value: objectId,
-      });
     }
 
     const bitmapFlush = this.bitmapIndex.flushToKVs();
@@ -879,19 +911,34 @@ export class ObjectIndex {
   public async clearFileIndex(file: string): Promise<void> {
     const normalizedPage = this.normalizePageName(file);
 
-    // Prefix scan on [reverseKey, normalizedPage] — only this page's entries
-    const allDeletes: KvKey[] = [];
+    // Phase 1: Collect all reverse entries for this page
+    const reverseEntries: { key: KvKey; tag: string; objectId: number }[] = [];
     for await (const { key, value } of this.ds.query<number>({
       prefix: [reverseKey, normalizedPage],
     })) {
-      const tag = key[2] as string;
-      const objectId = value;
+      reverseEntries.push({
+        key,
+        tag: key[2] as string,
+        objectId: value,
+      });
+    }
 
-      const encoded = await this.ds.get<EncodedObject>([
-        indexKey,
-        tag,
-        String(objectId),
-      ]);
+    if (reverseEntries.length === 0) return;
+
+    // Phase 2: Batch-read all encoded objects at once (eliminates N+1)
+    const encodedKeys: KvKey[] = reverseEntries.map(({ tag, objectId }) => [
+      indexKey,
+      tag,
+      String(objectId),
+    ]);
+    const encodedObjects = await this.ds.batchGet<EncodedObject>(encodedKeys);
+
+    // Phase 3: Unindex all objects from bitmaps
+    const allDeletes: KvKey[] = [];
+    for (let i = 0; i < reverseEntries.length; i++) {
+      const { key, tag, objectId } = reverseEntries[i];
+      const encoded = encodedObjects[i];
+
       if (encoded) {
         const tagId = this.bitmapIndex.getDictionary().tryEncode(tag);
         if (tagId !== undefined) {
@@ -906,37 +953,42 @@ export class ObjectIndex {
       allDeletes.push([indexKey, tag, String(objectId)]);
     }
 
-    if (allDeletes.length > 0) {
-      await this.ds.batchDelete(allDeletes);
-    }
+    await this.ds.batchDelete(allDeletes);
     await this.flushBitmapState();
   }
 
   public async clearIndex(): Promise<void> {
     this.bitmapIndex.clear();
-    const allKeys: KvKey[] = [];
-    for await (const { key } of this.ds.query({ prefix: [indexKey] })) {
-      allKeys.push(key);
+
+    const prefixes: KvKey[] = [
+      [indexKey],
+      [reverseKey],
+      ["b"],
+      ["m"],
+      ["$dict"],
+      ["$indexStats"],
+      ["$tagSketch"],
+    ];
+
+    // Collect keys from all prefixes in parallel
+    const keyArrays = await Promise.all(
+      prefixes.map(async (prefix) => {
+        const keys: KvKey[] = [];
+        for await (const { key } of this.ds.query({ prefix })) {
+          keys.push(key);
+        }
+        return keys;
+      }),
+    );
+
+    const allKeys = keyArrays.flat();
+    if (allKeys.length > 0) {
+      // Delete in chunks to avoid overwhelming the KV backend
+      const CHUNK = 5000;
+      for (let i = 0; i < allKeys.length; i += CHUNK) {
+        await this.ds.batchDelete(allKeys.slice(i, i + CHUNK));
+      }
     }
-    for await (const { key } of this.ds.query({ prefix: [reverseKey] })) {
-      allKeys.push(key);
-    }
-    for await (const { key } of this.ds.query({ prefix: ["b"] })) {
-      allKeys.push(key);
-    }
-    for await (const { key } of this.ds.query({ prefix: ["m"] })) {
-      allKeys.push(key);
-    }
-    for await (const { key } of this.ds.query({ prefix: ["$dict"] })) {
-      allKeys.push(key);
-    }
-    for await (const { key } of this.ds.query({ prefix: ["$indexStats"] })) {
-      allKeys.push(key);
-    }
-    for await (const { key } of this.ds.query({ prefix: ["$tagSketch"] })) {
-      allKeys.push(key);
-    }
-    await this.ds.batchDelete(allKeys);
     console.log("Deleted", allKeys.length, "keys from the index");
   }
 
@@ -977,11 +1029,15 @@ export class ObjectIndex {
 
     console.log("Queing", files.length, "pages to be indexed.");
     const startTime = Date.now();
+
+    // Enable fresh mode: batchSet skips reverse-key lookups
+    this._freshMode = true;
     await this.mq.batchSend(
       "indexQueue",
       files.map((file) => file.name),
     );
     await this.mq.awaitEmptyQueue("indexQueue");
+    this._freshMode = false;
 
     // Recompute NDV for all tags after full reindex to correct any drift
     this.bitmapIndex.recomputeAllNDV();
@@ -1110,7 +1166,6 @@ export class ObjectIndex {
       return [];
     }
 
-    // Batch-read all encoded objects in one call
     const keys: KvKey[] = objectIds.map((id) => [
       indexKey,
       tagName,
