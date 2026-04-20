@@ -944,20 +944,34 @@ function annotateExplainWrappersFromStageStats(
   }
 }
 
-async function buildExplainQueryShape(
+/**
+ * Build a LuaCollectionQuery from query clauses.  Shared by EXPLAIN,
+ * EXPLAIN ANALYZE, and normal execution paths to ensure plan fidelity.
+ *
+ * When `overrides.where` is provided it replaces the WHERE clause expression
+ * (used by the cross-join path to substitute the residual WHERE after
+ * join-predicate stripping).
+ */
+async function buildQueryFromClauses(
   q: ReturnType<typeof asQueryExpr>,
   env: LuaEnv,
   sf: LuaStackFrame,
-): Promise<Parameters<typeof wrapPlanWithQueryOps>[1]> {
-  const explainQuery: Parameters<typeof wrapPlanWithQueryOps>[1] = {};
+  overrides?: { where?: LuaExpression },
+): Promise<LuaCollectionQuery> {
+  const query: LuaCollectionQuery = {
+    distinct: true, // default; overridden by Select clause if present
+  };
 
   for (const clause of q.clauses) {
     switch (clause.type) {
       case "Where":
-        explainQuery.where = clause.expression;
+        query.where =
+          overrides && "where" in overrides
+            ? overrides.where
+            : clause.expression;
         break;
       case "OrderBy":
-        explainQuery.orderBy = clause.orderBy.map((o) => ({
+        query.orderBy = clause.orderBy.map((o) => ({
           expr: o.expression,
           desc: o.direction === "desc",
           nulls: o.nulls,
@@ -966,52 +980,32 @@ async function buildExplainQueryShape(
         break;
       case "Limit": {
         const lv = await evalExpression(clause.limit, env, sf);
-        explainQuery.limit = Number(lv);
+        query.limit = Number(lv);
         if (clause.offset) {
           const ov = await evalExpression(clause.offset, env, sf);
-          explainQuery.offset = Number(ov);
+          query.offset = Number(ov);
         }
         break;
       }
       case "Offset": {
         const ov = await evalExpression(clause.offset, env, sf);
-        explainQuery.offset = Number(ov);
+        query.offset = Number(ov);
         break;
       }
       case "GroupBy":
-        explainQuery.groupBy = clause.fields.map((f) => {
-          if (f.type === "PropField") {
-            return { expr: f.value, alias: f.key };
-          }
-          return { expr: f.value };
-        });
+        query.groupBy = fieldsToGroupByEntries(clause.fields);
         break;
       case "Having":
-        explainQuery.having = clause.expression;
+        query.having = clause.expression;
         break;
       case "Select":
-        explainQuery.select = fieldsToExpression(clause.fields, clause.ctx);
-        explainQuery.distinct = clause.distinct !== false;
+        query.select = fieldsToExpression(clause.fields, clause.ctx);
+        query.distinct = clause.distinct !== false;
         break;
     }
   }
 
-  return explainQuery;
-}
-
-async function buildExplainQueryShapeWithOverrides(
-  q: ReturnType<typeof asQueryExpr>,
-  env: LuaEnv,
-  sf: LuaStackFrame,
-  overrides: {
-    where?: LuaExpression;
-  } = {},
-): Promise<Parameters<typeof wrapPlanWithQueryOps>[1]> {
-  const explainQuery = await buildExplainQueryShape(q, env, sf);
-  if ("where" in overrides) {
-    explainQuery.where = overrides.where;
-  }
-  return explainQuery;
+  return query;
 }
 
 function unknownDefaultStats(): CollectionStats {
@@ -1055,6 +1049,7 @@ async function getStatsForValue(
     }
   }
 
+  // Queryable objects without getStats: use default estimate, don't materialize
   if (
     val &&
     typeof val === "object" &&
@@ -1064,26 +1059,16 @@ async function getStatsForValue(
     return unknownDefaultStats();
   }
 
+  if (val === null || val === undefined) {
+    return computeStatsFromArray([]);
+  }
+
   if (Array.isArray(val)) {
     return computeStatsFromArray(val);
   }
 
   if (val instanceof LuaTable) {
-    if (val.length > 0) {
-      const arr: any[] = [];
-      for (let i = 1; i <= val.length; i++) {
-        arr.push(val.rawGet(i));
-      }
-      return computeStatsFromArray(arr);
-    }
-    if (val.empty()) {
-      return computeStatsFromArray([]);
-    }
-    return computeStatsFromArray([val]);
-  }
-
-  if (val === null || val === undefined) {
-    return computeStatsFromArray([]);
+    return computeStatsFromArray(luaTableToArray(val));
   }
 
   return computeStatsFromArray([val]);
@@ -1233,42 +1218,37 @@ async function executeSingleSourceExplainAnalyze(
   return finalRows;
 }
 
+/**
+ * Convert a LuaTable to a flat JS array.  Array-like tables (length > 0)
+ * are unpacked; empty tables yield []; record-like tables are singletons.
+ */
+export function luaTableToArray(t: LuaTable): any[] {
+  if (t.empty()) return [];
+  if (t.length > 0) {
+    const arr: any[] = [];
+    for (let i = 1; i <= t.length; i++) {
+      arr.push(t.rawGet(i));
+    }
+    return arr;
+  }
+  return [t];
+}
+
 async function materializeValueAsItems(
   val: LuaValue,
   env: LuaEnv,
   sf: LuaStackFrame,
 ): Promise<any[]> {
-  if (val === null || val === undefined) {
-    return [];
-  }
-
-  if (Array.isArray(val)) {
-    return val;
-  }
-
-  if (val instanceof LuaTable) {
-    if (val.length > 0) {
-      const arr: any[] = [];
-      for (let i = 1; i <= val.length; i++) {
-        arr.push(val.rawGet(i));
-      }
-      return arr;
-    }
-    if (val.empty()) {
-      return [];
-    }
-    return [val];
-  }
-
+  if (val === null || val === undefined) return [];
+  if (Array.isArray(val)) return val;
+  if (val instanceof LuaTable) return luaTableToArray(val);
   if (
-    val &&
     typeof val === "object" &&
     "query" in val &&
     typeof (val as any).query === "function"
   ) {
     return (val as any).query({}, env, sf);
   }
-
   return [val];
 }
 
@@ -1587,18 +1567,7 @@ export function evalExpression(
               } else if (Array.isArray(val)) {
                 src.stats = computeStatsFromArray(val);
               } else if (val instanceof LuaTable) {
-                const len = val.length;
-                if (len > 0) {
-                  const arr: any[] = [];
-                  for (let i = 1; i <= len; i++) {
-                    arr.push(val.rawGet(i));
-                  }
-                  src.stats = computeStatsFromArray(arr);
-                } else if (!val.empty()) {
-                  src.stats = computeStatsFromArray([val]);
-                } else {
-                  src.stats = computeStatsFromArray([]);
-                }
+                src.stats = computeStatsFromArray(luaTableToArray(val));
               }
             }
 
@@ -1772,14 +1741,9 @@ export function evalExpression(
             // Build explain plan shape from the same logical plan used for execution.
             let explainPlan: ExplainNode | undefined;
             if (explainOpts) {
-              const explainQuery = await buildExplainQueryShapeWithOverrides(
-                q,
-                env,
-                sf,
-                {
-                  where: residualWhere,
-                },
-              );
+              const explainQuery = await buildQueryFromClauses(q, env, sf, {
+                where: residualWhere,
+              });
               const explainSourceStats = new Map<string, CollectionStats>(
                 fromSource.sources
                   .filter(
@@ -1830,76 +1794,11 @@ export function evalExpression(
               );
 
               const joinedCollection = toCollection(joinRows);
-              const selectClause = q.clauses.find((c) => c.type === "Select");
-              const selectDistinct = selectClause?.distinct;
 
-              const analyzeQuery: LuaCollectionQuery = {
-                objectVariable: undefined,
-                distinct: selectDistinct !== false,
-              };
-
-              for (const clause of q.clauses) {
-                switch (clause.type) {
-                  case "Where": {
-                    if (residualWhere) {
-                      analyzeQuery.where = residualWhere;
-                    }
-                    break;
-                  }
-                  case "OrderBy": {
-                    analyzeQuery.orderBy = clause.orderBy.map((o) => ({
-                      expr: o.expression,
-                      desc: o.direction === "desc",
-                      nulls: o.nulls,
-                      using: o.using,
-                    }));
-                    break;
-                  }
-                  case "Select": {
-                    analyzeQuery.select = fieldsToExpression(
-                      clause.fields,
-                      clause.ctx,
-                    );
-                    break;
-                  }
-                  case "Limit": {
-                    const limitVal = await evalExpression(
-                      clause.limit,
-                      env,
-                      sf,
-                    );
-                    analyzeQuery.limit = Number(limitVal);
-                    if (clause.offset) {
-                      const offsetVal = await evalExpression(
-                        clause.offset,
-                        env,
-                        sf,
-                      );
-                      analyzeQuery.offset = Number(offsetVal);
-                    }
-                    break;
-                  }
-                  case "Offset": {
-                    const offsetVal = await evalExpression(
-                      clause.offset,
-                      env,
-                      sf,
-                    );
-                    analyzeQuery.offset = Number(offsetVal);
-                    break;
-                  }
-                  case "GroupBy": {
-                    analyzeQuery.groupBy = fieldsToGroupByEntries(
-                      clause.fields,
-                    );
-                    break;
-                  }
-                  case "Having": {
-                    analyzeQuery.having = clause.expression;
-                    break;
-                  }
-                }
-              }
+              const analyzeQuery = await buildQueryFromClauses(q, env, sf, {
+                where: residualWhere,
+              });
+              analyzeQuery.objectVariable = undefined;
 
               const stageStats: QueryStageStat[] = [];
               const instrumentation: QueryInstrumentation = {
@@ -1945,71 +1844,13 @@ export function evalExpression(
 
             const joinedCollection = toCollection(result);
 
-            // Build up query object
-            const selectClause = q.clauses.find((c) => c.type === "Select");
-            const selectDistinct = selectClause?.distinct;
-
-            const query: LuaCollectionQuery = {
-              objectVariable: undefined,
-              distinct: selectDistinct !== false, // default true
-            };
-
             // Map clauses to query parameters. The join predicates already embedded
             // into the join tree must not be re-applied here, but any residual WHERE
             // must still be evaluated on the joined rows before grouping/aggregation.
-            for (const clause of q.clauses) {
-              switch (clause.type) {
-                case "Where": {
-                  if (residualWhere) {
-                    query.where = residualWhere;
-                  }
-                  break;
-                }
-                case "OrderBy": {
-                  query.orderBy = clause.orderBy.map((o) => ({
-                    expr: o.expression,
-                    desc: o.direction === "desc",
-                    nulls: o.nulls,
-                    using: o.using,
-                  }));
-                  break;
-                }
-                case "Select": {
-                  query.select = fieldsToExpression(clause.fields, clause.ctx);
-                  break;
-                }
-                case "Limit": {
-                  const limitVal = await evalExpression(clause.limit, env, sf);
-                  query.limit = Number(limitVal);
-                  if (clause.offset) {
-                    const offsetVal = await evalExpression(
-                      clause.offset,
-                      env,
-                      sf,
-                    );
-                    query.offset = Number(offsetVal);
-                  }
-                  break;
-                }
-                case "Offset": {
-                  const offsetVal = await evalExpression(
-                    clause.offset,
-                    env,
-                    sf,
-                  );
-                  query.offset = Number(offsetVal);
-                  break;
-                }
-                case "GroupBy": {
-                  query.groupBy = fieldsToGroupByEntries(clause.fields);
-                  break;
-                }
-                case "Having": {
-                  query.having = clause.expression;
-                  break;
-                }
-              }
-            }
+            const query = await buildQueryFromClauses(q, env, sf, {
+              where: residualWhere,
+            });
+            query.objectVariable = undefined;
 
             return joinedCollection
               .query(query, env, sf, globalThis.client?.config)
@@ -2063,73 +1904,15 @@ export function evalExpression(
             }
 
             // Build up query object
-            const selectClause = q.clauses.find((c) => c.type === "Select");
-            const selectDistinct = selectClause?.distinct;
-
-            const query: LuaCollectionQuery = {
-              objectVariable,
-              distinct: selectDistinct !== false, // default true
-            };
-
-            // Map clauses to query parameters
-            for (const clause of q.clauses) {
-              switch (clause.type) {
-                case "Where": {
-                  query.where = clause.expression;
-                  break;
-                }
-                case "OrderBy": {
-                  query.orderBy = clause.orderBy.map((o) => ({
-                    expr: o.expression,
-                    desc: o.direction === "desc",
-                    nulls: o.nulls,
-                    using: o.using,
-                  }));
-                  break;
-                }
-                case "Select": {
-                  query.select = fieldsToExpression(clause.fields, clause.ctx);
-                  break;
-                }
-                case "Limit": {
-                  const limitVal = await evalExpression(clause.limit, env, sf);
-                  query.limit = Number(limitVal);
-                  if (clause.offset) {
-                    const offsetVal = await evalExpression(
-                      clause.offset,
-                      env,
-                      sf,
-                    );
-                    query.offset = Number(offsetVal);
-                  }
-                  break;
-                }
-                case "Offset": {
-                  const offsetVal = await evalExpression(
-                    clause.offset,
-                    env,
-                    sf,
-                  );
-                  query.offset = Number(offsetVal);
-                  break;
-                }
-                case "GroupBy": {
-                  query.groupBy = fieldsToGroupByEntries(clause.fields);
-                  break;
-                }
-                case "Having": {
-                  query.having = clause.expression;
-                  break;
-                }
-              }
-            }
+            const query = await buildQueryFromClauses(q, env, sf);
+            query.objectVariable = objectVariable;
 
             const stats = await getStatsForValue(collection, env, sf);
             const sourceName = objectVariable ?? "_";
 
             let explainPlan: ExplainNode | undefined;
             if (explainOpts) {
-              const explainQuery = await buildExplainQueryShape(q, env, sf);
+              const explainQuery = await buildQueryFromClauses(q, env, sf);
               const explainSourceStats = new Map<string, CollectionStats>([
                 [sourceName, stats],
               ]);

@@ -10,7 +10,7 @@ import type {
   LuaJoinHint,
   LuaWithHints,
 } from "./ast.ts";
-import { evalExpression } from "./eval.ts";
+import { evalExpression, luaTableToArray } from "./eval.ts";
 import type { CollectionStats, StatsSource } from "./query_collection.ts";
 import {
   LuaEnv,
@@ -1333,15 +1333,7 @@ async function materializeSource(
     );
   }
   if (Array.isArray(val)) return val;
-  if (val instanceof LuaTable) {
-    if (val.length > 0) {
-      const arr: any[] = [];
-      for (let i = 1; i <= val.length; i++) arr.push(val.rawGet(i));
-      return arr;
-    }
-    if (val.empty()) return [];
-    return [val];
-  }
+  if (val instanceof LuaTable) return luaTableToArray(val);
   if (
     typeof val === "object" &&
     val !== null &&
