@@ -192,9 +192,8 @@ export class StatsTracker {
       ndv,
       avgColumnCount,
       mcv,
-      statsSource: this.rowCount === 0
-        ? "computed-empty"
-        : "computed-sketch-large",
+      statsSource:
+        this.rowCount === 0 ? "computed-empty" : "computed-sketch-large",
     };
   }
 
@@ -462,8 +461,7 @@ export function computeStatsFromArray(
   const sketches = new Map<string, HalfXorSketch>();
   for (const item of items) {
     if (typeof item === "object" && item !== null) {
-      const keys =
-        item instanceof LuaTable ? luaKeys(item) : Object.keys(item);
+      const keys = item instanceof LuaTable ? luaKeys(item) : Object.keys(item);
       totalColumnCount += keys.length;
       for (const key of keys) {
         if (typeof key !== "string") continue;
@@ -1404,6 +1402,229 @@ export async function applyQuery(
   return results;
 }
 
+/**
+ * A simple scalar filter that can be applied inline during a KV scan
+ * without building a full Lua environment per row.
+ */
+export type KvInlineFilter = {
+  column: string;
+  op: "==" | "~=" | "!=" | "<" | "<=" | ">" | ">=";
+  value: string | number | boolean | null;
+};
+
+/**
+ * Extract simple column-vs-literal comparisons from a WHERE expression
+ * that can be evaluated directly on raw KV values without Lua eval.
+ *
+ * Returns the pushable filters and a residual WHERE expression for
+ * anything that couldn't be pushed.
+ */
+export function extractKvInlineFilters(
+  where: LuaExpression | undefined,
+  objectVariable: string | undefined,
+): { filters: KvInlineFilter[]; residual: LuaExpression | undefined } {
+  if (!where) return { filters: [], residual: undefined };
+
+  const conjuncts = flattenAndConjuncts(where);
+  const pushed: KvInlineFilter[] = [];
+  const remaining: LuaExpression[] = [];
+
+  for (const conjunct of conjuncts) {
+    const filter = tryExtractInlineFilter(conjunct, objectVariable);
+    if (filter) {
+      pushed.push(filter);
+    } else {
+      remaining.push(conjunct);
+    }
+  }
+
+  const residual =
+    remaining.length > 0
+      ? remaining.reduce((acc, e) => ({
+          type: "Binary" as const,
+          operator: "and" as const,
+          left: acc,
+          right: e,
+          ctx: where.ctx,
+        }))
+      : undefined;
+
+  return { filters: pushed, residual };
+}
+
+/** Flatten top-level AND conjuncts from a WHERE expression. */
+function flattenAndConjuncts(expr: LuaExpression): LuaExpression[] {
+  if (expr.type === "Binary" && expr.operator === "and") {
+    return [
+      ...flattenAndConjuncts((expr as LuaBinaryExpression).left),
+      ...flattenAndConjuncts((expr as LuaBinaryExpression).right),
+    ];
+  }
+  return [expr];
+}
+
+/**
+ * Try to convert a single conjunct into a KvInlineFilter.
+ * Returns null if the conjunct is too complex for inline evaluation.
+ */
+function tryExtractInlineFilter(
+  expr: LuaExpression,
+  objectVariable: string | undefined,
+): KvInlineFilter | null {
+  if (expr.type !== "Binary") return null;
+  const bin = expr as LuaBinaryExpression;
+  const op = bin.operator;
+
+  // Only comparison operators
+  if (
+    op !== "==" &&
+    op !== "~=" &&
+    op !== "!=" &&
+    op !== "<" &&
+    op !== "<=" &&
+    op !== ">" &&
+    op !== ">="
+  ) {
+    return null;
+  }
+
+  // Try column op literal (left = column, right = literal)
+  const leftCol = tryExtractColumn(bin.left, objectVariable);
+  const rightLit = tryExtractLiteral(bin.right);
+  if (leftCol !== null && rightLit !== undefined) {
+    return { column: leftCol, op: op as KvInlineFilter["op"], value: rightLit };
+  }
+
+  // Try literal op column (left = literal, right = column) — flip operator
+  const rightCol = tryExtractColumn(bin.right, objectVariable);
+  const leftLit = tryExtractLiteral(bin.left);
+  if (rightCol !== null && leftLit !== undefined) {
+    const flipped = flipComparisonOp(op);
+    if (flipped) {
+      return { column: rightCol, op: flipped, value: leftLit };
+    }
+  }
+
+  return null;
+}
+
+/** Extract a column name from a simple variable or property access. */
+function tryExtractColumn(
+  expr: LuaExpression,
+  objectVariable: string | undefined,
+): string | null {
+  // Without object variable: bare variable name is the column
+  if (!objectVariable && expr.type === "Variable") {
+    return expr.name;
+  }
+  // With object variable: `obj.column` pattern
+  if (
+    objectVariable &&
+    expr.type === "PropertyAccess" &&
+    expr.object.type === "Variable" &&
+    expr.object.name === objectVariable
+  ) {
+    return expr.property;
+  }
+  return null;
+}
+
+/** Extract a constant literal value from an expression. */
+function tryExtractLiteral(
+  expr: LuaExpression,
+): string | number | boolean | null | undefined {
+  switch (expr.type) {
+    case "String":
+      return expr.value;
+    case "Number":
+      return expr.value;
+    case "Boolean":
+      return expr.value;
+    case "Nil":
+      return null;
+    default:
+      return undefined; // signal: not a literal
+  }
+}
+
+/** Flip a comparison operator for when operands are swapped. */
+function flipComparisonOp(op: string): KvInlineFilter["op"] | null {
+  switch (op) {
+    case "==":
+      return "==";
+    case "~=":
+      return "~=";
+    case "!=":
+      return "!=";
+    case "<":
+      return ">";
+    case "<=":
+      return ">=";
+    case ">":
+      return "<";
+    case ">=":
+      return "<=";
+    default:
+      return null;
+  }
+}
+
+/**
+ * Evaluate a KvInlineFilter against a raw item (JS object or LuaTable).
+ * Returns true if the item passes the filter.
+ */
+function matchesKvInlineFilter(item: any, filter: KvInlineFilter): boolean {
+  let fieldVal: any;
+  if (item instanceof LuaTable) {
+    fieldVal = item.rawGet(filter.column);
+  } else if (typeof item === "object" && item !== null) {
+    fieldVal = item[filter.column];
+  } else {
+    return false;
+  }
+
+  // Normalize undefined to null for comparison
+  if (fieldVal === undefined) fieldVal = null;
+
+  const lit = filter.value;
+
+  switch (filter.op) {
+    case "==":
+      return fieldVal === lit;
+    case "~=":
+    case "!=":
+      return fieldVal !== lit;
+    case "<":
+      if (fieldVal === null || lit === null) return false;
+      return fieldVal < lit;
+    case "<=":
+      if (fieldVal === null || lit === null) return false;
+      return fieldVal <= lit;
+    case ">":
+      if (fieldVal === null || lit === null) return false;
+      return fieldVal > lit;
+    case ">=":
+      if (fieldVal === null || lit === null) return false;
+      return fieldVal >= lit;
+    default:
+      return true;
+  }
+}
+
+/**
+ * Apply an array of KvInlineFilters to a single item.
+ * Returns true only if ALL filters pass (conjunction).
+ */
+function matchesAllKvInlineFilters(
+  item: any,
+  filters: KvInlineFilter[],
+): boolean {
+  for (let i = 0; i < filters.length; i++) {
+    if (!matchesKvInlineFilter(item, filters[i])) return false;
+  }
+  return true;
+}
+
 export async function queryLua<T = any>(
   kv: KvPrimitives,
   prefix: KvKey,
@@ -1414,14 +1635,32 @@ export async function queryLua<T = any>(
   config?: Config,
   instrumentation?: QueryInstrumentation,
 ): Promise<T[]> {
+  // P2: Extract simple column comparisons that can be evaluated inline
+  // during the KV scan, avoiding object allocation and Lua eval overhead
+  // for rows that will be filtered out anyway.
+  const { filters: inlineFilters, residual: residualWhere } =
+    extractKvInlineFilters(query.where, query.objectVariable);
+
   const results: T[] = [];
   for await (let { key, value } of kv.query({ prefix })) {
     if (enricher) {
       value = enricher(key, value);
     }
+    // Apply inline filters before pushing into results array
+    if (
+      inlineFilters.length > 0 &&
+      !matchesAllKvInlineFilters(value, inlineFilters)
+    ) {
+      continue;
+    }
     results.push(value);
   }
-  return applyQuery(results, query, env, sf, config, instrumentation);
+
+  // Pass residual WHERE (complex predicates) to applyQuery
+  const residualQuery: LuaCollectionQuery =
+    inlineFilters.length > 0 ? { ...query, where: residualWhere } : query;
+
+  return applyQuery(results, residualQuery, env, sf, config, instrumentation);
 }
 
 function generateKey(value: any) {
@@ -1491,6 +1730,7 @@ export class DataStoreQueryCollection implements LuaQueryCollection {
   }
 
   /** O(n) count via KV scan — avoids materializing all rows for planning */
+  /** O(n) count via KV scan — avoids materializing all rows for planning */
   async getStats(): Promise<CollectionStats> {
     const rowCount = await this.dataStore.kv.countQuery({
       prefix: this.prefix,
@@ -1500,7 +1740,7 @@ export class DataStoreQueryCollection implements LuaQueryCollection {
       ndv: new Map(),
       statsSource: rowCount === 0 ? "computed-empty" : "unknown-default",
       executionCapabilities: {
-        predicatePushdown: "none",
+        predicatePushdown: "basic",
         scanKind: "kv-scan",
       },
     };
