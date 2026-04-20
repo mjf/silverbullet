@@ -31,6 +31,7 @@ import {
   type BitmapIndexConfig,
   type EncodedObject,
 } from "./bitmap/bitmap_index.ts";
+import { RoaringBitmap } from "./bitmap/roaring_bitmap.ts";
 import { MCVList } from "../space_lua/mcv.ts";
 
 // KV key prefixes
@@ -67,6 +68,26 @@ type BitmapPredicate =
     }
   | {
       kind: "neq";
+      column: string;
+      value: string | number | boolean;
+    }
+  | {
+      kind: "gt";
+      column: string;
+      value: string | number | boolean;
+    }
+  | {
+      kind: "gte";
+      column: string;
+      value: string | number | boolean;
+    }
+  | {
+      kind: "lt";
+      column: string;
+      value: string | number | boolean;
+    }
+  | {
+      kind: "lte";
       column: string;
       value: string | number | boolean;
     };
@@ -128,36 +149,104 @@ function propertyNameForSourceExpr(
   return undefined;
 }
 
-function extractBitmapPredicate(
+function extractBitmapPredicates(
   expr: any,
   sourceName: string | undefined,
-): BitmapPredicate | undefined {
-  if (!expr || expr.type !== "Binary") return undefined;
+): BitmapPredicate[] {
+  if (!expr) return [];
+
+  // Flatten AND conjunctions
+  if (expr.type === "Binary" && expr.operator === "and") {
+    return [
+      ...extractBitmapPredicates(expr.left, sourceName),
+      ...extractBitmapPredicates(expr.right, sourceName),
+    ];
+  }
+
+  if (expr.type !== "Binary") return [];
 
   const leftCol = propertyNameForSourceExpr(expr.left, sourceName);
   const rightCol = propertyNameForSourceExpr(expr.right, sourceName);
   const leftLit = literalValueFromExpr(expr.left);
   const rightLit = literalValueFromExpr(expr.right);
 
-  if (expr.operator === "==") {
+  const op = expr.operator;
+
+  if (op === "==") {
     if (leftCol && rightLit !== undefined) {
-      return { kind: "eq", column: leftCol, value: rightLit };
+      return [{ kind: "eq", column: leftCol, value: rightLit }];
     }
     if (rightCol && leftLit !== undefined) {
-      return { kind: "eq", column: rightCol, value: leftLit };
+      return [{ kind: "eq", column: rightCol, value: leftLit }];
     }
   }
 
-  if (expr.operator === "~=" || expr.operator === "!=") {
+  if (op === "~=" || op === "!=") {
     if (leftCol && rightLit !== undefined) {
-      return { kind: "neq", column: leftCol, value: rightLit };
+      return [{ kind: "neq", column: leftCol, value: rightLit }];
     }
     if (rightCol && leftLit !== undefined) {
-      return { kind: "neq", column: rightCol, value: leftLit };
+      return [{ kind: "neq", column: rightCol, value: leftLit }];
     }
   }
 
-  return undefined;
+  if (op === ">") {
+    if (leftCol && rightLit !== undefined) {
+      return [{ kind: "gt", column: leftCol, value: rightLit }];
+    }
+    if (rightCol && leftLit !== undefined) {
+      return [{ kind: "lt", column: rightCol, value: leftLit }];
+    }
+  }
+
+  if (op === ">=") {
+    if (leftCol && rightLit !== undefined) {
+      return [{ kind: "gte", column: leftCol, value: rightLit }];
+    }
+    if (rightCol && leftLit !== undefined) {
+      return [{ kind: "lte", column: rightCol, value: leftLit }];
+    }
+  }
+
+  if (op === "<") {
+    if (leftCol && rightLit !== undefined) {
+      return [{ kind: "lt", column: leftCol, value: rightLit }];
+    }
+    if (rightCol && leftLit !== undefined) {
+      return [{ kind: "gt", column: rightCol, value: leftLit }];
+    }
+  }
+
+  if (op === "<=") {
+    if (leftCol && rightLit !== undefined) {
+      return [{ kind: "lte", column: leftCol, value: rightLit }];
+    }
+    if (rightCol && leftLit !== undefined) {
+      return [{ kind: "gte", column: rightCol, value: leftLit }];
+    }
+  }
+
+  return [];
+}
+
+function compareValues(
+  indexed: string | number | boolean,
+  threshold: string | number | boolean,
+  kind: "gt" | "gte" | "lt" | "lte",
+): boolean {
+  // Type mismatch: no match
+  if (typeof indexed !== typeof threshold) return false;
+
+  switch (kind) {
+    case "gt":
+      return indexed > threshold;
+    case "gte":
+      return indexed >= threshold;
+    case "lt":
+      return indexed < threshold;
+    case "lte":
+      return indexed <= threshold;
+  }
 }
 
 export class ObjectValidationError extends Error {
@@ -342,15 +431,15 @@ export class ObjectIndex {
         config?: Config,
         instrumentation?: QueryInstrumentation,
       ): Promise<ObjectValue<any>[]> {
-        const bitmapPredicate = extractBitmapPredicate(
+        const bitmapPredicates = extractBitmapPredicates(
           query.where,
           query.objectVariable,
         );
 
-        if (bitmapPredicate) {
-          const objectIds = await self.bitmapMatchObjectIds(
+        if (bitmapPredicates.length > 0) {
+          const objectIds = await self.bitmapMatchMultiplePredicates(
             tagName,
-            bitmapPredicate,
+            bitmapPredicates,
           );
           if (objectIds) {
             const prefetched = await self.loadObjectsByObjectIds(
@@ -433,7 +522,7 @@ export class ObjectIndex {
             ? "persisted-complete"
             : "persisted-partial",
           executionCapabilities: {
-            predicatePushdown: indexTrusted ? "bitmap-basic" : "none",
+            predicatePushdown: indexTrusted ? "bitmap-extended" : "none",
             scanKind: "index-scan",
           },
         };
@@ -477,7 +566,7 @@ export class ObjectIndex {
       const statsSource = indexComplete
         ? "persisted-complete"
         : "persisted-partial";
-      const predicatePushdown = indexTrusted ? "bitmap-basic" : "none";
+      const predicatePushdown = indexTrusted ? "bitmap-extended" : "none";
       const scanKind = "index-scan";
 
       rows.push({
@@ -1185,61 +1274,119 @@ export class ObjectIndex {
     return results;
   }
 
-  private async bitmapMatchObjectIds(
+  private async bitmapMatchMultiplePredicates(
+    tagName: string,
+    predicates: BitmapPredicate[],
+  ): Promise<number[] | undefined> {
+    if (predicates.length === 0) return undefined;
+
+    // Check all columns are trusted for pushdown
+    for (const pred of predicates) {
+      if (!(await this.isBitmapPushdownTrusted(tagName, pred.column))) {
+        return undefined;
+      }
+    }
+
+    // Resolve each predicate to a RoaringBitmap, then AND them together
+    let result: RoaringBitmap | undefined;
+
+    for (const pred of predicates) {
+      const bm = this.bitmapMatchSinglePredicate(tagName, pred);
+      if (bm === undefined) {
+        return undefined;
+      }
+
+      if (result === undefined) {
+        result = bm;
+      } else {
+        result = RoaringBitmap.and(result, bm);
+      }
+
+      if (result.isEmpty()) {
+        return [];
+      }
+    }
+
+    return result ? result.toArray().sort((a, b) => a - b) : [];
+  }
+
+  private bitmapMatchSinglePredicate(
     tagName: string,
     predicate: BitmapPredicate,
-  ): Promise<number[] | undefined> {
+  ): RoaringBitmap | undefined {
     const dict = this.bitmapIndex.getDictionary();
     const tagId = dict.tryEncode(tagName);
     if (tagId === undefined) {
-      return [];
+      return new RoaringBitmap();
     }
-
-    if (!(await this.isBitmapPushdownTrusted(tagName, predicate.column))) {
-      return undefined;
-    }
-
-    const valueId = dict.tryEncode(predicate.value);
 
     if (predicate.kind === "eq") {
+      const valueId = dict.tryEncode(predicate.value);
+      if (valueId === undefined) {
+        return new RoaringBitmap();
+      }
+      const bm = this.bitmapIndex.getBitmap(tagId, predicate.column, valueId);
+      return bm ?? new RoaringBitmap();
+    }
+
+    if (predicate.kind === "neq") {
+      const valueId = dict.tryEncode(predicate.value);
       if (valueId === undefined) {
         return undefined;
       }
-
-      const bm = this.bitmapIndex.getBitmap(tagId, predicate.column, valueId);
-      if (!bm) {
+      const allBitmaps = this.bitmapIndex.getColumnBitmaps(
+        tagId,
+        predicate.column,
+      );
+      if (allBitmaps.length === 0) {
         return undefined;
       }
-
-      return [...bm.toArray()].sort((a, b) => a - b);
+      // OR all bitmaps for the column
+      let union = allBitmaps[0];
+      for (let i = 1; i < allBitmaps.length; i++) {
+        union = RoaringBitmap.or(union, allBitmaps[i]);
+      }
+      // Remove the excluded value
+      const excluded = this.bitmapIndex.getBitmap(
+        tagId,
+        predicate.column,
+        valueId,
+      );
+      if (excluded) {
+        union = RoaringBitmap.andNot(union, excluded);
+      }
+      return union;
     }
 
-    if (valueId === undefined) {
-      return undefined;
-    }
-
-    const bitmaps = this.bitmapIndex.getColumnBitmaps(tagId, predicate.column);
-    if (bitmaps.length === 0) {
-      return undefined;
-    }
-
-    const excluded = this.bitmapIndex.getBitmap(
+    // Range predicates: gt, gte, lt, lte
+    const allValueIds = this.bitmapIndex.getColumnValueIds(
       tagId,
       predicate.column,
-      valueId,
     );
-    const ids = new Set<number>();
-    for (const bm of bitmaps) {
-      for (const id of bm.toArray()) {
-        ids.add(id);
+    if (!allValueIds || allValueIds.length === 0) {
+      return undefined;
+    }
+
+    // Filter value IDs by range condition, OR their bitmaps
+    let union: RoaringBitmap | undefined;
+    for (const vid of allValueIds) {
+      const decoded = dict.decodeValue(vid);
+      if (decoded === null || decoded === undefined) continue;
+      if (
+        typeof decoded === "string" ||
+        typeof decoded === "number" ||
+        typeof decoded === "boolean"
+      ) {
+        if (compareValues(decoded, predicate.value, predicate.kind)) {
+          const bm = this.bitmapIndex.getBitmap(tagId, predicate.column, vid);
+          if (bm) {
+            union = union ? RoaringBitmap.or(union, bm) : bm;
+          }
+        }
       }
     }
-    if (excluded) {
-      for (const id of excluded.toArray()) {
-        ids.delete(id);
-      }
-    }
-    return [...ids].sort((a, b) => a - b);
+
+    return union ?? new RoaringBitmap();
   }
 
   private async processObjectsToKVs<T>(

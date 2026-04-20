@@ -64,8 +64,16 @@ export type StatsSource =
   | "unknown-default";
 
 export type CollectionExecutionCapabilities = {
-  predicatePushdown?: "none" | "basic" | "bitmap-basic";
-  scanKind?: "materialized" | "kv-scan" | "index-scan";
+  predicatePushdown?:
+    "none" |
+    "basic" |
+    "bitmap-basic" |
+    "bitmap-extended";
+  scanKind?:
+    "index-scan" |
+    "kv-scan" |
+    "delegated-bitmap" |
+    "materialized";
 };
 
 // Collection statistics for the cost-based planner

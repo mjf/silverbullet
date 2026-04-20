@@ -106,7 +106,6 @@ import {
   luaFormatNumber,
   luaGet,
   luaIndexValue,
-  luaKeys,
   luaMarkToBeClosed,
   luaSet,
   luaTruthy,
@@ -1240,30 +1239,6 @@ export function luaTableToArray(t: LuaTable): any[] {
   return [t];
 }
 
-/**
- * Flatten cross-join rows: merge all source sub-tables into a single flat row.
- * Later sources win on key conflicts (like SQL SELECT * column ordering).
- */
-function flattenJoinedRows(rows: any[], sourceNames: string[]): any[] {
-  return rows.map((row) => {
-    if (!(row instanceof LuaTable)) return row;
-    const flat = new LuaTable();
-    for (const srcName of sourceNames) {
-      const srcObj = row.rawGet(srcName);
-      if (srcObj instanceof LuaTable) {
-        for (const key of luaKeys(srcObj)) {
-          void flat.rawSet(key, srcObj.rawGet(key));
-        }
-      } else if (typeof srcObj === "object" && srcObj !== null) {
-        for (const key of Object.keys(srcObj)) {
-          void flat.rawSet(key, (srcObj as any)[key]);
-        }
-      }
-    }
-    return flat;
-  });
-}
-
 async function materializeValueAsItems(
   val: LuaValue,
   env: LuaEnv,
@@ -1650,6 +1625,8 @@ export function evalExpression(
 
             // Materialize and filter single-source pushdown inputs before join
             // planning so both stats and execution use the filtered sources.
+            // Try delegation first: if the source supports native filtering
+            // (e.g. bitmap index), let it handle the predicate directly.
             for (const src of fromSource.sources) {
               const srcFilters = pushedFilters.filter(
                 (f) => f.sourceName === src.name,
@@ -1659,14 +1636,54 @@ export function evalExpression(
               }
 
               const val = await evalExpression(src.expression, env, sf);
-              const items = await materializeValueAsItems(val, env, sf);
-              const filtered = await applyPushedFilters(
-                items,
-                src.name,
-                srcFilters,
-                env,
-                sf,
-              );
+
+              // Can the source handle filtering natively?
+              const canDelegate =
+                src.stats?.executionCapabilities?.predicatePushdown !== "none" &&
+                val &&
+                typeof val === "object" &&
+                "query" in val &&
+                typeof (val as any).query === "function";
+
+              let filtered: any[];
+
+              if (canDelegate) {
+                // Build a combined WHERE from all pushed filters for this source.
+                // The source's query() + extractBitmapPredicate handles qualified
+                // access via objectVariable matching.
+                const combinedWhere: LuaExpression =
+                  srcFilters.length === 1
+                    ? srcFilters[0].expression
+                    : srcFilters.slice(1).reduce<LuaExpression>(
+                        (acc, f) => ({
+                          type: "Binary" as const,
+                          operator: "and" as const,
+                          left: acc,
+                          right: f.expression,
+                          ctx: f.expression.ctx,
+                        }),
+                        srcFilters[0].expression,
+                      );
+
+                // Delegate: source uses bitmap index for what it can,
+                // applyQuery handles residual predicates internally.
+                filtered = await (val as any).query(
+                  { where: combinedWhere, objectVariable: src.name },
+                  env,
+                  sf,
+                  globalThis.client?.config,
+                );
+              } else {
+                // Fallback: materialize all rows, filter in JS
+                const items = await materializeValueAsItems(val, env, sf);
+                filtered = await applyPushedFilters(
+                  items,
+                  src.name,
+                  srcFilters,
+                  env,
+                  sf,
+                );
+              }
 
               const originalRowCount = src.stats?.rowCount;
               const filteredStats = computeStatsFromArray(filtered);
@@ -1676,7 +1693,7 @@ export function evalExpression(
                 statsSource: "recomputed-filtered-exact",
                 executionCapabilities: {
                   ...(src.stats?.executionCapabilities ?? {}),
-                  scanKind: "materialized",
+                  scanKind: canDelegate ? "delegated-bitmap" : "materialized",
                 },
               };
               // Originally persisted, but re-computed after pushed filter
@@ -1893,18 +1910,8 @@ export function evalExpression(
             });
             query.objectVariable = undefined;
 
-            const hasExplicitSelect = q.clauses.some(
-              (c) => c.type === "Select",
-            );
-            const sourceNameList = fromSource.sources.map((s) => s.name);
-
             return joinedCollection
               .query(query, env, sf, globalThis.client?.config)
-              .then((rows) =>
-                hasExplicitSelect
-                  ? rows
-                  : flattenJoinedRows(rows, sourceNameList),
-              )
               .then(jsToLuaValue);
           })();
         }

@@ -1204,7 +1204,10 @@ function executionScanPenalty(
   const caps = source.stats?.executionCapabilities;
   if (!caps) return 1.0;
 
-  if (caps.predicatePushdown === "bitmap-basic") {
+  if (
+    caps.predicatePushdown === "bitmap-basic" ||
+    caps.predicatePushdown === "bitmap-extended"
+  ) {
     return getBitmapScanPenalty(config);
   }
   if (caps.scanKind === "index-scan" && caps.predicatePushdown === "none") {

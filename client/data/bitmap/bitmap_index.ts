@@ -323,6 +323,15 @@ export class BitmapIndex {
     return this.bitmapsByTag.get(tagId)?.get(column)?.get(valueId);
   }
 
+  /**
+   * Get all value IDs that have a bitmap stored for the given tag and column.
+   */
+  getColumnValueIds(tagId: number, column: string): number[] {
+    const colMap = this.bitmapsByTag.get(tagId)?.get(column);
+    if (!colMap) return [];
+    return [...colMap.keys()];
+  }
+
   // Unified index/unindex via walkObjectFields
 
   /**
