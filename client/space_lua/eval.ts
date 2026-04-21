@@ -41,6 +41,7 @@ import {
 } from "./ast_narrow.ts";
 import {
   applyPushedFilters,
+  attachAnalyzeQueryOpStats,
   buildJoinTree,
   type ExplainNode,
   type ExplainOptions,
@@ -82,6 +83,7 @@ import {
   type QueryInstrumentation,
   type QueryStageStat,
   toCollection,
+  type AggregateRuntimeInstrumentation,
 } from "./query_collection.ts";
 import { isPromise, rpAll, rpThen } from "./rp.ts";
 import {
@@ -1886,13 +1888,19 @@ export function evalExpression(
                   stageStats.push(stat);
                 },
               };
+              const aggregateInstrumentation: AggregateRuntimeInstrumentation = {
+                stats: {
+                  rowsRemovedByAggregateFilter: 0,
+                },
+              };
 
-              const finalRows = await joinedCollection.query(
+              const finalRows = await (joinedCollection as any).query(
                 analyzeQuery,
                 env,
                 sf,
                 globalThis.client?.config,
                 instrumentation,
+                aggregateInstrumentation,
               );
 
               explainPlan!.actualRows = finalRows.length;
@@ -1903,6 +1911,17 @@ export function evalExpression(
                 stageStats,
                 execT0,
                 explainOpts,
+              );
+
+              await attachAnalyzeQueryOpStats(
+                explainPlan!,
+                {
+                  objectVariable: undefined,
+                  groupBy: analyzeQuery.groupBy,
+                  having: analyzeQuery.having,
+                  select: analyzeQuery.select,
+                },
+                aggregateInstrumentation.stats,
               );
 
               const execEndT = performance.now();
@@ -2033,6 +2052,23 @@ export function evalExpression(
                 env,
                 sf,
                 explainOpts,
+              );
+
+              const aggregateInstrumentation: AggregateRuntimeInstrumentation = {
+                stats: {
+                  rowsRemovedByAggregateFilter: 0,
+                },
+              };
+
+              await attachAnalyzeQueryOpStats(
+                explainPlan!,
+                {
+                  objectVariable: query.objectVariable,
+                  groupBy: query.groupBy,
+                  having: query.having,
+                  select: query.select,
+                },
+                aggregateInstrumentation.stats,
               );
 
               const execEndT = performance.now();

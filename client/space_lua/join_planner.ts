@@ -11,7 +11,7 @@ import type {
   LuaWithHints,
 } from "./ast.ts";
 import { evalExpression, luaTableToArray } from "./eval.ts";
-import type { CollectionStats, StatsSource } from "./query_collection.ts";
+import type { AggregateRuntimeStats, CollectionStats, StatsSource } from "./query_collection.ts";
 import {
   LuaEnv,
   LuaFunction,
@@ -26,11 +26,8 @@ import {
 } from "./runtime.ts";
 import { MCVList } from "./mcv.ts";
 import {
-  executeAggregate,
   getAggregateSpec,
-  type AggregateResult,
 } from "./aggregates.ts";
-import { buildItemEnv } from "./query_env.ts";
 import type { Config } from "../config.ts";
 
 // 1. Constants
@@ -322,7 +319,6 @@ export type ExplainNode = {
   pushedDownFilter?: boolean;
   joinFilterType?: "join" | "join-residual";
   sortType?: "query" | "group";
-  aggregateName?: string;
   rowsRemovedByAggregateFilter?: number;
 
   selectivity?: number;
@@ -3979,10 +3975,6 @@ function wrapAggregateLocalOps(
         .map((agg) => `${agg.name}(${agg.args}) filter(${agg.filter})`)
         .join(", "),
       filterType: "aggregate",
-      rowsRemovedByAggregateFilter: aggregatesWithFilter.reduce(
-        (sum, agg) => sum + (agg.rowsFiltered ?? 0),
-        0,
-      ),
       statsSource: wrapped.statsSource,
       children: [wrapped],
     };
@@ -4030,178 +4022,9 @@ function estimateGroupRowsFromNdv(
   return Math.max(1, Math.min(inputRows, Math.round(combinedNdv)));
 }
 
-type AggregateRuntimeProbe = {
-  rowsFiltered: number;
-};
-
-function isAggregateResult(value: unknown): value is AggregateResult {
-  return (
-    typeof value === "object" &&
-    value !== null &&
-    "value" in value &&
-    Object.hasOwn(value, "value")
-  );
-}
-
-async function probeAggregateExpression(
-  expr: LuaExpression,
-  env: LuaEnv,
-  sf: LuaStackFrame,
-  groupItems: LuaTable,
-  objectVariable: string | undefined,
-  outerEnv: LuaEnv,
-  runtimeConfig: Config,
-): Promise<AggregateRuntimeProbe[]> {
-  const probes: AggregateRuntimeProbe[] = [];
-
-  const walk = async (node: LuaExpression): Promise<void> => {
-    switch (node.type) {
-      case "FilteredCall": {
-        const fc = node.call;
-        if (fc.prefix.type === "Variable") {
-          const spec = getAggregateSpec(fc.prefix.name, runtimeConfig);
-          if (spec) {
-            const valueExpr = fc.args.length > 0 ? fc.args[0] : null;
-            const extraArgExprs = fc.args.length > 1 ? fc.args.slice(1) : [];
-            const result = await executeAggregate(
-              spec,
-              groupItems,
-              valueExpr,
-              extraArgExprs,
-              objectVariable,
-              outerEnv,
-              sf,
-              evalExpression,
-              runtimeConfig,
-              node.filter,
-              fc.orderBy,
-              true,
-            );
-            if (isAggregateResult(result)) {
-              probes.push({
-                rowsFiltered: result.rowsFiltered ?? 0,
-              });
-            }
-            return;
-          }
-        }
-
-        await walk(node.call);
-        await walk(node.filter);
-        return;
-      }
-
-      case "AggregateCall": {
-        const fc = node.call;
-        if (fc.prefix.type === "Variable") {
-          const spec = getAggregateSpec(fc.prefix.name, runtimeConfig);
-          if (spec) {
-            const valueExpr = fc.args.length > 0 ? fc.args[0] : null;
-            const extraArgExprs = fc.args.length > 1 ? fc.args.slice(1) : [];
-            const result = await executeAggregate(
-              spec,
-              groupItems,
-              valueExpr,
-              extraArgExprs,
-              objectVariable,
-              outerEnv,
-              sf,
-              evalExpression,
-              runtimeConfig,
-              undefined,
-              node.orderBy,
-              true,
-            );
-            if (isAggregateResult(result)) {
-              probes.push({
-                rowsFiltered: result.rowsFiltered ?? 0,
-              });
-            }
-            return;
-          }
-        }
-
-        await walk(node.call);
-        return;
-      }
-
-      case "FunctionCall": {
-        if (
-          node.prefix.type === "Variable" &&
-          getAggregateSpec(node.prefix.name, runtimeConfig)
-        ) {
-          const spec = getAggregateSpec(node.prefix.name, runtimeConfig);
-          if (spec) {
-            const valueExpr = node.args.length > 0 ? node.args[0] : null;
-            const extraArgExprs = node.args.length > 1 ? node.args.slice(1) : [];
-            const result = await executeAggregate(
-              spec,
-              groupItems,
-              valueExpr,
-              extraArgExprs,
-              objectVariable,
-              outerEnv,
-              sf,
-              evalExpression,
-              runtimeConfig,
-              undefined,
-              node.orderBy,
-              true,
-            );
-            if (isAggregateResult(result)) {
-              probes.push({
-                rowsFiltered: result.rowsFiltered ?? 0,
-              });
-            }
-            return;
-          }
-        }
-
-        await walk(node.prefix);
-        for (const arg of node.args) {
-          await walk(arg);
-        }
-        return;
-      }
-
-      case "Binary":
-        await walk(node.left);
-        await walk(node.right);
-        return;
-
-      case "Unary":
-        await walk(node.argument);
-        return;
-
-      case "Parenthesized":
-        await walk(node.expression);
-        return;
-
-      case "TableConstructor":
-        for (const field of node.fields) {
-          switch (field.type) {
-            case "DynamicField":
-              await walk(field.key);
-              await walk(field.value);
-              break;
-            case "PropField":
-            case "ExpressionField":
-              await walk(field.value);
-              break;
-          }
-        }
-        return;
-
-      default:
-        return;
-    }
-  };
-
-  await walk(expr);
-  return probes;
-}
-
-function findFirstAggregateFilterNode(node: ExplainNode): ExplainNode | undefined {
+function findFirstAggregateFilterNode(
+  node: ExplainNode,
+): ExplainNode | undefined {
   if (node.nodeType === "Filter" && node.filterType === "aggregate") {
     return node;
   }
@@ -4210,157 +4033,6 @@ function findFirstAggregateFilterNode(node: ExplainNode): ExplainNode | undefine
     if (found) return found;
   }
   return undefined;
-}
-
-async function attachAggregateAnalyzeStats(
-  plan: ExplainNode,
-  rows: LuaTable[],
-  query: {
-    objectVariable?: string;
-    groupBy?: { expr: LuaExpression; alias?: string }[];
-    having?: LuaExpression;
-    select?: LuaExpression;
-  },
-  env: LuaEnv,
-  sf: LuaStackFrame,
-  runtimeConfig: Config,
-): Promise<void> {
-  const aggregateFilterNode = findFirstAggregateFilterNode(plan);
-  if (!aggregateFilterNode) {
-    return;
-  }
-
-  const grouped = !!query.groupBy;
-  if (!grouped) {
-    if (!query.select && !query.having) return;
-
-    const groupItems = new LuaTable();
-    for (let i = 0; i < rows.length; i++) {
-      const row = rows[i];
-      groupItems.rawSetArrayIndex(i + 1, row);
-    }
-
-    let totalRowsFiltered = 0;
-
-    if (query.select) {
-      const probes = await probeAggregateExpression(
-        query.select,
-        env,
-        sf,
-        groupItems,
-        query.objectVariable,
-        env,
-        runtimeConfig,
-      );
-      totalRowsFiltered += probes.reduce((sum, p) => sum + p.rowsFiltered, 0);
-    }
-
-    if (query.having) {
-      const probes = await probeAggregateExpression(
-        query.having,
-        env,
-        sf,
-        groupItems,
-        query.objectVariable,
-        env,
-        runtimeConfig,
-      );
-      totalRowsFiltered += probes.reduce((sum, p) => sum + p.rowsFiltered, 0);
-    }
-
-    aggregateFilterNode.rowsRemovedByAggregateFilter = totalRowsFiltered;
-    return;
-  }
-
-  let totalRowsFiltered = 0;
-
-  for (const row of rows) {
-    const groupTable = row.rawGet("group");
-    if (!(groupTable instanceof LuaTable)) {
-      continue;
-    }
-
-    const firstItem = groupTable.length > 0 ? groupTable.rawGet(1) : undefined;
-    const groupEnv = new LuaEnv(env);
-
-    groupEnv.setLocal("_", row);
-    if (query.objectVariable) {
-      groupEnv.setLocal(query.objectVariable, firstItem ?? row);
-    }
-    groupEnv.setLocal("key", row.rawGet("key"));
-    groupEnv.setLocal("group", groupTable);
-
-    if (firstItem instanceof LuaTable) {
-      for (const key of luaKeys(firstItem)) {
-        if (typeof key !== "string") continue;
-        groupEnv.setLocal(key, firstItem.rawGet(key));
-      }
-    } else if (typeof firstItem === "object" && firstItem !== null) {
-      for (const key of Object.keys(firstItem)) {
-        groupEnv.setLocal(key, (firstItem as any)[key]);
-      }
-    }
-
-    if (query.groupBy && query.groupBy.length > 0) {
-      const keyVal = row.rawGet("key");
-      if (keyVal instanceof LuaTable) {
-        for (const g of query.groupBy) {
-          const alias =
-            g.alias ??
-            (g.expr.type === "Variable"
-              ? g.expr.name
-              : g.expr.type === "PropertyAccess"
-                ? g.expr.property
-                : undefined);
-          if (!alias) continue;
-          const v = keyVal.rawGet(alias);
-          if (v !== undefined) {
-            groupEnv.setLocal(alias, v);
-          }
-        }
-      } else {
-        for (const g of query.groupBy) {
-          const alias =
-            g.alias ??
-            (g.expr.type === "Variable"
-              ? g.expr.name
-              : g.expr.type === "PropertyAccess"
-                ? g.expr.property
-                : undefined);
-          if (!alias) continue;
-          groupEnv.setLocal(alias, keyVal);
-        }
-      }
-    }
-
-    if (query.select) {
-      const probes = await probeAggregateExpression(
-        query.select,
-        groupEnv,
-        sf,
-        groupTable,
-        query.objectVariable,
-        env,
-        runtimeConfig,
-      );
-      totalRowsFiltered += probes.reduce((sum, p) => sum + p.rowsFiltered, 0);
-    }
-
-    if (query.having) {
-      const probes = await probeAggregateExpression(
-        query.having,
-        groupEnv,
-        sf,
-        groupTable,
-        query.objectVariable,
-        env,
-        runtimeConfig,
-      );
-      totalRowsFiltered += probes.reduce((sum, p) => sum + p.rowsFiltered, 0);
-    }
-  }
-
-  aggregateFilterNode.rowsRemovedByAggregateFilter = totalRowsFiltered;
 }
 
 // 22. Explain analyze execution
@@ -4530,25 +4202,21 @@ export async function executeAndInstrument(
 
 export async function attachAnalyzeQueryOpStats(
   plan: ExplainNode,
-  rows: LuaTable[],
-  query: {
+  _query: {
     objectVariable?: string;
     groupBy?: { expr: LuaExpression; alias?: string }[];
     having?: LuaExpression;
     select?: LuaExpression;
   },
-  env: LuaEnv,
-  sf: LuaStackFrame,
-  runtimeConfig: Config,
+  aggregateStats: AggregateRuntimeStats,
 ): Promise<void> {
-  await attachAggregateAnalyzeStats(
-    plan,
-    rows,
-    query,
-    env,
-    sf,
-    runtimeConfig,
-  );
+  const aggregateFilterNode = findFirstAggregateFilterNode(plan);
+  if (!aggregateFilterNode) {
+    return;
+  }
+
+  aggregateFilterNode.rowsRemovedByAggregateFilter =
+    aggregateStats.rowsRemovedByAggregateFilter;
 }
 
 // 23. Explain formatting

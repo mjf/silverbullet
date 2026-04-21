@@ -69,15 +69,15 @@ export type StatsSource =
 
 export type CollectionExecutionCapabilities = {
   predicatePushdown?:
-    "none" |
-    "basic" |
-    "bitmap-basic" |
-    "bitmap-extended";
+    | "none"
+    | "basic"
+    | "bitmap-basic"
+    | "bitmap-extended";
   scanKind?:
-    "index-scan" |
-    "kv-scan" |
-    "delegated-bitmap" |
-    "materialized";
+    | "index-scan"
+    | "kv-scan"
+    | "delegated-bitmap"
+    | "materialized";
 };
 
 // Collection statistics for the cost-based planner
@@ -115,6 +115,14 @@ export type QueryStageStat = {
 
 export type QueryInstrumentation = {
   onStage?: (stat: QueryStageStat) => void;
+};
+
+export type AggregateRuntimeStats = {
+  rowsRemovedByAggregateFilter: number;
+};
+
+export type AggregateRuntimeInstrumentation = {
+  stats: AggregateRuntimeStats;
 };
 
 export interface LuaQueryCollection {
@@ -268,6 +276,26 @@ function emitStageStat(
     memoryRows: extra.memoryRows,
     inlineFilteredRows: extra.inlineFilteredRows,
   });
+}
+
+function mergeAggregateRuntimeStats(
+  target: AggregateRuntimeInstrumentation | undefined,
+  result: AggregateResult | LuaValue,
+): LuaValue {
+  if (
+    typeof result === "object" &&
+    result !== null &&
+    "value" in result &&
+    Object.hasOwn(result, "value")
+  ) {
+    const aggregateResult = result as AggregateResult;
+    if (target) {
+      target.stats.rowsRemovedByAggregateFilter +=
+        aggregateResult.rowsFiltered ?? 0;
+    }
+    return aggregateResult.value;
+  }
+  return result as LuaValue;
 }
 
 // Build environment for post-`group by` clauses. Injects `key` and `group`
@@ -624,16 +652,11 @@ function selectVal(v: LuaValue): LuaValue {
   return v === null || v === undefined ? LIQ_NULL : v;
 }
 
-function unwrapAggregateValue(v: LuaValue | AggregateResult): LuaValue {
-  if (
-    typeof v === "object" &&
-    v !== null &&
-    "value" in v &&
-    Object.hasOwn(v, "value")
-  ) {
-    return (v as AggregateResult).value;
-  }
-  return v as LuaValue;
+function unwrapAggregateValue(
+  v: LuaValue | AggregateResult,
+  aggregateInstrumentation?: AggregateRuntimeInstrumentation,
+): LuaValue {
+  return mergeAggregateRuntimeStats(aggregateInstrumentation, v);
 }
 
 /**
@@ -651,6 +674,7 @@ export async function evalExpressionWithAggregates(
   objectVariable: string | undefined,
   outerEnv: LuaEnv,
   config: Config,
+  aggregateInstrumentation?: AggregateRuntimeInstrumentation,
 ): Promise<LuaValue> {
   if (!containsAggregate(expr, config)) {
     return evalExpression(expr, env, sf);
@@ -664,6 +688,7 @@ export async function evalExpressionWithAggregates(
       objectVariable,
       outerEnv,
       config,
+      aggregateInstrumentation,
     );
 
   if (expr.type === "FilteredCall") {
@@ -675,18 +700,21 @@ export async function evalExpressionWithAggregates(
       if (spec) {
         const valueExpr = fc.args.length > 0 ? fc.args[0] : null;
         const extraArgExprs = fc.args.length > 1 ? fc.args.slice(1) : [];
-        return executeAggregate(
-          spec,
-          groupItems,
-          valueExpr,
-          extraArgExprs,
-          objectVariable,
-          outerEnv,
-          sf,
-          evalExpression,
-          config,
-          filtered.filter,
-          fc.orderBy,
+        return unwrapAggregateValue(
+          await executeAggregate(
+            spec,
+            groupItems,
+            valueExpr,
+            extraArgExprs,
+            objectVariable,
+            outerEnv,
+            sf,
+            evalExpression,
+            config,
+            filtered.filter,
+            fc.orderBy,
+          ),
+          aggregateInstrumentation,
         );
       }
     }
@@ -702,18 +730,21 @@ export async function evalExpressionWithAggregates(
       if (spec) {
         const valueExpr = fc.args.length > 0 ? fc.args[0] : null;
         const extraArgExprs = fc.args.length > 1 ? fc.args.slice(1) : [];
-        return executeAggregate(
-          spec,
-          groupItems,
-          valueExpr,
-          extraArgExprs,
-          objectVariable,
-          outerEnv,
-          sf,
-          evalExpression,
-          config,
-          undefined,
-          fc.orderBy,
+        return unwrapAggregateValue(
+          await executeAggregate(
+            spec,
+            groupItems,
+            valueExpr,
+            extraArgExprs,
+            objectVariable,
+            outerEnv,
+            sf,
+            evalExpression,
+            config,
+            undefined,
+            fc.orderBy,
+          ),
+          aggregateInstrumentation,
         );
       }
     }
@@ -725,20 +756,20 @@ export async function evalExpressionWithAggregates(
       switch (field.type) {
         case "PropField": {
           const pf = field as LuaPropField;
-          const value = unwrapAggregateValue(await recurse(pf.value));
+          const value = await recurse(pf.value);
           void table.set(pf.key, selectVal(value), sf);
           break;
         }
         case "DynamicField": {
           const df = field as LuaDynamicField;
           const key = await evalExpression(df.key, env, sf);
-          const value = unwrapAggregateValue(await recurse(df.value));
+          const value = await recurse(df.value);
           void table.set(key, selectVal(value), sf);
           break;
         }
         case "ExpressionField": {
           const ef = field as LuaExpressionField;
-          const value = unwrapAggregateValue(await recurse(ef.value));
+          const value = await recurse(ef.value);
           table.rawSetArrayIndex(nextArrayIndex, selectVal(value));
           nextArrayIndex++;
           break;
@@ -750,24 +781,22 @@ export async function evalExpressionWithAggregates(
   if (expr.type === "Binary") {
     const bin = expr as LuaBinaryExpression;
     if (bin.operator === "and") {
-      const left = singleResult(unwrapAggregateValue(await recurse(bin.left)));
+      const left = singleResult(await recurse(bin.left));
       if (!luaTruthy(left)) return left;
-      return singleResult(unwrapAggregateValue(await recurse(bin.right)));
+      return singleResult(await recurse(bin.right));
     }
     if (bin.operator === "or") {
-      const left = singleResult(unwrapAggregateValue(await recurse(bin.left)));
+      const left = singleResult(await recurse(bin.left));
       if (luaTruthy(left)) return left;
-      return singleResult(unwrapAggregateValue(await recurse(bin.right)));
+      return singleResult(await recurse(bin.right));
     }
-    const left = singleResult(unwrapAggregateValue(await recurse(bin.left)));
-    const right = singleResult(unwrapAggregateValue(await recurse(bin.right)));
+    const left = singleResult(await recurse(bin.left));
+    const right = singleResult(await recurse(bin.right));
     return luaOp(bin.operator, left, right, undefined, undefined, expr.ctx, sf);
   }
   if (expr.type === "Unary") {
     const un = expr as LuaUnaryExpression;
-    const arg = singleResult(
-      unwrapAggregateValue(await recurse(un.argument)),
-    );
+    const arg = singleResult(await recurse(un.argument));
     switch (un.operator) {
       case "-":
         return typeof arg === "number"
@@ -786,7 +815,7 @@ export async function evalExpressionWithAggregates(
   }
   if (expr.type === "Parenthesized") {
     const paren = expr as LuaParenthesizedExpression;
-    return singleResult(unwrapAggregateValue(await recurse(paren.expression)));
+    return singleResult(await recurse(paren.expression));
   }
   return evalExpression(expr, env, sf);
 }
@@ -904,6 +933,7 @@ async function precomputeSortKeys(
   grouped: boolean,
   selectResults: any[] | undefined,
   config: Config,
+  aggregateInstrumentation?: AggregateRuntimeInstrumentation,
 ): Promise<any[][]> {
   const allKeys: any[][] = new Array(results.length);
   for (let i = 0; i < results.length; i++) {
@@ -930,6 +960,7 @@ async function precomputeSortKeys(
           objectVariable,
           env,
           config,
+          aggregateInstrumentation,
         );
       } else {
         keys[j] = await evalExpression(orderBy[j].expr, itemEnv, sf);
@@ -1028,6 +1059,7 @@ export async function applyQuery(
   sf: LuaStackFrame,
   config: Config = new Config(),
   instrumentation?: QueryInstrumentation,
+  aggregateInstrumentation?: AggregateRuntimeInstrumentation,
 ): Promise<any[]> {
   results = results.slice();
 
@@ -1221,6 +1253,7 @@ export async function applyQuery(
           query.objectVariable,
           env,
           config,
+          aggregateInstrumentation,
         );
       } else {
         const itemEnv = buildItemEnvLocal(query.objectVariable, value, env, sf);
@@ -1265,6 +1298,7 @@ export async function applyQuery(
         query.objectVariable,
         env,
         config,
+        aggregateInstrumentation,
       );
       selectResults.push(selected);
     }
@@ -1303,6 +1337,7 @@ export async function applyQuery(
       grouped,
       selectResults,
       config,
+      aggregateInstrumentation,
     );
 
     // Tag each result with its original index for stable sorting
@@ -1378,6 +1413,7 @@ export async function applyQuery(
               query.objectVariable,
               env,
               config,
+              aggregateInstrumentation,
             ),
           );
         } else {

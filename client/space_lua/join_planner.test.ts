@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
+  attachAnalyzeQueryOpStats,
   buildJoinTree,
+  executeAndInstrument,
   executeJoinTree,
   explainJoinTree,
   formatExplainOutput,
@@ -11,6 +13,18 @@ import {
 } from "./join_planner.ts";
 import { parseExpressionString } from "./parse.ts";
 import { LuaEnv, LuaStackFrame, LuaTable } from "./runtime.ts";
+import { Config } from "../config.ts";
+
+function analyzeOpts() {
+  return {
+    analyze: true,
+    verbose: true,
+    summary: false,
+    costs: true,
+    timing: false,
+    hints: false,
+  } as const;
+}
 
 describe("wrapPlanWithQueryOps group NDV", () => {
   it("prefers accumulated post-join NDV over leaf source NDV", () => {
@@ -1499,5 +1513,228 @@ describe("aggregate-local explain nodes", () => {
     expect(rendered.includes("Aggregate Filter:")).toBe(true);
     expect(rendered.includes("Sort (Group)")).toBe(true);
     expect(rendered.includes("Sort Key (Group): t.k")).toBe(true);
+  });
+});
+
+describe("aggregate filter analyze stats", () => {
+  it("attachAnalyzeQueryOpStats records rows removed by aggregate filter for implicit aggregate", async () => {
+    const plan: ExplainNode = wrapPlanWithQueryOps(
+      {
+        nodeType: "Scan",
+        source: "t",
+        startupCost: 0,
+        estimatedCost: 10,
+        estimatedRows: 4,
+        estimatedWidth: 2,
+        children: [],
+      },
+      {
+        select: parseExpressionString(
+          "{ total = sum(t.v) filter(where t.keep == true) }",
+        ),
+      },
+      undefined,
+      undefined,
+      undefined,
+      new Config(),
+    );
+
+    const rows = [
+      { v: 10, keep: true },
+      { v: 20, keep: false },
+      { v: 30, keep: false },
+      { v: 40, keep: false },
+    ].map((item) => {
+      const row = new LuaTable();
+      void row.rawSet("t", item);
+      return row;
+    });
+
+    await attachAnalyzeQueryOpStats(
+      plan,
+      rows,
+      {
+        objectVariable: "t",
+        select: parseExpressionString(
+          "{ total = sum(t.v) filter(where t.keep == true) }",
+        ),
+      },
+      new LuaEnv(),
+      LuaStackFrame.lostFrame,
+      new Config(),
+    );
+
+    const aggNode = plan.children[0];
+    expect(aggNode.nodeType).toBe("GroupAggregate");
+    const filterNode = aggNode.children[0];
+    expect(filterNode.nodeType).toBe("Filter");
+    expect(filterNode.filterType).toBe("aggregate");
+    expect(filterNode.rowsRemovedByAggregateFilter).toBe(3);
+  });
+
+  it("attachAnalyzeQueryOpStats records rows removed by aggregate filter for grouped aggregate", async () => {
+    const plan: ExplainNode = wrapPlanWithQueryOps(
+      {
+        nodeType: "Scan",
+        source: "t",
+        startupCost: 0,
+        estimatedCost: 10,
+        estimatedRows: 5,
+        estimatedWidth: 3,
+        children: [],
+      },
+      {
+        groupBy: [
+          {
+            expr: parseExpressionString("t.g"),
+          },
+        ],
+        select: parseExpressionString(
+          "{ g = t.g, total = sum(t.v) filter(where t.keep == true) }",
+        ),
+      },
+      undefined,
+      undefined,
+      undefined,
+      new Config(),
+    );
+
+    const mkGroupRow = (key: string, items: Array<{ g: string; v: number; keep: boolean }>) => {
+      const group = new LuaTable();
+      for (let i = 0; i < items.length; i++) {
+        group.rawSetArrayIndex(i + 1, items[i]);
+      }
+      const row = new LuaTable();
+      void row.rawSet("key", key);
+      void row.rawSet("group", group);
+      return row;
+    };
+
+    const rows = [
+      mkGroupRow("a", [
+        { g: "a", v: 1, keep: true },
+        { g: "a", v: 2, keep: false },
+      ]),
+      mkGroupRow("b", [
+        { g: "b", v: 3, keep: false },
+        { g: "b", v: 4, keep: false },
+        { g: "b", v: 5, keep: true },
+      ]),
+    ];
+
+    await attachAnalyzeQueryOpStats(
+      plan,
+      rows,
+      {
+        objectVariable: "t",
+        groupBy: [
+          {
+            expr: parseExpressionString("t.g"),
+          },
+        ],
+        select: parseExpressionString(
+          "{ g = t.g, total = sum(t.v) filter(where t.keep == true) }",
+        ),
+      },
+      new LuaEnv(),
+      LuaStackFrame.lostFrame,
+      new Config(),
+    );
+
+    const projectNode = plan;
+    expect(projectNode.nodeType).toBe("Project");
+
+    const groupNode = projectNode.children[0];
+    expect(groupNode.nodeType).toBe("GroupAggregate");
+
+    const filterNode = groupNode.children[0];
+    expect(filterNode.nodeType).toBe("Filter");
+    expect(filterNode.filterType).toBe("aggregate");
+    expect(filterNode.rowsRemovedByAggregateFilter).toBe(3);
+  });
+
+  it("executeAndInstrument plus attachAnalyzeQueryOpStats renders aggregate filter removal count", async () => {
+    const items = [
+      { v: 10, keep: true },
+      { v: 20, keep: false },
+      { v: 30, keep: false },
+      { v: 40, keep: false },
+    ];
+
+    const source: JoinSource = {
+      ...makeSource("t", items),
+      expression: parseExpressionString("t"),
+    };
+
+    const tree = buildJoinTree([source]);
+    const explainLeaf = explainJoinTree(tree, analyzeOpts());
+    const wrapped = wrapPlanWithQueryOps(
+      explainLeaf,
+      {
+        select: parseExpressionString(
+          "{ total = sum(t.v) filter(where t.keep == true) }",
+        ),
+      },
+      new Map([
+        [
+          "t",
+          {
+            rowCount: items.length,
+            ndv: new Map([
+              ["v", 4],
+              ["keep", 2],
+            ]),
+            avgColumnCount: 2,
+            statsSource: "computed-exact-small",
+            executionCapabilities: {
+              predicatePushdown: "none",
+              scanKind: "materialized",
+            },
+          },
+        ],
+      ]),
+      undefined,
+      undefined,
+      new Config(),
+    );
+
+    const env = testEnvWithSources({ t: items });
+
+    const joinRows = await executeAndInstrument(
+      tree,
+      wrapped.children[0].children[0],
+      env,
+      LuaStackFrame.lostFrame,
+      analyzeOpts(),
+      undefined,
+      undefined,
+      0,
+    );
+
+    await attachAnalyzeQueryOpStats(
+      wrapped,
+      joinRows,
+      {
+        objectVariable: "t",
+        select: parseExpressionString(
+          "{ total = sum(t.v) filter(where t.keep == true) }",
+        ),
+      },
+      env,
+      LuaStackFrame.lostFrame,
+      new Config(),
+    );
+
+    const rendered = formatExplainOutput(
+      {
+        plan: wrapped,
+        planningTimeMs: 0,
+        executionTimeMs: 0,
+      },
+      analyzeOpts(),
+    );
+
+    expect(rendered.includes("Filter (Aggregate)")).toBe(true);
+    expect(rendered.includes("Rows Removed by Aggregate Filter: 3")).toBe(true);
   });
 });
