@@ -1811,14 +1811,8 @@ export function evalExpression(
                 explainOpts,
               );
 
-              await attachAnalyzeQueryOpStats(
+              attachAnalyzeQueryOpStats(
                 explainPlan!,
-                {
-                  objectVariable: undefined,
-                  groupBy: analyzeQuery.groupBy,
-                  having: analyzeQuery.having,
-                  select: analyzeQuery.select,
-                },
                 aggregateInstrumentation.stats,
               );
 
@@ -1977,14 +1971,8 @@ export function evalExpression(
               explainPlan!.actualRows = finalRows.length;
               explainPlan!.actualLoops = 1;
 
-              await attachAnalyzeQueryOpStats(
+              attachAnalyzeQueryOpStats(
                 explainPlan!,
-                {
-                  objectVariable: query.objectVariable,
-                  groupBy: query.groupBy,
-                  having: query.having,
-                  select: query.select,
-                },
                 aggregateInstrumentation.stats,
               );
 
