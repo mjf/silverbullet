@@ -6550,3 +6550,163 @@ do
     "150: expected last with-hints to win, got: " .. tostring(plan)
   )
 end
+
+-- 151. Aggregate filter analyze statistics
+
+-- 151a. Implicit aggregate filter reports removed rows
+do
+  local plan = query [[
+    explain analyze verbose
+    from
+      t = {
+        { v = 10, keep = true },
+        { v = 20, keep = false },
+        { v = 30, keep = false },
+        { v = 40, keep = false },
+      }
+    select {
+      total = sum(t.v) filter(where t.keep == true),
+    }
+  ]]
+
+  plan = tostring(plan)
+
+  assertTrue(
+    string.find(plan, "Filter %(Aggregate%)") ~= nil,
+    "151a: expected aggregate filter node, got: " .. tostring(plan)
+  )
+  assertTrue(
+    string.find(plan, "Rows Removed by Aggregate Filter: 3", 1, true) ~= nil,
+    "151a: expected removed-row count 3, got: " .. tostring(plan)
+  )
+end
+
+-- 151b. Explicit grouping aggregate filter reports removed rows across groups
+do
+  local plan = query [[
+    explain analyze verbose
+    from
+      t = {
+        { g = "a", v = 1, keep = true },
+        { g = "a", v = 2, keep = false },
+        { g = "b", v = 3, keep = false },
+        { g = "b", v = 4, keep = false },
+        { g = "b", v = 5, keep = true },
+      }
+    group by
+      t.g
+    select {
+      g = key,
+      total = sum(t.v) filter(where t.keep == true),
+    }
+  ]]
+
+  plan = tostring(plan)
+
+  assertTrue(
+    string.find(plan, "Group Aggregate", 1, true) ~= nil,
+    "151b: expected Group Aggregate node, got: " .. tostring(plan)
+  )
+  assertTrue(
+    string.find(plan, "Rows Removed by Aggregate Filter: 3", 1, true) ~= nil,
+    "151b: expected removed-row count 3, got: " .. tostring(plan)
+  )
+end
+
+-- 151c. Aggregate filter with intra-aggregate order by still reports removed rows
+do
+  local plan = query [[
+    explain analyze verbose
+    from
+      t = {
+        { v = 10, k = 4, keep = true },
+        { v = 20, k = 3, keep = false },
+        { v = 30, k = 2, keep = false },
+        { v = 40, k = 1, keep = false },
+      }
+    select {
+      xs = array_agg(t.v order by t.k desc) filter(where t.keep == true),
+    }
+  ]]
+
+  plan = tostring(plan)
+
+  assertTrue(
+    string.find(plan, "Sort %(Group%)") ~= nil,
+    "151c: expected group sort node, got: " .. tostring(plan)
+  )
+  assertTrue(
+    string.find(plan, "Filter %(Aggregate%)") ~= nil,
+    "151c: expected aggregate filter node, got: " .. tostring(plan)
+  )
+  assertTrue(
+    string.find(plan, "Rows Removed by Aggregate Filter: 3", 1, true) ~= nil,
+    "151c: expected removed-row count 3, got: " .. tostring(plan)
+  )
+end
+
+-- 151d. Same filtered aggregate used in select and having is counted once
+do
+  local plan = query [[
+    explain analyze verbose
+    from
+      t = {
+        { g = "a", v = 1, keep = true },
+        { g = "a", v = 2, keep = false },
+        { g = "b", v = 3, keep = false },
+        { g = "b", v = 4, keep = false },
+        { g = "b", v = 5, keep = true },
+      }
+    group by
+      t.g
+    having
+      sum(t.v) filter(where t.keep == true) > 0
+    select {
+      g = key,
+      total = sum(t.v) filter(where t.keep == true),
+    }
+  ]]
+
+  plan = tostring(plan)
+
+  assertTrue(
+    string.find(plan, "Filter %(Having%)") ~= nil,
+    "151d: expected having filter node, got: " .. tostring(plan)
+  )
+  assertTrue(
+    string.find(plan, "Rows Removed by Aggregate Filter: 3", 1, true) ~= nil,
+    "151d: expected deduped removed-row count 3, got: " .. tostring(plan)
+  )
+  assertTrue(
+    string.find(plan, "Rows Removed by Aggregate Filter: 6", 1, true) == nil,
+    "151d: aggregate filter rows must not be double-counted: " .. tostring(plan)
+  )
+end
+
+-- 151e. Embedded from-data form also reports aggregate-filter removed rows
+do
+  local plan = query [[
+    explain analyze verbose
+    from
+      data = {
+        { v = 10, keep = true },
+        { v = 20, keep = false },
+        { v = 30, keep = false },
+        { v = 40, keep = false },
+      }
+    select {
+      total = sum(data.v) filter(where data.keep == true),
+    }
+  ]]
+
+  plan = tostring(plan)
+
+  assertTrue(
+    string.find(plan, "Scan on data", 1, true) ~= nil,
+    "151e: expected scan on data, got: " .. tostring(plan)
+  )
+  assertTrue(
+    string.find(plan, "Rows Removed by Aggregate Filter: 3", 1, true) ~= nil,
+    "151e: expected removed-row count 3, got: " .. tostring(plan)
+  )
+end

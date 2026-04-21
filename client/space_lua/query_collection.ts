@@ -657,8 +657,15 @@ function containsAggregate(expr: LuaExpression, config?: Config): boolean {
 }
 
 type AggregateFilterProbe = {
+  signature: string;
   filter: LuaExpression;
 };
+
+function aggregateFilterProbeSignature(
+  filter: LuaExpression,
+): string {
+  return JSON.stringify(filter);
+}
 
 function collectAggregateFilterProbes(
   expr: LuaExpression | undefined,
@@ -674,7 +681,10 @@ function collectAggregateFilterProbes(
           node.call.prefix.type === "Variable" &&
           getAggregateSpec(node.call.prefix.name, config)
         ) {
-          out.push({ filter: node.filter });
+          out.push({
+            signature: aggregateFilterProbeSignature(node.filter),
+            filter: node.filter,
+          });
           walk(node.call);
           return;
         }
@@ -744,12 +754,24 @@ function dedupeAggregateFilterProbes(
   const seen = new Set<string>();
   const result: AggregateFilterProbe[] = [];
   for (const probe of probes) {
-    const sig = JSON.stringify(probe.filter);
-    if (seen.has(sig)) continue;
-    seen.add(sig);
+    if (seen.has(probe.signature)) continue;
+    seen.add(probe.signature);
     result.push(probe);
   }
   return result;
+}
+
+function collectAggregateFilterProbesForQuery(
+  query: {
+    select?: LuaExpression;
+    having?: LuaExpression;
+  },
+  config?: Config,
+): AggregateFilterProbe[] {
+  return dedupeAggregateFilterProbes([
+    ...collectAggregateFilterProbes(query.select, config),
+    ...collectAggregateFilterProbes(query.having, config),
+  ]);
 }
 
 async function countAggregateFilterRemovedRows(
@@ -1409,9 +1431,7 @@ export async function applyQuery(
         const groupTable = (value as LuaTable).rawGet("group");
 
         if (aggregateInstrumentation) {
-          const probes = dedupeAggregateFilterProbes(
-            collectAggregateFilterProbes(query.having, config),
-          );
+          const probes = collectAggregateFilterProbesForQuery(query, config);
           aggregateInstrumentation.stats.rowsRemovedByAggregateFilter +=
             await countAggregateFilterRemovedRows(
               probes,
@@ -1469,9 +1489,7 @@ export async function applyQuery(
       const groupTable = (item as LuaTable).rawGet("group");
 
       if (aggregateInstrumentation) {
-        const probes = dedupeAggregateFilterProbes(
-          collectAggregateFilterProbes(selectExpr, config),
-        );
+        const probes = collectAggregateFilterProbesForQuery(query, config);
         aggregateInstrumentation.stats.rowsRemovedByAggregateFilter +=
           await countAggregateFilterRemovedRows(
             probes,
@@ -1598,9 +1616,7 @@ export async function applyQuery(
           const groupTable = (item as LuaTable).rawGet("group");
 
           if (aggregateInstrumentation) {
-            const probes = dedupeAggregateFilterProbes(
-              collectAggregateFilterProbes(selectExpr, config),
-            );
+            const probes = collectAggregateFilterProbesForQuery(query, config);
             aggregateInstrumentation.stats.rowsRemovedByAggregateFilter +=
               await countAggregateFilterRemovedRows(
                 probes,
