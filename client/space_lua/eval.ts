@@ -1123,108 +1123,6 @@ function explainSingleSource(
   };
 }
 
-function shouldTrustSingleSourceIndexRowCount(
-  collection: any,
-  stats: CollectionStats | undefined,
-): collection is {
-  query: (
-    query: LuaCollectionQuery,
-    env: LuaEnv,
-    sf: LuaStackFrame,
-    config?: any,
-  ) => Promise<any[]>;
-  isTagIndexTrusted: () => Promise<boolean>;
-} {
-  return (
-    !!stats &&
-    stats.statsSource === "persisted-complete" &&
-    !!collection &&
-    typeof collection === "object" &&
-    "query" in collection &&
-    typeof (collection as any).query === "function" &&
-    "isTagIndexTrusted" in collection &&
-    typeof (collection as any).isTagIndexTrusted === "function"
-  );
-}
-
-async function executeSingleSourceExplainAnalyze(
-  collection: any,
-  query: LuaCollectionQuery,
-  plan: ExplainNode,
-  sourceStats: CollectionStats,
-  env: LuaEnv,
-  sf: LuaStackFrame,
-  opts: ExplainOptions,
-): Promise<any[]> {
-  const t0 = performance.now();
-
-  let baseRowCount: number;
-  if (shouldTrustSingleSourceIndexRowCount(collection, sourceStats)) {
-    const trusted = await collection.isTagIndexTrusted();
-    if (trusted) {
-      baseRowCount = sourceStats.rowCount;
-    } else {
-      const loadedBaseRows = await collection.query(
-        {},
-        env,
-        sf,
-        globalThis.client?.config,
-      );
-      baseRowCount = loadedBaseRows.length;
-    }
-  } else {
-    const loadedBaseRows = await collection.query(
-      {},
-      env,
-      sf,
-      globalThis.client?.config,
-    );
-    baseRowCount = loadedBaseRows.length;
-  }
-
-  const stageStats: QueryStageStat[] = [];
-  const instrumentation: QueryInstrumentation = {
-    onStage: (stat) => {
-      stageStats.push(stat);
-    },
-  };
-
-  const finalRows = await collection.query(
-    query,
-    env,
-    sf,
-    globalThis.client?.config,
-    instrumentation,
-  );
-
-  annotateExplainWrappersFromStageStats(plan, stageStats, t0, opts);
-
-  const scanPlan = unwrapToJoinPlan(plan);
-  scanPlan.actualRows = baseRowCount;
-  scanPlan.actualLoops = 1;
-
-  if (opts.timing) {
-    // Use the earliest stage stat start time as the scan end boundary
-    const scanEndMs =
-      stageStats.length > 0
-        ? Math.round((stageStats[0].startTimeMs - t0) * 1000) / 1000
-        : Math.round((performance.now() - t0) * 1000) / 1000;
-    scanPlan.actualStartupTimeMs = 0;
-    scanPlan.actualTimeMs = scanEndMs;
-  }
-
-  plan.actualRows = finalRows.length;
-  plan.actualLoops = 1;
-
-  if (opts.timing) {
-    const elapsed = Math.round((performance.now() - t0) * 1000) / 1000;
-    plan.actualStartupTimeMs = 0;
-    plan.actualTimeMs = elapsed;
-  }
-
-  return finalRows;
-}
-
 /**
  * Convert a LuaTable to a flat JS array.  Array-like tables (length > 0)
  * are unpacked; empty tables yield []; record-like tables are singletons.
@@ -2044,21 +1942,40 @@ export function evalExpression(
 
             if (explainOpts?.analyze) {
               const execT0 = performance.now();
-              await executeSingleSourceExplainAnalyze(
-                collection as any,
-                query,
-                explainPlan!,
-                stats,
-                env,
-                sf,
-                explainOpts,
-              );
-
+              const stageStats: QueryStageStat[] = [];
+              const instrumentation: QueryInstrumentation = {
+                onStage: (stat) => {
+                  stageStats.push(stat);
+                },
+              };
               const aggregateInstrumentation: AggregateRuntimeInstrumentation = {
                 stats: {
                   rowsRemovedByAggregateFilter: 0,
                 },
               };
+
+              const finalRows = await (collection as any).query(
+                query,
+                env,
+                sf,
+                globalThis.client?.config,
+                instrumentation,
+                aggregateInstrumentation,
+              );
+
+              annotateExplainWrappersFromStageStats(
+                explainPlan!,
+                stageStats,
+                execT0,
+                explainOpts,
+              );
+
+              const scanPlan = unwrapToJoinPlan(explainPlan!);
+              scanPlan.actualRows = stats.rowCount;
+              scanPlan.actualLoops = 1;
+
+              explainPlan!.actualRows = finalRows.length;
+              explainPlan!.actualLoops = 1;
 
               await attachAnalyzeQueryOpStats(
                 explainPlan!,

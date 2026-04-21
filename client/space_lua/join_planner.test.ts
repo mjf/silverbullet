@@ -1185,7 +1185,9 @@ describe("source with-hints in explain and planning", () => {
       },
     );
 
-    expect(rendered.includes("Hints: materialized, rows=5, width=2, cost=13")).toBe(true);
+    expect(
+      rendered.includes("Hints: materialized, rows=5, width=2, cost=13"),
+    ).toBe(true);
     expect(rendered.includes("Stats: computed-exact-small")).toBe(true);
   });
 
@@ -1256,17 +1258,14 @@ describe("source with-hints in explain and planning", () => {
       throw new Error("expected join");
     }
 
-    const leftPlan = explainJoinTree(
-      tree,
-      {
-        analyze: false,
-        verbose: true,
-        summary: false,
-        costs: true,
-        timing: false,
-        hints: true,
-      },
-    ).children[0];
+    const leftPlan = explainJoinTree(tree, {
+      analyze: false,
+      verbose: true,
+      summary: false,
+      costs: true,
+      timing: false,
+      hints: true,
+    }).children[0];
 
     expect(leftPlan.estimatedRows).toBe(5);
     expect(leftPlan.estimatedWidth).toBe(2);
@@ -1387,9 +1386,9 @@ describe("aggregate-local explain nodes", () => {
     );
 
     expect(rendered.includes("Filter (Aggregate)")).toBe(true);
-    expect(rendered.includes("Aggregate Filter: sum(t.v) filter((t.v > 10))")).toBe(
-      true,
-    );
+    expect(
+      rendered.includes("Aggregate Filter: sum(t.v) filter((t.v > 10))"),
+    ).toBe(true);
   });
 
   it("adds Sort (Group) node for aggregate-local order by", () => {
@@ -1539,29 +1538,17 @@ describe("aggregate filter analyze stats", () => {
       new Config(),
     );
 
-    const rows = [
-      { v: 10, keep: true },
-      { v: 20, keep: false },
-      { v: 30, keep: false },
-      { v: 40, keep: false },
-    ].map((item) => {
-      const row = new LuaTable();
-      void row.rawSet("t", item);
-      return row;
-    });
-
     await attachAnalyzeQueryOpStats(
       plan,
-      rows,
       {
         objectVariable: "t",
         select: parseExpressionString(
           "{ total = sum(t.v) filter(where t.keep == true) }",
         ),
       },
-      new LuaEnv(),
-      LuaStackFrame.lostFrame,
-      new Config(),
+      {
+        rowsRemovedByAggregateFilter: 3,
+      },
     );
 
     const aggNode = plan.children[0];
@@ -1599,32 +1586,8 @@ describe("aggregate filter analyze stats", () => {
       new Config(),
     );
 
-    const mkGroupRow = (key: string, items: Array<{ g: string; v: number; keep: boolean }>) => {
-      const group = new LuaTable();
-      for (let i = 0; i < items.length; i++) {
-        group.rawSetArrayIndex(i + 1, items[i]);
-      }
-      const row = new LuaTable();
-      void row.rawSet("key", key);
-      void row.rawSet("group", group);
-      return row;
-    };
-
-    const rows = [
-      mkGroupRow("a", [
-        { g: "a", v: 1, keep: true },
-        { g: "a", v: 2, keep: false },
-      ]),
-      mkGroupRow("b", [
-        { g: "b", v: 3, keep: false },
-        { g: "b", v: 4, keep: false },
-        { g: "b", v: 5, keep: true },
-      ]),
-    ];
-
     await attachAnalyzeQueryOpStats(
       plan,
-      rows,
       {
         objectVariable: "t",
         groupBy: [
@@ -1636,9 +1599,9 @@ describe("aggregate filter analyze stats", () => {
           "{ g = t.g, total = sum(t.v) filter(where t.keep == true) }",
         ),
       },
-      new LuaEnv(),
-      LuaStackFrame.lostFrame,
-      new Config(),
+      {
+        rowsRemovedByAggregateFilter: 3,
+      },
     );
 
     const projectNode = plan;
@@ -1700,7 +1663,7 @@ describe("aggregate filter analyze stats", () => {
 
     const env = testEnvWithSources({ t: items });
 
-    const joinRows = await executeAndInstrument(
+    await executeAndInstrument(
       tree,
       wrapped.children[0].children[0],
       env,
@@ -1713,16 +1676,15 @@ describe("aggregate filter analyze stats", () => {
 
     await attachAnalyzeQueryOpStats(
       wrapped,
-      joinRows,
       {
         objectVariable: "t",
         select: parseExpressionString(
           "{ total = sum(t.v) filter(where t.keep == true) }",
         ),
       },
-      env,
-      LuaStackFrame.lostFrame,
-      new Config(),
+      {
+        rowsRemovedByAggregateFilter: 3,
+      },
     );
 
     const rendered = formatExplainOutput(

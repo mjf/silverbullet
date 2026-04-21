@@ -132,6 +132,7 @@ export interface LuaQueryCollection {
     sf: LuaStackFrame,
     config?: Config,
     instrumentation?: QueryInstrumentation,
+    aggregateInstrumentation?: AggregateRuntimeInstrumentation,
   ): Promise<any[]>;
 }
 
@@ -549,8 +550,17 @@ export class ArrayQueryCollection<T> implements LuaQueryCollection {
     sf: LuaStackFrame,
     config?: Config,
     instrumentation?: QueryInstrumentation,
+    aggregateInstrumentation?: AggregateRuntimeInstrumentation,
   ): Promise<any[]> {
-    return applyQuery(this.array, query, env, sf, config, instrumentation);
+    return applyQuery(
+      this.array,
+      query,
+      env,
+      sf,
+      config,
+      instrumentation,
+      aggregateInstrumentation,
+    );
   }
 
   getStats(): CollectionStats {
@@ -646,6 +656,127 @@ function containsAggregate(expr: LuaExpression, config?: Config): boolean {
   }
 }
 
+type AggregateFilterProbe = {
+  filter: LuaExpression;
+};
+
+function collectAggregateFilterProbes(
+  expr: LuaExpression | undefined,
+  config?: Config,
+): AggregateFilterProbe[] {
+  if (!expr) return [];
+  const out: AggregateFilterProbe[] = [];
+
+  const walk = (node: LuaExpression) => {
+    switch (node.type) {
+      case "FilteredCall":
+        if (
+          node.call.prefix.type === "Variable" &&
+          getAggregateSpec(node.call.prefix.name, config)
+        ) {
+          out.push({ filter: node.filter });
+          walk(node.call);
+          return;
+        }
+        walk(node.call);
+        walk(node.filter);
+        return;
+
+      case "AggregateCall":
+        walk(node.call);
+        for (const ob of node.orderBy) {
+          walk(ob.expression);
+        }
+        return;
+
+      case "FunctionCall":
+        walk(node.prefix);
+        for (const arg of node.args) {
+          walk(arg);
+        }
+        if (node.orderBy) {
+          for (const ob of node.orderBy) {
+            walk(ob.expression);
+          }
+        }
+        return;
+
+      case "Binary":
+        walk(node.left);
+        walk(node.right);
+        return;
+
+      case "Unary":
+        walk(node.argument);
+        return;
+
+      case "Parenthesized":
+        walk(node.expression);
+        return;
+
+      case "TableConstructor":
+        for (const field of node.fields) {
+          switch (field.type) {
+            case "DynamicField":
+              walk(field.key);
+              walk(field.value);
+              break;
+            case "PropField":
+            case "ExpressionField":
+              walk(field.value);
+              break;
+          }
+        }
+        return;
+
+      default:
+        return;
+    }
+  };
+
+  walk(expr);
+  return out;
+}
+
+function dedupeAggregateFilterProbes(
+  probes: AggregateFilterProbe[],
+): AggregateFilterProbe[] {
+  const seen = new Set<string>();
+  const result: AggregateFilterProbe[] = [];
+  for (const probe of probes) {
+    const sig = JSON.stringify(probe.filter);
+    if (seen.has(sig)) continue;
+    seen.add(sig);
+    result.push(probe);
+  }
+  return result;
+}
+
+async function countAggregateFilterRemovedRows(
+  probes: AggregateFilterProbe[],
+  groupItems: LuaTable,
+  objectVariable: string | undefined,
+  env: LuaEnv,
+  sf: LuaStackFrame,
+): Promise<number> {
+  let removed = 0;
+
+  for (const probe of probes) {
+    let passed = 0;
+    for (let i = 1; i <= groupItems.length; i++) {
+      const item = groupItems.rawGet(i);
+      const itemEnv = buildItemEnvLocal(objectVariable, item, env, sf);
+      const ok = await evalExpression(probe.filter, itemEnv, sf);
+      if (luaTruthy(ok)) {
+        passed++;
+      }
+    }
+    removed += groupItems.length - passed;
+  }
+
+  return removed;
+}
+
 // Wrap a value for select result tables so that the column key survives
 // in the `LuaTable`
 function selectVal(v: LuaValue): LuaValue {
@@ -713,6 +844,37 @@ export async function evalExpressionWithAggregates(
             config,
             filtered.filter,
             fc.orderBy,
+          ),
+          aggregateInstrumentation,
+        );
+      }
+    }
+
+    return evalExpression(expr, env, sf);
+  }
+
+  if (expr.type === "AggregateCall") {
+    const agg = expr as LuaAggregateCallExpression;
+    const fc = agg.call;
+    if (fc.prefix.type === "Variable") {
+      const name = fc.prefix.name;
+      const spec = getAggregateSpec(name, config);
+      if (spec) {
+        const valueExpr = fc.args.length > 0 ? fc.args[0] : null;
+        const extraArgExprs = fc.args.length > 1 ? fc.args.slice(1) : [];
+        return unwrapAggregateValue(
+          await executeAggregate(
+            spec,
+            groupItems,
+            valueExpr,
+            extraArgExprs,
+            objectVariable,
+            outerEnv,
+            sf,
+            evalExpression,
+            config,
+            undefined,
+            agg.orderBy,
           ),
           aggregateInstrumentation,
         );
@@ -1245,6 +1407,21 @@ export async function applyQuery(
           sf,
         );
         const groupTable = (value as LuaTable).rawGet("group");
+
+        if (aggregateInstrumentation) {
+          const probes = dedupeAggregateFilterProbes(
+            collectAggregateFilterProbes(query.having, config),
+          );
+          aggregateInstrumentation.stats.rowsRemovedByAggregateFilter +=
+            await countAggregateFilterRemovedRows(
+              probes,
+              groupTable,
+              query.objectVariable,
+              env,
+              sf,
+            );
+        }
+
         condResult = await evalExpressionWithAggregates(
           query.having,
           itemEnv,
@@ -1290,6 +1467,21 @@ export async function applyQuery(
     for (const item of results) {
       const itemEnv = mkEnv(query.objectVariable, item, env, sf);
       const groupTable = (item as LuaTable).rawGet("group");
+
+      if (aggregateInstrumentation) {
+        const probes = dedupeAggregateFilterProbes(
+          collectAggregateFilterProbes(selectExpr, config),
+        );
+        aggregateInstrumentation.stats.rowsRemovedByAggregateFilter +=
+          await countAggregateFilterRemovedRows(
+            probes,
+            groupTable,
+            query.objectVariable,
+            env,
+            sf,
+          );
+      }
+
       const selected = await evalExpressionWithAggregates(
         selectExpr,
         itemEnv,
@@ -1404,6 +1596,21 @@ export async function applyQuery(
         const itemEnv = mkEnv(query.objectVariable, item, env, sf);
         if (grouped) {
           const groupTable = (item as LuaTable).rawGet("group");
+
+          if (aggregateInstrumentation) {
+            const probes = dedupeAggregateFilterProbes(
+              collectAggregateFilterProbes(selectExpr, config),
+            );
+            aggregateInstrumentation.stats.rowsRemovedByAggregateFilter +=
+              await countAggregateFilterRemovedRows(
+                probes,
+                groupTable,
+                query.objectVariable,
+                env,
+                sf,
+              );
+          }
+
           newResult.push(
             await evalExpressionWithAggregates(
               selectExpr,
@@ -1726,6 +1933,7 @@ export async function queryLua<T = any>(
   enricher?: (key: KvKey, item: any) => any,
   config?: Config,
   instrumentation?: QueryInstrumentation,
+  aggregateInstrumentation?: AggregateRuntimeInstrumentation,
 ): Promise<T[]> {
   // P2: Extract simple column comparisons that can be evaluated inline
   // during the KV scan, avoiding object allocation and Lua eval overhead
@@ -1752,7 +1960,15 @@ export async function queryLua<T = any>(
   const residualQuery: LuaCollectionQuery =
     inlineFilters.length > 0 ? { ...query, where: residualWhere } : query;
 
-  return applyQuery(results, residualQuery, env, sf, config, instrumentation);
+  return applyQuery(
+    results,
+    residualQuery,
+    env,
+    sf,
+    config,
+    instrumentation,
+    aggregateInstrumentation,
+  );
 }
 
 function generateKey(value: any) {
@@ -1802,12 +2018,14 @@ export class DataStoreQueryCollection implements LuaQueryCollection {
     private readonly dataStore: DataStore,
     readonly prefix: string[],
   ) {}
+
   query(
     query: LuaCollectionQuery,
     env: LuaEnv,
     sf: LuaStackFrame,
     config?: Config,
     instrumentation?: QueryInstrumentation,
+    aggregateInstrumentation?: AggregateRuntimeInstrumentation,
   ): Promise<any[]> {
     return queryLua(
       this.dataStore.kv,
@@ -1818,10 +2036,10 @@ export class DataStoreQueryCollection implements LuaQueryCollection {
       undefined,
       config,
       instrumentation,
+      aggregateInstrumentation,
     );
   }
 
-  /** O(n) count via KV scan — avoids materializing all rows for planning */
   /** O(n) count via KV scan — avoids materializing all rows for planning */
   async getStats(): Promise<CollectionStats> {
     const rowCount = await this.dataStore.kv.countQuery({
