@@ -1538,14 +1538,8 @@ describe("aggregate filter analyze stats", () => {
       new Config(),
     );
 
-    await attachAnalyzeQueryOpStats(
+    attachAnalyzeQueryOpStats(
       plan,
-      {
-        objectVariable: "t",
-        select: parseExpressionString(
-          "{ total = sum(t.v) filter(where t.keep == true) }",
-        ),
-      },
       {
         rowsRemovedByAggregateFilter: 3,
       },
@@ -1588,17 +1582,6 @@ describe("aggregate filter analyze stats", () => {
 
     await attachAnalyzeQueryOpStats(
       plan,
-      {
-        objectVariable: "t",
-        groupBy: [
-          {
-            expr: parseExpressionString("t.g"),
-          },
-        ],
-        select: parseExpressionString(
-          "{ g = t.g, total = sum(t.v) filter(where t.keep == true) }",
-        ),
-      },
       {
         rowsRemovedByAggregateFilter: 3,
       },
@@ -1676,12 +1659,6 @@ describe("aggregate filter analyze stats", () => {
 
     await attachAnalyzeQueryOpStats(
       wrapped,
-      {
-        objectVariable: "t",
-        select: parseExpressionString(
-          "{ total = sum(t.v) filter(where t.keep == true) }",
-        ),
-      },
       {
         rowsRemovedByAggregateFilter: 3,
       },

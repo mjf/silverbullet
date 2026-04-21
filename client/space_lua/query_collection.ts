@@ -68,16 +68,8 @@ export type StatsSource =
   | "unknown-default";
 
 export type CollectionExecutionCapabilities = {
-  predicatePushdown?:
-    | "none"
-    | "basic"
-    | "bitmap-basic"
-    | "bitmap-extended";
-  scanKind?:
-    | "index-scan"
-    | "kv-scan"
-    | "delegated-bitmap"
-    | "materialized";
+  predicatePushdown?: "none" | "basic" | "bitmap-basic" | "bitmap-extended";
+  scanKind?: "index-scan" | "kv-scan" | "delegated-bitmap" | "materialized";
 };
 
 // Collection statistics for the cost-based planner
@@ -279,24 +271,15 @@ function emitStageStat(
   });
 }
 
+// AFTER
 function mergeAggregateRuntimeStats(
   target: AggregateRuntimeInstrumentation | undefined,
-  result: AggregateResult | LuaValue,
+  result: AggregateResult,
 ): LuaValue {
-  if (
-    typeof result === "object" &&
-    result !== null &&
-    "value" in result &&
-    Object.hasOwn(result, "value")
-  ) {
-    const aggregateResult = result as AggregateResult;
-    if (target) {
-      target.stats.rowsRemovedByAggregateFilter +=
-        aggregateResult.rowsFiltered ?? 0;
-    }
-    return aggregateResult.value;
+  if (target) {
+    target.stats.rowsRemovedByAggregateFilter += result.rowsFiltered ?? 0;
   }
-  return result as LuaValue;
+  return result.value;
 }
 
 // Build environment for post-`group by` clauses. Injects `key` and `group`
@@ -674,8 +657,9 @@ function selectVal(v: LuaValue): LuaValue {
   return v === null || v === undefined ? LIQ_NULL : v;
 }
 
+// AFTER
 function unwrapAggregateValue(
-  v: LuaValue | AggregateResult,
+  v: AggregateResult,
   aggregateInstrumentation?: AggregateRuntimeInstrumentation,
 ): LuaValue {
   return mergeAggregateRuntimeStats(aggregateInstrumentation, v);
@@ -735,10 +719,7 @@ export async function evalExpressionWithAggregates(
         const sig = aggregateExprSignature(expr);
         const cached = aggregateEvalCache?.get(sig);
         if (cached) {
-          mergeAggregateRuntimeStatsOnce(
-            aggregateInstrumentation,
-            cached,
-          );
+          mergeAggregateRuntimeStatsOnce(aggregateInstrumentation, cached);
           return cached.value;
         }
 
@@ -759,17 +740,10 @@ export async function evalExpressionWithAggregates(
         );
 
         const value = unwrapAggregateValue(result, aggregateInstrumentation);
-        if (
-          aggregateEvalCache &&
-          typeof result === "object" &&
-          result !== null &&
-          "value" in result &&
-          Object.hasOwn(result, "value")
-        ) {
-          const ar = result as AggregateResult;
+        if (aggregateEvalCache) {
           aggregateEvalCache.set(sig, {
             value,
-            rowsFiltered: ar.rowsFiltered ?? 0,
+            rowsFiltered: result.rowsFiltered ?? 0,
             counted: true,
           });
         }
@@ -790,10 +764,7 @@ export async function evalExpressionWithAggregates(
         const sig = aggregateExprSignature(expr);
         const cached = aggregateEvalCache?.get(sig);
         if (cached) {
-          mergeAggregateRuntimeStatsOnce(
-            aggregateInstrumentation,
-            cached,
-          );
+          mergeAggregateRuntimeStatsOnce(aggregateInstrumentation, cached);
           return cached.value;
         }
 
@@ -814,17 +785,10 @@ export async function evalExpressionWithAggregates(
         );
 
         const value = unwrapAggregateValue(result, aggregateInstrumentation);
-        if (
-          aggregateEvalCache &&
-          typeof result === "object" &&
-          result !== null &&
-          "value" in result &&
-          Object.hasOwn(result, "value")
-        ) {
-          const ar = result as AggregateResult;
+        if (aggregateEvalCache) {
           aggregateEvalCache.set(sig, {
             value,
-            rowsFiltered: ar.rowsFiltered ?? 0,
+            rowsFiltered: result.rowsFiltered ?? 0,
             counted: true,
           });
         }
@@ -844,10 +808,7 @@ export async function evalExpressionWithAggregates(
         const sig = aggregateExprSignature(expr);
         const cached = aggregateEvalCache?.get(sig);
         if (cached) {
-          mergeAggregateRuntimeStatsOnce(
-            aggregateInstrumentation,
-            cached,
-          );
+          mergeAggregateRuntimeStatsOnce(aggregateInstrumentation, cached);
           return cached.value;
         }
 
@@ -868,17 +829,10 @@ export async function evalExpressionWithAggregates(
         );
 
         const value = unwrapAggregateValue(result, aggregateInstrumentation);
-        if (
-          aggregateEvalCache &&
-          typeof result === "object" &&
-          result !== null &&
-          "value" in result &&
-          Object.hasOwn(result, "value")
-        ) {
-          const ar = result as AggregateResult;
+        if (aggregateEvalCache) {
           aggregateEvalCache.set(sig, {
             value,
-            rowsFiltered: ar.rowsFiltered ?? 0,
+            rowsFiltered: result.rowsFiltered ?? 0,
             counted: true,
           });
         }
@@ -1104,7 +1058,10 @@ async function precomputeSortKeys(
           aggregateInstrumentation,
           aggregateEvalCache,
         );
-        void (item as LuaTable).rawSet("__aggregateEvalCache", aggregateEvalCache);
+        void (item as LuaTable).rawSet(
+          "__aggregateEvalCache",
+          aggregateEvalCache,
+        );
       } else {
         keys[j] = await evalExpression(orderBy[j].expr, itemEnv, sf);
       }
@@ -1250,7 +1207,8 @@ export async function applyQuery(
       stageStart,
       {
         rowsRemoved: Math.max(0, inputRows - results.length),
-        inlineFilteredRows: inlineFilteredRows > 0 ? inlineFilteredRows : undefined,
+        inlineFilteredRows:
+          inlineFilteredRows > 0 ? inlineFilteredRows : undefined,
       },
     );
   }
@@ -1400,7 +1358,10 @@ export async function applyQuery(
           aggregateInstrumentation,
           aggregateEvalCache,
         );
-        void (value as LuaTable).rawSet("__aggregateEvalCache", aggregateEvalCache);
+        void (value as LuaTable).rawSet(
+          "__aggregateEvalCache",
+          aggregateEvalCache,
+        );
       } else {
         const itemEnv = buildItemEnvLocal(query.objectVariable, value, env, sf);
         condResult = await evalExpression(query.having, itemEnv, sf);
@@ -1437,8 +1398,9 @@ export async function applyQuery(
       const itemEnv = mkEnv(query.objectVariable, item, env, sf);
       const groupTable = (item as LuaTable).rawGet("group");
       const aggregateEvalCache =
-        ((item as LuaTable).rawGet("__aggregateEvalCache") as AggregateEvalCache | undefined) ??
-        new Map<string, AggregateEvalCacheEntry>();
+        ((item as LuaTable).rawGet("__aggregateEvalCache") as
+          | AggregateEvalCache
+          | undefined) ?? new Map<string, AggregateEvalCacheEntry>();
       const selected = await evalExpressionWithAggregates(
         selectExpr,
         itemEnv,
@@ -1450,7 +1412,10 @@ export async function applyQuery(
         aggregateInstrumentation,
         aggregateEvalCache,
       );
-      void (item as LuaTable).rawSet("__aggregateEvalCache", aggregateEvalCache);
+      void (item as LuaTable).rawSet(
+        "__aggregateEvalCache",
+        aggregateEvalCache,
+      );
       selectResults.push(selected);
     }
     selectResults = normalizeSelectResults(selectResults);
@@ -1556,8 +1521,9 @@ export async function applyQuery(
         if (grouped) {
           const groupTable = (item as LuaTable).rawGet("group");
           const aggregateEvalCache =
-            ((item as LuaTable).rawGet("__aggregateEvalCache") as AggregateEvalCache | undefined) ??
-            new Map<string, AggregateEvalCacheEntry>();
+            ((item as LuaTable).rawGet("__aggregateEvalCache") as
+              | AggregateEvalCache
+              | undefined) ?? new Map<string, AggregateEvalCacheEntry>();
           newResult.push(
             await evalExpressionWithAggregates(
               selectExpr,
@@ -1571,7 +1537,10 @@ export async function applyQuery(
               aggregateEvalCache,
             ),
           );
-          void (item as LuaTable).rawSet("__aggregateEvalCache", aggregateEvalCache);
+          void (item as LuaTable).rawSet(
+            "__aggregateEvalCache",
+            aggregateEvalCache,
+          );
         } else {
           newResult.push(await evalSelectExpression(query.select, itemEnv, sf));
         }

@@ -667,8 +667,7 @@ export async function executeAggregate(
   config: Config,
   filterExpr?: LuaExpression,
   orderBy?: LuaOrderBy[],
-  instrumented?: boolean,
-): Promise<LuaValue | AggregateResult> {
+): Promise<AggregateResult> {
   const ctx = buildAggCtx(spec.name, config);
 
   // Evaluate extra args using the first item's env so that references
@@ -762,12 +761,8 @@ export async function executeAggregate(
     state = await luaCall(spec.finish, [state, ctx, ...extraArgs], noCtx, sf);
   }
 
-  if (instrumented) {
-    return {
-      value: state,
-      rowsFiltered: filterExpr ? rowsFiltered : undefined,
-    };
-  }
-
-  return state;
+  return {
+    value: state,
+    rowsFiltered: filterExpr ? rowsFiltered : undefined,
+  };
 }

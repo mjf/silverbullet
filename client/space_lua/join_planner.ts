@@ -4246,21 +4246,12 @@ export async function executeAndInstrument(
   return joinResult;
 }
 
-export async function attachAnalyzeQueryOpStats(
+export function attachAnalyzeQueryOpStats(
   plan: ExplainNode,
-  _query: {
-    objectVariable?: string;
-    groupBy?: { expr: LuaExpression; alias?: string }[];
-    having?: LuaExpression;
-    select?: LuaExpression;
-  },
   aggregateStats: AggregateRuntimeStats,
-): Promise<void> {
+): void {
   const aggregateFilterNode = findFirstAggregateFilterNode(plan);
-  if (!aggregateFilterNode) {
-    return;
-  }
-
+  if (!aggregateFilterNode) return;
   aggregateFilterNode.rowsRemovedByAggregateFilter =
     aggregateStats.rowsRemovedByAggregateFilter;
 }
