@@ -3162,7 +3162,7 @@ export function wrapPlanWithQueryOps(
       estimatedCost: root.estimatedCost,
       estimatedRows: Math.max(1, Math.round(root.estimatedRows * filterSel)),
       estimatedWidth: root.estimatedWidth,
-      filterExpr: exprToString(query.where),
+      filterExpr: formatOutputExpression(query.where, runtimeConfig),
       whereExpr: query.where,
       filterType: "where",
       statsSource: root.statsSource,
@@ -3184,7 +3184,7 @@ export function wrapPlanWithQueryOps(
   const allAggDescs = dedupeAggregateDescriptions(allAggDescsRaw);
 
   if (query.groupBy && query.groupBy.length > 0) {
-    const keys = query.groupBy.map((g) => g.alias ?? exprToString(g.expr));
+    const keys = query.groupBy.map((g) => g.alias ?? formatOutputExpression(g.expr, runtimeConfig));
     const ndvGroupRows = estimateGroupRowsFromNdv(
       root.estimatedRows,
       query.groupBy,
@@ -3219,7 +3219,7 @@ export function wrapPlanWithQueryOps(
       estimatedCost: root.estimatedCost,
       estimatedRows: Math.max(1, Math.round(root.estimatedRows * filterSel)),
       estimatedWidth: root.estimatedWidth,
-      filterExpr: exprToString(query.having),
+      filterExpr: formatOutputExpression(query.having, runtimeConfig),
       havingExpr: query.having,
       filterType: "having",
       statsSource: root.statsSource,
@@ -3297,7 +3297,7 @@ export function wrapPlanWithQueryOps(
 
   if (query.orderBy && query.orderBy.length > 0) {
     const keys = query.orderBy.map((o) => {
-      let s = exprToString(o.expr);
+      let s = formatOutputExpression(o.expr, runtimeConfig);
       if (o.desc) s += " desc";
       if (o.nulls) s += ` nulls ${o.nulls}`;
       if (o.using) {
@@ -3588,7 +3588,36 @@ export function exprToString(expr: LuaExpression): string {
     case "FunctionCall": {
       const prefix = exprToString(expr.prefix);
       const args = expr.args.map(exprToString).join(", ");
-      return `${prefix}(${args})`;
+      let s = `${prefix}(${args})`;
+      if (expr.orderBy && expr.orderBy.length > 0) {
+        const orderBy = expr.orderBy
+          .map((o) => {
+            let part = exprToString(o.expression);
+            if (o.direction === "desc") part += " desc";
+            if (o.nulls) part += ` nulls ${o.nulls}`;
+            return part;
+          })
+          .join(", ");
+        s += ` order by ${orderBy}`;
+      }
+      return s;
+    }
+    case "FilteredCall":
+      return `${exprToString(expr.call)} filter((${exprToString(expr.filter)}))`;
+    case "AggregateCall": {
+      let s = exprToString(expr.call);
+      if (expr.orderBy.length > 0) {
+        const orderBy = expr.orderBy
+          .map((o) => {
+            let part = exprToString(o.expression);
+            if (o.direction === "desc") part += " desc";
+            if (o.nulls) part += ` nulls ${o.nulls}`;
+            return part;
+          })
+          .join(", ");
+        s += ` order by ${orderBy}`;
+      }
+      return s;
     }
     case "TableAccess":
       return `${exprToString(expr.object)}[${exprToString(expr.key)}]`;
@@ -3596,6 +3625,23 @@ export function exprToString(expr: LuaExpression): string {
       return exprToString(expr.expression);
     case "FunctionDefinition":
       return "<anonymous>";
+    case "TableConstructor": {
+      const parts: string[] = [];
+      for (const field of expr.fields) {
+        switch (field.type) {
+          case "PropField":
+            parts.push(`${field.key} = ${exprToString(field.value)}`);
+            break;
+          case "DynamicField":
+            parts.push(`[${exprToString(field.key)}] = ${exprToString(field.value)}`);
+            break;
+          case "ExpressionField":
+            parts.push(exprToString(field.value));
+            break;
+        }
+      }
+      return `{ ${parts.join(", ")} }`;
+    }
     default:
       return "?";
   }
