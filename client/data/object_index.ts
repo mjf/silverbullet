@@ -491,10 +491,20 @@ export class ObjectIndex {
         }
         const rowCount = self.bitmapIndex.getRowCount(tagId);
         const meta = self.bitmapIndex.getTagMetaById(tagId);
+
+        const indexComplete = await self.hasFullIndexCompleted();
+        const statsSource = indexComplete
+          ? "persisted-complete"
+          : "persisted-partial";
+
+        // When the index is still building, NDV and MCV values are
+        // underestimated and would mislead the join planner into
+        // picking catastrophically wrong plans. Return empty maps
+        // so the planner falls back to row-count heuristics.
         const ndv = new Map<string, number>();
         const mcv = new Map<string, MCVList>();
 
-        if (meta) {
+        if (indexComplete && meta) {
           for (const [col, colMeta] of Object.entries(meta.columns)) {
             ndv.set(col, colMeta.ndv);
 
@@ -509,7 +519,6 @@ export class ObjectIndex {
           }
         }
 
-        const indexComplete = await self.hasFullIndexCompleted();
         return {
           rowCount,
           ndv,
@@ -518,9 +527,7 @@ export class ObjectIndex {
               ? Math.round(meta.totalColumnCount / rowCount)
               : 0,
           mcv: mcv.size > 0 ? mcv : undefined,
-          statsSource: indexComplete
-            ? "persisted-complete"
-            : "persisted-partial",
+          statsSource,
           executionCapabilities: {
             predicatePushdown: indexTrusted ? "bitmap-extended" : "none",
             scanKind: "index-scan",
