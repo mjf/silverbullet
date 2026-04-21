@@ -213,7 +213,7 @@ describe("ObjectIndex tag query", () => {
 // --- Stats ---
 
 describe("ObjectIndex stats", () => {
-  test("getStats returns row count and NDV", async () => {
+  test("getStats returns row count and NDV after full index completion", async () => {
     const { index } = createTestIndex();
 
     await index.indexObjects("P", [
@@ -222,13 +222,17 @@ describe("ObjectIndex stats", () => {
       { tag: "item", ref: "P@3", name: "C", page: "Q" },
     ]);
 
+    await index.markFullIndexComplete();
+
     const stats = await index.tag("item").getStats!();
     expect(stats).toBeDefined();
     expect(stats!.rowCount).toBe(3);
     // page column has 2 distinct values: P and Q
     expect(stats!.ndv.get("page")).toBe(2);
-    // name has high selectivity (3/3 = 1.0 > 0.5), so only 2 values
-    // were bitmap-indexed before the threshold kicked in
+    // The raw data has 3 distinct names, but persisted NDV comes from
+    // bitmap-indexed metadata. Because `name` is highly selective and not
+    // always-indexed, indexing is disabled once the selectivity threshold
+    // is exceeded, so the persisted NDV observed here is 2.
     expect(stats!.ndv.get("name")).toBe(2);
   });
 

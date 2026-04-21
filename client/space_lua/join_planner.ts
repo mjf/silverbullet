@@ -25,7 +25,12 @@ import {
   singleResult,
 } from "./runtime.ts";
 import { MCVList } from "./mcv.ts";
-import { getAggregateSpec } from "./aggregates.ts";
+import {
+  executeAggregate,
+  getAggregateSpec,
+  type AggregateResult,
+} from "./aggregates.ts";
+import { buildItemEnv } from "./query_env.ts";
 import type { Config } from "../config.ts";
 
 // 1. Constants
@@ -313,9 +318,12 @@ export type ExplainNode = {
   outputColumns?: string[];
   aggregates?: AggregateDescription[];
   implicitGroup?: boolean;
-  filterType?: "where" | "having";
+  filterType?: "where" | "having" | "aggregate";
   pushedDownFilter?: boolean;
   joinFilterType?: "join" | "join-residual";
+  sortType?: "query" | "group";
+  aggregateName?: string;
+  rowsRemovedByAggregateFilter?: number;
 
   selectivity?: number;
   ndvSource?:
@@ -3166,6 +3174,19 @@ export function wrapPlanWithQueryOps(
     };
   }
 
+  const allAggDescsRaw: AggregateDescription[] = [];
+  if (query.select) {
+    allAggDescsRaw.push(
+      ...collectAggregateDescriptions(query.select, runtimeConfig),
+    );
+  }
+  if (query.having) {
+    allAggDescsRaw.push(
+      ...collectAggregateDescriptions(query.having, runtimeConfig),
+    );
+  }
+  const allAggDescs = dedupeAggregateDescriptions(allAggDescsRaw);
+
   if (query.groupBy && query.groupBy.length > 0) {
     const keys = query.groupBy.map((g) => g.alias ?? exprToString(g.expr));
     const ndvGroupRows = estimateGroupRowsFromNdv(
@@ -3177,42 +3198,21 @@ export function wrapPlanWithQueryOps(
     const estimatedGroupRows =
       ndvGroupRows ?? Math.max(1, Math.round(root.estimatedRows * filterSel));
 
-    const aggDescs: AggregateDescription[] = [];
-    if (query.select) {
-      aggDescs.push(
-        ...collectAggregateDescriptions(query.select, runtimeConfig),
-      );
-    }
-    if (query.having) {
-      aggDescs.push(
-        ...collectAggregateDescriptions(query.having, runtimeConfig),
-      );
-    }
-
-    const seen = new Set<string>();
-    const uniqueAggs: AggregateDescription[] = [];
-    for (const agg of aggDescs) {
-      let sig = `${agg.name}(${agg.args})`;
-      if (agg.filter) sig += ` filter(${agg.filter})`;
-      if (agg.orderBy) sig += ` order by ${agg.orderBy}`;
-      if (!seen.has(sig)) {
-        seen.add(sig);
-        uniqueAggs.push(agg);
-      }
-    }
+    let groupInput = root;
+    groupInput = wrapAggregateLocalOps(groupInput, allAggDescs);
 
     root = {
       nodeType: "GroupAggregate",
-      startupCost: root.estimatedCost,
-      estimatedCost: root.estimatedCost + root.estimatedRows,
+      startupCost: groupInput.estimatedCost,
+      estimatedCost: groupInput.estimatedCost + groupInput.estimatedRows,
       estimatedRows: estimatedGroupRows,
-      estimatedWidth: root.estimatedWidth,
+      estimatedWidth: groupInput.estimatedWidth,
       sortKeys: keys,
       groupBySpec: query.groupBy,
-      aggregates: uniqueAggs.length > 0 ? uniqueAggs : undefined,
+      aggregates: allAggDescs.length > 0 ? allAggDescs : undefined,
       implicitGroup: query.groupBy.length === 0 ? true : undefined,
-      statsSource: root.statsSource,
-      children: [root],
+      statsSource: groupInput.statsSource,
+      children: [groupInput],
     };
   }
 
@@ -3239,19 +3239,25 @@ export function wrapPlanWithQueryOps(
 
   if (isImplicitAggregate) {
     const cols = collectOutputColumns(query.select!, runtimeConfig);
-    const aggDescs = collectAggregateDescriptions(query.select!, runtimeConfig);
+    const aggDescs = dedupeAggregateDescriptions(
+      collectAggregateDescriptions(query.select!, runtimeConfig),
+    );
+
+    let aggInput = root;
+    aggInput = wrapAggregateLocalOps(aggInput, aggDescs);
+
     root = {
       nodeType: "GroupAggregate",
-      startupCost: root.estimatedCost,
-      estimatedCost: root.estimatedCost + root.estimatedRows,
+      startupCost: aggInput.estimatedCost,
+      estimatedCost: aggInput.estimatedCost + aggInput.estimatedRows,
       estimatedRows: 1,
-      estimatedWidth: cols.length > 0 ? cols.length : root.estimatedWidth,
+      estimatedWidth: cols.length > 0 ? cols.length : aggInput.estimatedWidth,
       sortKeys: [],
       outputColumns: cols,
       aggregates: aggDescs.length > 0 ? aggDescs : undefined,
       implicitGroup: true,
-      statsSource: root.statsSource,
-      children: [root],
+      statsSource: aggInput.statsSource,
+      children: [aggInput],
     };
   }
 
@@ -3313,6 +3319,7 @@ export function wrapPlanWithQueryOps(
       estimatedRows: root.estimatedRows,
       estimatedWidth: root.estimatedWidth,
       sortKeys: keys,
+      sortType: "query",
       orderBySpec: query.orderBy.map((o) => ({
         expr: o.expr,
         desc: o.desc,
@@ -3776,47 +3783,89 @@ function walkAggregates(
 ): void {
   switch (expr.type) {
     case "FilteredCall": {
+      const innerBefore = out.length;
+      walkAggregates(expr.call, out, runtimeConfig);
+
+      if (out.length > innerBefore) {
+        const last = out[out.length - 1];
+        if (!last.filter) {
+          last.filter = exprToString(expr.filter);
+        }
+        return;
+      }
+
       const fc = expr.call;
       if (
         fc.prefix.type === "Variable" &&
         isAggregateFunctionName(fc.prefix.name, runtimeConfig)
       ) {
         const args = fc.args.map(exprToString).join(", ");
-        out.push({
+        const desc: AggregateDescription = {
           name: fc.prefix.name,
           args,
           filter: exprToString(expr.filter),
-        });
+        };
+        if (fc.orderBy && fc.orderBy.length > 0) {
+          desc.orderBy = fc.orderBy
+            .map((o) => {
+              let part = exprToString(o.expression);
+              if (o.direction === "desc") part += " desc";
+              if (o.nulls) part += ` nulls ${o.nulls}`;
+              return part;
+            })
+            .join(", ");
+        }
+        out.push(desc);
         return;
       }
-      walkAggregates(fc, out, runtimeConfig);
+
       walkAggregates(expr.filter, out, runtimeConfig);
       return;
     }
+
     case "AggregateCall": {
+      const innerBefore = out.length;
+      walkAggregates(expr.call, out, runtimeConfig);
+
+      if (out.length > innerBefore) {
+        const last = out[out.length - 1];
+        if (!last.orderBy && expr.orderBy.length > 0) {
+          last.orderBy = expr.orderBy
+            .map((o) => {
+              let part = exprToString(o.expression);
+              if (o.direction === "desc") part += " desc";
+              if (o.nulls) part += ` nulls ${o.nulls}`;
+              return part;
+            })
+            .join(", ");
+        }
+        return;
+      }
+
       const fc = expr.call;
       if (
         fc.prefix.type === "Variable" &&
         isAggregateFunctionName(fc.prefix.name, runtimeConfig)
       ) {
         const args = fc.args.map(exprToString).join(", ");
-        const ob = expr.orderBy
-          .map(
-            (o) =>
-              exprToString(o.expression) +
-              (o.direction === "desc" ? " desc" : ""),
-          )
-          .join(", ");
         out.push({
           name: fc.prefix.name,
           args,
-          orderBy: ob,
+          orderBy: expr.orderBy
+            .map((o) => {
+              let part = exprToString(o.expression);
+              if (o.direction === "desc") part += " desc";
+              if (o.nulls) part += ` nulls ${o.nulls}`;
+              return part;
+            })
+            .join(", "),
         });
         return;
       }
-      walkAggregates(fc, out, runtimeConfig);
+
       return;
     }
+
     case "FunctionCall": {
       if (
         expr.prefix.type === "Variable" &&
@@ -3826,11 +3875,12 @@ function walkAggregates(
         const desc: AggregateDescription = { name: expr.prefix.name, args };
         if (expr.orderBy && expr.orderBy.length > 0) {
           desc.orderBy = expr.orderBy
-            .map(
-              (o) =>
-                exprToString(o.expression) +
-                (o.direction === "desc" ? " desc" : ""),
-            )
+            .map((o) => {
+              let part = exprToString(o.expression);
+              if (o.direction === "desc") part += " desc";
+              if (o.nulls) part += ` nulls ${o.nulls}`;
+              return part;
+            })
             .join(", ");
         }
         out.push(desc);
@@ -3842,6 +3892,7 @@ function walkAggregates(
       }
       return;
     }
+
     case "Binary":
       walkAggregates(expr.left, out, runtimeConfig);
       walkAggregates(expr.right, out, runtimeConfig);
@@ -3869,6 +3920,75 @@ function walkAggregates(
     default:
       return;
   }
+}
+
+function dedupeAggregateDescriptions(
+  aggDescs: AggregateDescription[],
+): AggregateDescription[] {
+  const seen = new Set<string>();
+  const uniqueAggs: AggregateDescription[] = [];
+  for (const agg of aggDescs) {
+    let sig = `${agg.name}(${agg.args})`;
+    if (agg.filter) sig += ` filter(${agg.filter})`;
+    if (agg.orderBy) sig += ` order by ${agg.orderBy}`;
+    if (!seen.has(sig)) {
+      seen.add(sig);
+      uniqueAggs.push(agg);
+    }
+  }
+  return uniqueAggs;
+}
+
+function wrapAggregateLocalOps(
+  root: ExplainNode,
+  aggregates: AggregateDescription[] | undefined,
+): ExplainNode {
+  if (!aggregates || aggregates.length === 0) {
+    return root;
+  }
+
+  let wrapped = root;
+
+  const aggregatesWithOrder = aggregates.filter((agg) => !!agg.orderBy);
+  if (aggregatesWithOrder.length > 0) {
+    const sortKeys = aggregatesWithOrder.flatMap((agg) =>
+      agg.orderBy ? [agg.orderBy] : [],
+    );
+    wrapped = {
+      nodeType: "Sort",
+      startupCost: wrapped.startupCost,
+      estimatedCost: wrapped.estimatedCost + wrapped.estimatedRows,
+      estimatedRows: wrapped.estimatedRows,
+      estimatedWidth: wrapped.estimatedWidth,
+      sortKeys,
+      sortType: "group",
+      statsSource: wrapped.statsSource,
+      children: [wrapped],
+    };
+  }
+
+  const aggregatesWithFilter = aggregates.filter((agg) => !!agg.filter);
+  if (aggregatesWithFilter.length > 0) {
+    wrapped = {
+      nodeType: "Filter",
+      startupCost: wrapped.startupCost,
+      estimatedCost: wrapped.estimatedCost,
+      estimatedRows: wrapped.estimatedRows,
+      estimatedWidth: wrapped.estimatedWidth,
+      filterExpr: aggregatesWithFilter
+        .map((agg) => `${agg.name}(${agg.args}) filter(${agg.filter})`)
+        .join(", "),
+      filterType: "aggregate",
+      rowsRemovedByAggregateFilter: aggregatesWithFilter.reduce(
+        (sum, agg) => sum + (agg.rowsFiltered ?? 0),
+        0,
+      ),
+      statsSource: wrapped.statsSource,
+      children: [wrapped],
+    };
+  }
+
+  return wrapped;
 }
 
 function estimateGroupRowsFromNdv(
@@ -3908,6 +4028,339 @@ function estimateGroupRowsFromNdv(
   if (!foundAny) return undefined;
 
   return Math.max(1, Math.min(inputRows, Math.round(combinedNdv)));
+}
+
+type AggregateRuntimeProbe = {
+  rowsFiltered: number;
+};
+
+function isAggregateResult(value: unknown): value is AggregateResult {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "value" in value &&
+    Object.hasOwn(value, "value")
+  );
+}
+
+async function probeAggregateExpression(
+  expr: LuaExpression,
+  env: LuaEnv,
+  sf: LuaStackFrame,
+  groupItems: LuaTable,
+  objectVariable: string | undefined,
+  outerEnv: LuaEnv,
+  runtimeConfig: Config,
+): Promise<AggregateRuntimeProbe[]> {
+  const probes: AggregateRuntimeProbe[] = [];
+
+  const walk = async (node: LuaExpression): Promise<void> => {
+    switch (node.type) {
+      case "FilteredCall": {
+        const fc = node.call;
+        if (fc.prefix.type === "Variable") {
+          const spec = getAggregateSpec(fc.prefix.name, runtimeConfig);
+          if (spec) {
+            const valueExpr = fc.args.length > 0 ? fc.args[0] : null;
+            const extraArgExprs = fc.args.length > 1 ? fc.args.slice(1) : [];
+            const result = await executeAggregate(
+              spec,
+              groupItems,
+              valueExpr,
+              extraArgExprs,
+              objectVariable,
+              outerEnv,
+              sf,
+              evalExpression,
+              runtimeConfig,
+              node.filter,
+              fc.orderBy,
+              true,
+            );
+            if (isAggregateResult(result)) {
+              probes.push({
+                rowsFiltered: result.rowsFiltered ?? 0,
+              });
+            }
+            return;
+          }
+        }
+
+        await walk(node.call);
+        await walk(node.filter);
+        return;
+      }
+
+      case "AggregateCall": {
+        const fc = node.call;
+        if (fc.prefix.type === "Variable") {
+          const spec = getAggregateSpec(fc.prefix.name, runtimeConfig);
+          if (spec) {
+            const valueExpr = fc.args.length > 0 ? fc.args[0] : null;
+            const extraArgExprs = fc.args.length > 1 ? fc.args.slice(1) : [];
+            const result = await executeAggregate(
+              spec,
+              groupItems,
+              valueExpr,
+              extraArgExprs,
+              objectVariable,
+              outerEnv,
+              sf,
+              evalExpression,
+              runtimeConfig,
+              undefined,
+              node.orderBy,
+              true,
+            );
+            if (isAggregateResult(result)) {
+              probes.push({
+                rowsFiltered: result.rowsFiltered ?? 0,
+              });
+            }
+            return;
+          }
+        }
+
+        await walk(node.call);
+        return;
+      }
+
+      case "FunctionCall": {
+        if (
+          node.prefix.type === "Variable" &&
+          getAggregateSpec(node.prefix.name, runtimeConfig)
+        ) {
+          const spec = getAggregateSpec(node.prefix.name, runtimeConfig);
+          if (spec) {
+            const valueExpr = node.args.length > 0 ? node.args[0] : null;
+            const extraArgExprs = node.args.length > 1 ? node.args.slice(1) : [];
+            const result = await executeAggregate(
+              spec,
+              groupItems,
+              valueExpr,
+              extraArgExprs,
+              objectVariable,
+              outerEnv,
+              sf,
+              evalExpression,
+              runtimeConfig,
+              undefined,
+              node.orderBy,
+              true,
+            );
+            if (isAggregateResult(result)) {
+              probes.push({
+                rowsFiltered: result.rowsFiltered ?? 0,
+              });
+            }
+            return;
+          }
+        }
+
+        await walk(node.prefix);
+        for (const arg of node.args) {
+          await walk(arg);
+        }
+        return;
+      }
+
+      case "Binary":
+        await walk(node.left);
+        await walk(node.right);
+        return;
+
+      case "Unary":
+        await walk(node.argument);
+        return;
+
+      case "Parenthesized":
+        await walk(node.expression);
+        return;
+
+      case "TableConstructor":
+        for (const field of node.fields) {
+          switch (field.type) {
+            case "DynamicField":
+              await walk(field.key);
+              await walk(field.value);
+              break;
+            case "PropField":
+            case "ExpressionField":
+              await walk(field.value);
+              break;
+          }
+        }
+        return;
+
+      default:
+        return;
+    }
+  };
+
+  await walk(expr);
+  return probes;
+}
+
+function findFirstAggregateFilterNode(node: ExplainNode): ExplainNode | undefined {
+  if (node.nodeType === "Filter" && node.filterType === "aggregate") {
+    return node;
+  }
+  for (const child of node.children) {
+    const found = findFirstAggregateFilterNode(child);
+    if (found) return found;
+  }
+  return undefined;
+}
+
+async function attachAggregateAnalyzeStats(
+  plan: ExplainNode,
+  rows: LuaTable[],
+  query: {
+    objectVariable?: string;
+    groupBy?: { expr: LuaExpression; alias?: string }[];
+    having?: LuaExpression;
+    select?: LuaExpression;
+  },
+  env: LuaEnv,
+  sf: LuaStackFrame,
+  runtimeConfig: Config,
+): Promise<void> {
+  const aggregateFilterNode = findFirstAggregateFilterNode(plan);
+  if (!aggregateFilterNode) {
+    return;
+  }
+
+  const grouped = !!query.groupBy;
+  if (!grouped) {
+    if (!query.select && !query.having) return;
+
+    const groupItems = new LuaTable();
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i];
+      groupItems.rawSetArrayIndex(i + 1, row);
+    }
+
+    let totalRowsFiltered = 0;
+
+    if (query.select) {
+      const probes = await probeAggregateExpression(
+        query.select,
+        env,
+        sf,
+        groupItems,
+        query.objectVariable,
+        env,
+        runtimeConfig,
+      );
+      totalRowsFiltered += probes.reduce((sum, p) => sum + p.rowsFiltered, 0);
+    }
+
+    if (query.having) {
+      const probes = await probeAggregateExpression(
+        query.having,
+        env,
+        sf,
+        groupItems,
+        query.objectVariable,
+        env,
+        runtimeConfig,
+      );
+      totalRowsFiltered += probes.reduce((sum, p) => sum + p.rowsFiltered, 0);
+    }
+
+    aggregateFilterNode.rowsRemovedByAggregateFilter = totalRowsFiltered;
+    return;
+  }
+
+  let totalRowsFiltered = 0;
+
+  for (const row of rows) {
+    const groupTable = row.rawGet("group");
+    if (!(groupTable instanceof LuaTable)) {
+      continue;
+    }
+
+    const firstItem = groupTable.length > 0 ? groupTable.rawGet(1) : undefined;
+    const groupEnv = new LuaEnv(env);
+
+    groupEnv.setLocal("_", row);
+    if (query.objectVariable) {
+      groupEnv.setLocal(query.objectVariable, firstItem ?? row);
+    }
+    groupEnv.setLocal("key", row.rawGet("key"));
+    groupEnv.setLocal("group", groupTable);
+
+    if (firstItem instanceof LuaTable) {
+      for (const key of luaKeys(firstItem)) {
+        if (typeof key !== "string") continue;
+        groupEnv.setLocal(key, firstItem.rawGet(key));
+      }
+    } else if (typeof firstItem === "object" && firstItem !== null) {
+      for (const key of Object.keys(firstItem)) {
+        groupEnv.setLocal(key, (firstItem as any)[key]);
+      }
+    }
+
+    if (query.groupBy && query.groupBy.length > 0) {
+      const keyVal = row.rawGet("key");
+      if (keyVal instanceof LuaTable) {
+        for (const g of query.groupBy) {
+          const alias =
+            g.alias ??
+            (g.expr.type === "Variable"
+              ? g.expr.name
+              : g.expr.type === "PropertyAccess"
+                ? g.expr.property
+                : undefined);
+          if (!alias) continue;
+          const v = keyVal.rawGet(alias);
+          if (v !== undefined) {
+            groupEnv.setLocal(alias, v);
+          }
+        }
+      } else {
+        for (const g of query.groupBy) {
+          const alias =
+            g.alias ??
+            (g.expr.type === "Variable"
+              ? g.expr.name
+              : g.expr.type === "PropertyAccess"
+                ? g.expr.property
+                : undefined);
+          if (!alias) continue;
+          groupEnv.setLocal(alias, keyVal);
+        }
+      }
+    }
+
+    if (query.select) {
+      const probes = await probeAggregateExpression(
+        query.select,
+        groupEnv,
+        sf,
+        groupTable,
+        query.objectVariable,
+        env,
+        runtimeConfig,
+      );
+      totalRowsFiltered += probes.reduce((sum, p) => sum + p.rowsFiltered, 0);
+    }
+
+    if (query.having) {
+      const probes = await probeAggregateExpression(
+        query.having,
+        groupEnv,
+        sf,
+        groupTable,
+        query.objectVariable,
+        env,
+        runtimeConfig,
+      );
+      totalRowsFiltered += probes.reduce((sum, p) => sum + p.rowsFiltered, 0);
+    }
+  }
+
+  aggregateFilterNode.rowsRemovedByAggregateFilter = totalRowsFiltered;
 }
 
 // 22. Explain analyze execution
@@ -4075,6 +4528,29 @@ export async function executeAndInstrument(
   return joinResult;
 }
 
+export async function attachAnalyzeQueryOpStats(
+  plan: ExplainNode,
+  rows: LuaTable[],
+  query: {
+    objectVariable?: string;
+    groupBy?: { expr: LuaExpression; alias?: string }[];
+    having?: LuaExpression;
+    select?: LuaExpression;
+  },
+  env: LuaEnv,
+  sf: LuaStackFrame,
+  runtimeConfig: Config,
+): Promise<void> {
+  await attachAggregateAnalyzeStats(
+    plan,
+    rows,
+    query,
+    env,
+    sf,
+    runtimeConfig,
+  );
+}
+
 // 23. Explain formatting
 
 export function formatExplainOutput(
@@ -4164,7 +4640,11 @@ function formatNode(
 
   if (node.sortKeys && node.sortKeys.length > 0) {
     const keyLabel =
-      node.nodeType === "GroupAggregate" ? "Group Key" : "Sort Key";
+      node.nodeType === "GroupAggregate"
+        ? "Group Key"
+        : node.sortType === "group"
+          ? "Sort Key (Group)"
+          : "Sort Key";
     lines.push(`${detailPad}${keyLabel}: ${node.sortKeys.join(", ")}`);
   }
 
@@ -4198,11 +4678,14 @@ function formatNode(
       filterLabel = node.pushedDownFilter ? "Pushdown Filter" : "Filter";
     } else if (node.filterType === "having") {
       filterLabel = "Having Condition";
+    } else if (node.filterType === "aggregate") {
+      filterLabel = "Aggregate Filter";
     } else {
       filterLabel = "Filter";
     }
     lines.push(`${detailPad}${filterLabel}: ${node.filterExpr}`);
   }
+
   if (
     opts.analyze &&
     node.rowsRemovedByFilter !== undefined &&
@@ -4216,6 +4699,16 @@ function formatNode(
 
     lines.push(
       `${detailPad}${removedByFilterLabel}: ${node.rowsRemovedByFilter}`,
+    );
+  }
+
+  if (
+    opts.analyze &&
+    node.rowsRemovedByAggregateFilter !== undefined &&
+    node.rowsRemovedByAggregateFilter > 0
+  ) {
+    lines.push(
+      `${detailPad}Rows Removed by Aggregate Filter: ${node.rowsRemovedByAggregateFilter}`,
     );
   }
 
@@ -4330,7 +4823,9 @@ function formatNodeLabel(node: ExplainNode): string {
     case "FunctionScan":
       return `Function Scan on ${node.source}`;
     case "Filter":
-      return node.filterType === "having" ? "Filter (Having)" : "Filter";
+      if (node.filterType === "having") return "Filter (Having)";
+      if (node.filterType === "aggregate") return "Filter (Aggregate)";
+      return "Filter";
     case "HashJoin":
       return node.joinType && node.joinType !== "inner"
         ? `Hash ${node.joinType.charAt(0).toUpperCase() + node.joinType.slice(1)} Join`
@@ -4344,7 +4839,7 @@ function formatNodeLabel(node: ExplainNode): string {
         ? `Merge ${node.joinType.charAt(0).toUpperCase() + node.joinType.slice(1)} Join`
         : "Merge Join";
     case "Sort":
-      return "Sort";
+      return node.sortType === "group" ? "Sort (Group)" : "Sort";
     case "Limit":
       return "Limit";
     case "GroupAggregate":

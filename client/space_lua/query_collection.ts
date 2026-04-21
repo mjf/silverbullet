@@ -3,7 +3,11 @@ import type { KvKey } from "../../plug-api/types/datastore.ts";
 import { Config } from "../config.ts";
 import type { DataStore } from "../data/datastore.ts";
 import type { KvPrimitives } from "../data/kv_primitives.ts";
-import { executeAggregate, getAggregateSpec } from "./aggregates.ts";
+import {
+  executeAggregate,
+  getAggregateSpec,
+  type AggregateResult,
+} from "./aggregates.ts";
 import type {
   LuaAggregateCallExpression,
   LuaBinaryExpression,
@@ -620,6 +624,18 @@ function selectVal(v: LuaValue): LuaValue {
   return v === null || v === undefined ? LIQ_NULL : v;
 }
 
+function unwrapAggregateValue(v: LuaValue | AggregateResult): LuaValue {
+  if (
+    typeof v === "object" &&
+    v !== null &&
+    "value" in v &&
+    Object.hasOwn(v, "value")
+  ) {
+    return (v as AggregateResult).value;
+  }
+  return v as LuaValue;
+}
+
 /**
  * Evaluate an expression in aggregate-aware mode.
  *
@@ -709,20 +725,20 @@ export async function evalExpressionWithAggregates(
       switch (field.type) {
         case "PropField": {
           const pf = field as LuaPropField;
-          const value = await recurse(pf.value);
+          const value = unwrapAggregateValue(await recurse(pf.value));
           void table.set(pf.key, selectVal(value), sf);
           break;
         }
         case "DynamicField": {
           const df = field as LuaDynamicField;
           const key = await evalExpression(df.key, env, sf);
-          const value = await recurse(df.value);
+          const value = unwrapAggregateValue(await recurse(df.value));
           void table.set(key, selectVal(value), sf);
           break;
         }
         case "ExpressionField": {
           const ef = field as LuaExpressionField;
-          const value = await recurse(ef.value);
+          const value = unwrapAggregateValue(await recurse(ef.value));
           table.rawSetArrayIndex(nextArrayIndex, selectVal(value));
           nextArrayIndex++;
           break;
@@ -734,22 +750,24 @@ export async function evalExpressionWithAggregates(
   if (expr.type === "Binary") {
     const bin = expr as LuaBinaryExpression;
     if (bin.operator === "and") {
-      const left = singleResult(await recurse(bin.left));
+      const left = singleResult(unwrapAggregateValue(await recurse(bin.left)));
       if (!luaTruthy(left)) return left;
-      return singleResult(await recurse(bin.right));
+      return singleResult(unwrapAggregateValue(await recurse(bin.right)));
     }
     if (bin.operator === "or") {
-      const left = singleResult(await recurse(bin.left));
+      const left = singleResult(unwrapAggregateValue(await recurse(bin.left)));
       if (luaTruthy(left)) return left;
-      return singleResult(await recurse(bin.right));
+      return singleResult(unwrapAggregateValue(await recurse(bin.right)));
     }
-    const left = singleResult(await recurse(bin.left));
-    const right = singleResult(await recurse(bin.right));
+    const left = singleResult(unwrapAggregateValue(await recurse(bin.left)));
+    const right = singleResult(unwrapAggregateValue(await recurse(bin.right)));
     return luaOp(bin.operator, left, right, undefined, undefined, expr.ctx, sf);
   }
   if (expr.type === "Unary") {
     const un = expr as LuaUnaryExpression;
-    const arg = singleResult(await recurse(un.argument));
+    const arg = singleResult(
+      unwrapAggregateValue(await recurse(un.argument)),
+    );
     switch (un.operator) {
       case "-":
         return typeof arg === "number"
@@ -768,7 +786,7 @@ export async function evalExpressionWithAggregates(
   }
   if (expr.type === "Parenthesized") {
     const paren = expr as LuaParenthesizedExpression;
-    return singleResult(await recurse(paren.expression));
+    return singleResult(unwrapAggregateValue(await recurse(paren.expression)));
   }
   return evalExpression(expr, env, sf);
 }

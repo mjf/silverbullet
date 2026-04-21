@@ -1304,3 +1304,200 @@ describe("source with-hints in explain and planning", () => {
     expect(planB.estimatedCost).toBe(1000);
   });
 });
+
+describe("aggregate-local explain nodes", () => {
+  const basePlan: ExplainNode = {
+    nodeType: "Scan",
+    source: "t",
+    startupCost: 0,
+    estimatedCost: 100,
+    estimatedRows: 100,
+    estimatedWidth: 5,
+    children: [],
+  };
+
+  it("adds Filter (Aggregate) node for aggregate filter clause", () => {
+    const wrapped = wrapPlanWithQueryOps(
+      basePlan,
+      {
+        select: parseExpressionString(
+          "{ total = sum(t.v) filter(where t.v > 10) }",
+        ),
+      },
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+    );
+
+    expect(wrapped.nodeType).toBe("Project");
+    expect(wrapped.children).toHaveLength(1);
+
+    const aggNode = wrapped.children[0];
+    expect(aggNode.nodeType).toBe("GroupAggregate");
+    expect(aggNode.children).toHaveLength(1);
+
+    const filterNode = aggNode.children[0];
+    expect(filterNode.nodeType).toBe("Filter");
+    expect(filterNode.filterType).toBe("aggregate");
+    expect(filterNode.filterExpr).toContain("sum(t.v) filter((t.v > 10))");
+  });
+
+  it("renders Filter (Aggregate) in explain output", () => {
+    const wrapped = wrapPlanWithQueryOps(
+      basePlan,
+      {
+        select: parseExpressionString(
+          "{ total = sum(t.v) filter(where t.v > 10) }",
+        ),
+      },
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+    );
+
+    const rendered = formatExplainOutput(
+      {
+        plan: wrapped,
+        planningTimeMs: 0,
+      },
+      {
+        analyze: false,
+        verbose: true,
+        summary: false,
+        costs: true,
+        timing: false,
+        hints: false,
+      },
+    );
+
+    expect(rendered.includes("Filter (Aggregate)")).toBe(true);
+    expect(rendered.includes("Aggregate Filter: sum(t.v) filter((t.v > 10))")).toBe(
+      true,
+    );
+  });
+
+  it("adds Sort (Group) node for aggregate-local order by", () => {
+    const wrapped = wrapPlanWithQueryOps(
+      basePlan,
+      {
+        select: parseExpressionString(
+          "{ xs = array_agg(t.v order by t.k desc) }",
+        ),
+      },
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+    );
+
+    expect(wrapped.nodeType).toBe("Project");
+    expect(wrapped.children).toHaveLength(1);
+
+    const aggNode = wrapped.children[0];
+    expect(aggNode.nodeType).toBe("GroupAggregate");
+    expect(aggNode.children).toHaveLength(1);
+
+    const sortNode = aggNode.children[0];
+    expect(sortNode.nodeType).toBe("Sort");
+    expect(sortNode.sortType).toBe("group");
+    expect(sortNode.sortKeys).toEqual(["t.k desc"]);
+  });
+
+  it("renders Sort (Group) in explain output", () => {
+    const wrapped = wrapPlanWithQueryOps(
+      basePlan,
+      {
+        select: parseExpressionString(
+          "{ xs = array_agg(t.v order by t.k desc) }",
+        ),
+      },
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+    );
+
+    const rendered = formatExplainOutput(
+      {
+        plan: wrapped,
+        planningTimeMs: 0,
+      },
+      {
+        analyze: false,
+        verbose: true,
+        summary: false,
+        costs: true,
+        timing: false,
+        hints: false,
+      },
+    );
+
+    expect(rendered.includes("Sort (Group)")).toBe(true);
+    expect(rendered.includes("Sort Key (Group): t.k desc")).toBe(true);
+  });
+
+  it("nests aggregate filter above group sort when both are present", () => {
+    const wrapped = wrapPlanWithQueryOps(
+      basePlan,
+      {
+        select: parseExpressionString(
+          "{ xs = array_agg(t.v order by t.k asc) filter(where t.keep == true) }",
+        ),
+      },
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+    );
+
+    expect(wrapped.nodeType).toBe("Project");
+    const aggNode = wrapped.children[0];
+    expect(aggNode.nodeType).toBe("GroupAggregate");
+
+    const filterNode = aggNode.children[0];
+    expect(filterNode.nodeType).toBe("Filter");
+    expect(filterNode.filterType).toBe("aggregate");
+
+    const sortNode = filterNode.children[0];
+    expect(sortNode.nodeType).toBe("Sort");
+    expect(sortNode.sortType).toBe("group");
+    expect(sortNode.sortKeys).toEqual(["t.k"]);
+  });
+
+  it("renders aggregate-local sort and filter together", () => {
+    const wrapped = wrapPlanWithQueryOps(
+      basePlan,
+      {
+        select: parseExpressionString(
+          "{ xs = array_agg(t.v order by t.k asc) filter(where t.keep == true) }",
+        ),
+      },
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+    );
+
+    const rendered = formatExplainOutput(
+      {
+        plan: wrapped,
+        planningTimeMs: 0,
+      },
+      {
+        analyze: false,
+        verbose: true,
+        summary: false,
+        costs: true,
+        timing: false,
+        hints: false,
+      },
+    );
+
+    expect(rendered.includes("Filter (Aggregate)")).toBe(true);
+    expect(rendered.includes("Aggregate Filter:")).toBe(true);
+    expect(rendered.includes("Sort (Group)")).toBe(true);
+    expect(rendered.includes("Sort Key (Group): t.k")).toBe(true);
+  });
+});
