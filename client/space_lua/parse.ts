@@ -167,8 +167,8 @@ function expressionHasFunctionDef(e: LuaExpression): boolean {
               }
             }
             break;
-	  case "Explain":
-	    break;
+          case "Explain":
+            break;
         }
       }
       return false;
@@ -288,8 +288,8 @@ function exprReferencesNames(e: LuaExpression, names: Set<string>): boolean {
               }
             }
             break;
-	  case "Explain":
-	    break;
+          case "Explain":
+            break;
         }
       }
       return false;
@@ -1326,15 +1326,49 @@ function parseExpression(t: ParseTree, ctx: ASTCtx): LuaExpression {
       const clauses = t
         .children!.slice(2, -1)
         .map((c) => parseQueryClause(c, ctx));
-      const hasLeading = clauses.some((c) => c.type === "Leading");
-      if (hasLeading) {
-        const fromClause = clauses.find((c) => c.type === "From");
+
+      const fromClause = clauses.find((c) => c.type === "From");
+      const leadingClauses = clauses.filter((c) => c.type === "Leading");
+
+      if (leadingClauses.length > 1) {
+        throw new Error("query may contain at most one 'leading' clause");
+      }
+
+      if (leadingClauses.length > 0) {
         if (!fromClause || fromClause.fields.length < 2) {
           throw new Error(
             "'leading' only valid for multi-source 'from' clause",
           );
         }
+
+        const leadingClause = leadingClauses[0];
+        if (leadingClause.fields.length === 0) {
+          throw new Error("'leading' requires at least one source name");
+        }
+
+        const fromNames = new Set<string>();
+        for (const f of fromClause.fields) {
+          if (f.type !== "PropField") {
+            throw new Error(
+              "'leading' requires multi-source 'from' entries to use explicit source names",
+            );
+          }
+          fromNames.add(f.key);
+        }
+
+        const seen = new Set<string>();
+        for (const f of leadingClause.fields) {
+          const name = getLeadingNameFromField(f);
+          if (seen.has(name)) {
+            throw new Error(`duplicate source '${name}' in 'leading' clause`);
+          }
+          seen.add(name);
+          if (!fromNames.has(name)) {
+            throw new Error(`unknown source '${name}' in 'leading' clause`);
+          }
+        }
       }
+
       return {
         type: "Query",
         clauses,
@@ -1369,6 +1403,13 @@ function parseFieldList(t: ParseTree, ctx: ASTCtx): LuaTableField[] {
         c.type === "FieldDynamic",
     )
     .map((c) => parseTableField(c, ctx));
+}
+
+function getLeadingNameFromField(field: LuaTableField): string {
+  if (field.type === "ExpressionField" && field.value.type === "Variable") {
+    return field.value.name;
+  }
+  throw new Error("'leading' entries must be source names");
 }
 
 function parseQueryClause(t: ParseTree, ctx: ASTCtx): LuaQueryClause {
@@ -1489,8 +1530,8 @@ function parseQueryClause(t: ParseTree, ctx: ASTCtx): LuaQueryClause {
       };
 
       const parseBoolValue = (node: ParseTree): boolean => {
-        const text = node.children?.[0]?.children?.[0]?.text
-          ?? node.children?.[0]?.text;
+        const text =
+          node.children?.[0]?.children?.[0]?.text ?? node.children?.[0]?.text;
         return text !== "false" && text !== "off" && text !== "0";
       };
 
@@ -1501,8 +1542,9 @@ function parseQueryClause(t: ParseTree, ctx: ASTCtx): LuaQueryClause {
         const valNode = child.children?.find(
           (c) => c.type === "ExplainBoolValue",
         );
-        const name = nameNode?.children?.[0]?.children?.[0]?.text
-          ?? nameNode?.children?.[0]?.text;
+        const name =
+          nameNode?.children?.[0]?.children?.[0]?.text ??
+          nameNode?.children?.[0]?.text;
         if (name && name in options) {
           explicit.add(name);
           options[name] = valNode ? parseBoolValue(valNode) : true;
@@ -1515,9 +1557,7 @@ function parseQueryClause(t: ParseTree, ctx: ASTCtx): LuaQueryClause {
         }
       }
 
-      const optList = t.children!.find(
-        (c) => c.type === "ExplainOptionList",
-      );
+      const optList = t.children!.find((c) => c.type === "ExplainOptionList");
       if (optList) {
         for (const child of optList.children!) {
           if (child.type === "ExplainParenEntry") {
@@ -1581,16 +1621,18 @@ function parseJoinHint(t: ParseTree, ctx: ASTCtx): LuaJoinHint {
 
   const visit = (node: ParseTree) => {
     if (node.type === "JoinType") {
-      const text = node.children?.[0]?.children?.[0]?.text
-        ?? node.children?.[0]?.text
-        ?? node.text;
+      const text =
+        node.children?.[0]?.children?.[0]?.text ??
+        node.children?.[0]?.text ??
+        node.text;
       if (text === "inner" || text === "semi" || text === "anti") {
         joinType = text;
       }
     } else if (node.type === "JoinMethod") {
-      const text = node.children?.[0]?.children?.[0]?.text
-        ?? node.children?.[0]?.text
-        ?? node.text;
+      const text =
+        node.children?.[0]?.children?.[0]?.text ??
+        node.children?.[0]?.text ??
+        node.text;
       if (text === "hash" || text === "loop" || text === "merge") {
         kind = text;
       }
@@ -1646,17 +1688,16 @@ function parseFromFieldList(t: ParseTree, ctx: ASTCtx): LuaFromField[] {
       const joinHintNode = c.children?.find((ch) => ch.type === "JoinHint");
       const withNode = c.children?.find((ch) => ch.type === "WithClause");
 
-      const baseChildren = c.children!.filter((ch) =>
-        ch.type !== "materialized" &&
-        ch.type !== "JoinHint" &&
-        ch.type !== "WithClause"
+      const baseChildren = c.children!.filter(
+        (ch) =>
+          ch.type !== "materialized" &&
+          ch.type !== "JoinHint" &&
+          ch.type !== "WithClause",
       );
 
       const baseNode = {
         ...c,
-        type: materialized
-          ? fieldType.replace("Materialized", "")
-          : fieldType,
+        type: materialized ? fieldType.replace("Materialized", "") : fieldType,
         children: baseChildren,
       } as ParseTree;
 
@@ -1698,12 +1739,14 @@ function parseWithClause(t: ParseTree): LuaWithHints {
     const nameNode = entry.children?.find((c) => c.type === "WithOptionName");
     const valueNode = entry.children?.find((c) => c.type === "WithValue");
 
-    const key = nameNode?.children?.[0]?.children?.[0]?.text
-      ?? nameNode?.children?.[0]?.text
-      ?? nameNode?.text;
-    const valueText = valueNode?.children?.[0]?.children?.[0]?.text
-      ?? valueNode?.children?.[0]?.text
-      ?? valueNode?.text;
+    const key =
+      nameNode?.children?.[0]?.children?.[0]?.text ??
+      nameNode?.children?.[0]?.text ??
+      nameNode?.text;
+    const valueText =
+      valueNode?.children?.[0]?.children?.[0]?.text ??
+      valueNode?.children?.[0]?.text ??
+      valueNode?.text;
 
     if (!key || !valueText) {
       throw new Error("with entry requires a name and numeric value");

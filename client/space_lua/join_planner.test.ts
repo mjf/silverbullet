@@ -26,6 +26,20 @@ function analyzeOpts() {
   } as const;
 }
 
+function leafNamesInOrder(tree: any): string[] {
+  const out: string[] = [];
+  const walk = (n: any) => {
+    if (n.kind === "leaf") {
+      out.push(n.source.name);
+      return;
+    }
+    walk(n.left);
+    walk(n.right);
+  };
+  walk(tree);
+  return out;
+}
+
 describe("wrapPlanWithQueryOps group NDV", () => {
   it("prefers accumulated post-join NDV over leaf source NDV", () => {
     const plan: ExplainNode = {
@@ -329,6 +343,130 @@ function testEnvWithSources(bindings: Record<string, any[]>): LuaEnv {
   }
   return env;
 }
+
+describe("leading join order hints", () => {
+  it("leading forces prefix while the remaining suffix is still optimized", () => {
+    const sources: JoinSource[] = [
+      {
+        ...makeSource("a"),
+        stats: {
+          ...makeSource("a").stats!,
+          rowCount: 1000,
+        },
+      },
+      {
+        ...makeSource("b"),
+        stats: {
+          ...makeSource("b").stats!,
+          rowCount: 5,
+        },
+      },
+      {
+        ...makeSource("c"),
+        stats: {
+          ...makeSource("c").stats!,
+          rowCount: 900,
+        },
+      },
+      {
+        ...makeSource("d"),
+        stats: {
+          ...makeSource("d").stats!,
+          rowCount: 10,
+        },
+      },
+    ];
+
+    const tree = buildJoinTree(sources, ["a", "c"]);
+    const order = leafNamesInOrder(tree);
+
+    expect(order.slice(0, 2)).toEqual(["a", "c"]);
+    expect(order.slice(2)).toEqual(["b", "d"]);
+  });
+
+  it("leading full list fixes the complete join order", () => {
+    const sources: JoinSource[] = [
+      {
+        ...makeSource("a"),
+        stats: {
+          ...makeSource("a").stats!,
+          rowCount: 1000,
+        },
+      },
+      {
+        ...makeSource("b"),
+        stats: {
+          ...makeSource("b").stats!,
+          rowCount: 5,
+        },
+      },
+      {
+        ...makeSource("c"),
+        stats: {
+          ...makeSource("c").stats!,
+          rowCount: 900,
+        },
+      },
+    ];
+
+    const tree = buildJoinTree(sources, ["c", "a", "b"]);
+    const order = leafNamesInOrder(tree);
+
+    expect(order).toEqual(["c", "a", "b"]);
+  });
+
+  it("leading preserves prefix and still allows hinted suffix choice", () => {
+    const sources: JoinSource[] = [
+      {
+        ...makeSource("a"),
+        stats: {
+          ...makeSource("a").stats!,
+          rowCount: 100,
+        },
+      },
+      {
+        ...makeSource("b"),
+        stats: {
+          ...makeSource("b").stats!,
+          rowCount: 1000,
+        },
+      },
+      {
+        ...makeSource("c"),
+        hint: {
+          type: "JoinHint",
+          kind: "loop",
+          ctx: {} as any,
+        },
+        stats: {
+          ...makeSource("c").stats!,
+          rowCount: 2,
+        },
+      },
+    ];
+
+    const tree = buildJoinTree(sources, ["a"]);
+    const order = leafNamesInOrder(tree);
+
+    expect(order[0]).toBe("a");
+    expect(order.slice(1)).toEqual(["c", "b"]);
+
+    const joins: any[] = [];
+    const collect = (n: any) => {
+      if (n.kind === "join") {
+        joins.push(n);
+        collect(n.left);
+        collect(n.right);
+      }
+    };
+    collect(tree);
+
+    const joinWithC = joins.find(
+      (j) => j.right.kind === "leaf" && j.right.source.name === "c",
+    );
+    expect(joinWithC?.method).toBe("loop");
+  });
+});
 
 describe("join residual predicate stripping and explain", () => {
   it("strips consumed equi and cross-source residual predicates from WHERE", () => {
@@ -1538,12 +1676,9 @@ describe("aggregate filter analyze stats", () => {
       new Config(),
     );
 
-    attachAnalyzeQueryOpStats(
-      plan,
-      {
-        rowsRemovedByAggregateFilter: 3,
-      },
-    );
+    attachAnalyzeQueryOpStats(plan, {
+      rowsRemovedByAggregateFilter: 3,
+    });
 
     const aggNode = plan.children[0];
     expect(aggNode.nodeType).toBe("GroupAggregate");
@@ -1580,12 +1715,9 @@ describe("aggregate filter analyze stats", () => {
       new Config(),
     );
 
-    await attachAnalyzeQueryOpStats(
-      plan,
-      {
-        rowsRemovedByAggregateFilter: 3,
-      },
-    );
+    await attachAnalyzeQueryOpStats(plan, {
+      rowsRemovedByAggregateFilter: 3,
+    });
 
     const projectNode = plan;
     expect(projectNode.nodeType).toBe("Project");
@@ -1657,12 +1789,9 @@ describe("aggregate filter analyze stats", () => {
       0,
     );
 
-    await attachAnalyzeQueryOpStats(
-      wrapped,
-      {
-        rowsRemovedByAggregateFilter: 3,
-      },
-    );
+    await attachAnalyzeQueryOpStats(wrapped, {
+      rowsRemovedByAggregateFilter: 3,
+    });
 
     const rendered = formatExplainOutput(
       {

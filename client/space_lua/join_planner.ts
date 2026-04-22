@@ -11,7 +11,11 @@ import type {
   LuaWithHints,
 } from "./ast.ts";
 import { evalExpression, luaTableToArray } from "./eval.ts";
-import type { AggregateRuntimeStats, CollectionStats, StatsSource } from "./query_collection.ts";
+import type {
+  AggregateRuntimeStats,
+  CollectionStats,
+  StatsSource,
+} from "./query_collection.ts";
 import {
   LuaEnv,
   LuaFunction,
@@ -25,9 +29,7 @@ import {
   singleResult,
 } from "./runtime.ts";
 import { MCVList } from "./mcv.ts";
-import {
-  getAggregateSpec,
-} from "./aggregates.ts";
+import { getAggregateSpec } from "./aggregates.ts";
 import type { Config } from "../config.ts";
 
 // 1. Constants
@@ -279,6 +281,7 @@ export type ExplainNode = {
   method?: "hash" | "loop" | "merge";
   hintUsed?: string;
   sourceHints?: string[];
+  leadingHint?: string[];
   startupCost: number;
   estimatedCost: number;
   estimatedRows: number;
@@ -1074,41 +1077,98 @@ function orderSources(
   rangePreds?: RangePredicate[],
   config?: JoinPlannerConfig,
 ): JoinSource[] {
+  const hasExplicitJoinHint = sources.some((s) => !!s.hint);
+  if (!leading?.length && hasExplicitJoinHint) {
+    return [...sources];
+  }
+
+  if (!leading?.length && shouldAvoidAggressiveReordering(sources)) {
+    return [...sources];
+  }
+
+  const byName = new Map(sources.map((s) => [s.name, s]));
+  const ordered: JoinSource[] = [];
+
   if (leading && leading.length > 0) {
-    const byName = new Map(sources.map((s) => [s.name, s]));
-    const ordered: JoinSource[] = [];
     for (const n of leading) {
       const s = byName.get(n);
-      if (s) {
-        ordered.push(s);
-        byName.delete(n);
+      if (!s) {
+        throw new Error(`unknown source '${n}' in leading clause`);
       }
-    }
-    for (const s of byName.values()) {
       ordered.push(s);
+      byName.delete(n);
     }
-    return ordered;
   }
 
-  const hasExplicitJoinHint = sources.some((s) => !!s.hint);
-  if (hasExplicitJoinHint) {
-    return [...sources];
+  const remaining = [...byName.values()];
+
+  if (ordered.length === 0) {
+    remaining.sort((a, b) => estimatedRows(a) - estimatedRows(b));
+    ordered.push(remaining.shift()!);
   }
 
-  if (shouldAvoidAggressiveReordering(sources)) {
-    return [...sources];
-  }
-
-  const remaining = [...sources];
-  remaining.sort((a, b) => estimatedRows(a) - estimatedRows(b));
-
-  const ordered = [remaining.shift()!];
   let joinedNames = new Set<string>([ordered[0].name]);
   let joinedRows = estimatedRows(ordered[0]);
   let joinedWidth = estimatedWidth(ordered[0]);
   let joinedNdv = getNodeNdv({ kind: "leaf", source: ordered[0] });
   let joinedMcv = getNodeMcv({ kind: "leaf", source: ordered[0] });
   let joinedStatsSource = ordered[0].stats?.statsSource;
+
+  const advanceJoinedState = (candidate: JoinSource) => {
+    const joinType = candidate.hint?.joinType ?? "inner";
+
+    const { equiPred, outputRows } = estimateJoinWithCandidate(
+      joinedNames,
+      joinedRows,
+      joinedNdv,
+      joinedMcv,
+      candidate,
+      equiPreds,
+      rangePreds,
+      joinType,
+      joinedStatsSource,
+      config,
+    );
+
+    joinedRows = outputRows;
+    joinedWidth += estimatedWidth(candidate);
+    joinedNdv = propagateJoinNdv(
+      joinedNdv,
+      candidate.stats?.ndv ?? new Map(),
+      candidate.name,
+      joinType,
+      equiPred,
+      outputRows,
+    );
+    joinedMcv = propagateJoinMcv(
+      joinedMcv,
+      candidate.stats?.mcv,
+      candidate.name,
+      joinType,
+      equiPred,
+      joinedNdv,
+      candidate.stats?.ndv ?? new Map(),
+    );
+
+    const nextSummary = summarizeJoinStatsSource(
+      joinedStatsSource,
+      candidate.stats?.statsSource,
+    );
+    joinedStatsSource =
+      nextSummary === "exact"
+        ? "persisted-complete"
+        : nextSummary === "partial"
+          ? "persisted-partial"
+          : nextSummary === "approximate"
+            ? "computed-sketch-large"
+            : undefined;
+
+    joinedNames = new Set([...joinedNames, candidate.name]);
+  };
+
+  for (let i = 1; i < ordered.length; i++) {
+    advanceJoinedState(ordered[i]);
+  }
 
   while (remaining.length > 0) {
     let bestIdx = 0;
@@ -3146,6 +3206,7 @@ export function wrapPlanWithQueryOps(
     having?: LuaExpression;
     select?: LuaExpression;
     distinct?: boolean;
+    leading?: string[];
   },
   sourceStats?: Map<string, CollectionStats>,
   accumulatedNdv?: Map<string, Map<string, number>>,
@@ -3184,7 +3245,9 @@ export function wrapPlanWithQueryOps(
   const allAggDescs = dedupeAggregateDescriptions(allAggDescsRaw);
 
   if (query.groupBy && query.groupBy.length > 0) {
-    const keys = query.groupBy.map((g) => g.alias ?? formatOutputExpression(g.expr, runtimeConfig));
+    const keys = query.groupBy.map(
+      (g) => g.alias ?? formatOutputExpression(g.expr, runtimeConfig),
+    );
     const ndvGroupRows = estimateGroupRowsFromNdv(
       root.estimatedRows,
       query.groupBy,
@@ -3370,6 +3433,10 @@ export function wrapPlanWithQueryOps(
       statsSource: root.statsSource,
       children: [root],
     };
+  }
+
+  if (query.leading && query.leading.length > 0) {
+    root.leadingHint = [...query.leading];
   }
 
   return root;
@@ -3633,7 +3700,9 @@ export function exprToString(expr: LuaExpression): string {
             parts.push(`${field.key} = ${exprToString(field.value)}`);
             break;
           case "DynamicField":
-            parts.push(`[${exprToString(field.key)}] = ${exprToString(field.value)}`);
+            parts.push(
+              `[${exprToString(field.key)}] = ${exprToString(field.value)}`,
+            );
             break;
           case "ExpressionField":
             parts.push(exprToString(field.value));
@@ -4462,6 +4531,10 @@ function formatNode(
 
     if (node.hintUsed) {
       lines.push(`${detailPad}Join Hint: ${node.hintUsed}`);
+    }
+
+    if (opts.hints && node.leadingHint && node.leadingHint.length > 0) {
+      lines.push(`${detailPad}Leading: ${node.leadingHint.join(", ")}`);
     }
 
     if (opts.hints && node.sourceHints && node.sourceHints.length > 0) {

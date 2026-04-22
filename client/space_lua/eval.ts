@@ -1432,7 +1432,7 @@ export function evalExpression(
                 return f.value.name;
               }
               throw new LuaRuntimeError(
-                "'plan order by' fields must be source names",
+                "'leading' fields must be source names",
                 sf.withCtx(planClause!.ctx),
               );
             });
@@ -1539,7 +1539,8 @@ export function evalExpression(
 
               // Can the source handle filtering natively?
               const canDelegate =
-                src.stats?.executionCapabilities?.predicatePushdown !== "none" &&
+                src.stats?.executionCapabilities?.predicatePushdown !==
+                  "none" &&
                 val &&
                 typeof val === "object" &&
                 "query" in val &&
@@ -1591,7 +1592,7 @@ export function evalExpression(
               const filteredStats = computeStatsFromArray(filtered);
 
               // Preserve bitmap-index NDV/MCV when available,
-	      // capped to filtered row count
+              // capped to filtered row count
               const filteredRowCount = filteredStats.rowCount;
               let finalNdv = filteredStats.ndv;
               let finalMcv = filteredStats.mcv;
@@ -1740,7 +1741,10 @@ export function evalExpression(
                   explainOpts,
                   pushedFilterExprBySource,
                 ),
-                explainQuery,
+                {
+                  ...explainQuery,
+                  leading: planOrder,
+                },
                 explainSourceStats,
                 joinRootNdv,
                 plannerConfig,
@@ -1786,11 +1790,12 @@ export function evalExpression(
                   stageStats.push(stat);
                 },
               };
-              const aggregateInstrumentation: AggregateRuntimeInstrumentation = {
-                stats: {
-                  rowsRemovedByAggregateFilter: 0,
-                },
-              };
+              const aggregateInstrumentation: AggregateRuntimeInstrumentation =
+                {
+                  stats: {
+                    rowsRemovedByAggregateFilter: 0,
+                  },
+                };
 
               const finalRows = await (joinedCollection as any).query(
                 analyzeQuery,
@@ -1942,11 +1947,12 @@ export function evalExpression(
                   stageStats.push(stat);
                 },
               };
-              const aggregateInstrumentation: AggregateRuntimeInstrumentation = {
-                stats: {
-                  rowsRemovedByAggregateFilter: 0,
-                },
-              };
+              const aggregateInstrumentation: AggregateRuntimeInstrumentation =
+                {
+                  stats: {
+                    rowsRemovedByAggregateFilter: 0,
+                  },
+                };
 
               const finalRows = await (collection as any).query(
                 query,
