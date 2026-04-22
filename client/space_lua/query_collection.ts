@@ -271,17 +271,6 @@ function emitStageStat(
   });
 }
 
-// AFTER
-function mergeAggregateRuntimeStats(
-  target: AggregateRuntimeInstrumentation | undefined,
-  result: AggregateResult,
-): LuaValue {
-  if (target) {
-    target.stats.rowsRemovedByAggregateFilter += result.rowsFiltered ?? 0;
-  }
-  return result.value;
-}
-
 // Build environment for post-`group by` clauses. Injects `key` and `group`
 // as top-level variables. Unpacks first group item fields and group-by key
 // fields as locals so that bare field access works after grouping.
@@ -645,10 +634,175 @@ type AggregateEvalCacheEntry = {
   counted: boolean;
 };
 
+type AggregateEvalContext = {
+  cache: AggregateEvalCache;
+};
+
+type GroupedValue = {
+  item: LuaTable;
+  aggregateCtx: AggregateEvalContext;
+};
+
 export type AggregateEvalCache = Map<string, AggregateEvalCacheEntry>;
 
-function aggregateExprSignature(expr: LuaExpression): string {
-  return JSON.stringify(expr);
+function isGroupedValue(item: any): item is GroupedValue {
+  return (
+    !!item &&
+    typeof item === "object" &&
+    "item" in item &&
+    item.item instanceof LuaTable &&
+    "aggregateCtx" in item
+  );
+}
+
+function unwrapGroupedItem(item: any): LuaTable {
+  return isGroupedValue(item) ? item.item : item;
+}
+
+function getGroupedAggregateContext(
+  item: any,
+): AggregateEvalContext | undefined {
+  return isGroupedValue(item) ? item.aggregateCtx : undefined;
+}
+
+function aggregateExprSignature(expr: LuaExpression, config?: Config): string {
+  switch (expr.type) {
+    case "FilteredCall": {
+      const fc = expr.call;
+      if (
+        fc.prefix.type === "Variable" &&
+        getAggregateSpec(fc.prefix.name, config)
+      ) {
+        return [
+          "filtered",
+          fc.prefix.name,
+          fc.args.map(stableExprToString).join(","),
+          stableExprToString(expr.filter),
+          (fc.orderBy ?? [])
+            .map(
+              (o) =>
+                `${stableExprToString(o.expression)}:${o.direction}:${o.nulls ?? ""}`,
+            )
+            .join("|"),
+        ].join("::");
+      }
+      return `filtered-nonagg::${stableExprToString(expr.call)}::${stableExprToString(expr.filter)}`;
+    }
+
+    case "AggregateCall": {
+      const fc = expr.call;
+      if (
+        fc.prefix.type === "Variable" &&
+        getAggregateSpec(fc.prefix.name, config)
+      ) {
+        return [
+          "aggregate",
+          fc.prefix.name,
+          fc.args.map(stableExprToString).join(","),
+          expr.orderBy
+            .map(
+              (o) =>
+                `${stableExprToString(o.expression)}:${o.direction}:${o.nulls ?? ""}`,
+            )
+            .join("|"),
+        ].join("::");
+      }
+      return `aggregate-nonagg::${stableExprToString(expr.call)}`;
+    }
+
+    case "FunctionCall": {
+      const fc = expr;
+      if (
+        fc.prefix.type === "Variable" &&
+        getAggregateSpec(fc.prefix.name, config)
+      ) {
+        return [
+          "function",
+          fc.prefix.name,
+          fc.args.map(stableExprToString).join(","),
+          (fc.orderBy ?? [])
+            .map(
+              (o) =>
+                `${stableExprToString(o.expression)}:${o.direction}:${o.nulls ?? ""}`,
+            )
+            .join("|"),
+        ].join("::");
+      }
+      return `function-nonagg::${stableExprToString(expr)}`;
+    }
+
+    default:
+      return `expr::${stableExprToString(expr)}`;
+  }
+}
+
+function stableExprToString(expr: LuaExpression): string {
+  switch (expr.type) {
+    case "Nil":
+      return "nil";
+    case "Boolean":
+      return String(expr.value);
+    case "Number":
+      return expr.numericType
+        ? `${expr.value}:${expr.numericType}`
+        : String(expr.value);
+    case "String":
+      return JSON.stringify(expr.value);
+    case "Variable":
+      return `var(${expr.name})`;
+    case "PropertyAccess":
+      return `prop(${stableExprToString(expr.object)}.${expr.property})`;
+    case "TableAccess":
+      return `tbl(${stableExprToString(expr.object)}[${stableExprToString(expr.key)}])`;
+    case "Unary":
+      return `un(${expr.operator} ${stableExprToString(expr.argument)})`;
+    case "Binary":
+      return `bin(${stableExprToString(expr.left)} ${expr.operator} ${stableExprToString(expr.right)})`;
+    case "Parenthesized":
+      return `paren(${stableExprToString(expr.expression)})`;
+    case "FunctionCall":
+      return [
+        "call",
+        stableExprToString(expr.prefix),
+        expr.args.map(stableExprToString).join(","),
+        (expr.orderBy ?? [])
+          .map(
+            (o) =>
+              `${stableExprToString(o.expression)}:${o.direction}:${o.nulls ?? ""}`,
+          )
+          .join("|"),
+      ].join("::");
+    case "FilteredCall":
+      return `filtered(${stableExprToString(expr.call)}|${stableExprToString(expr.filter)})`;
+    case "AggregateCall":
+      return [
+        "aggcall",
+        stableExprToString(expr.call),
+        expr.orderBy
+          .map(
+            (o) =>
+              `${stableExprToString(o.expression)}:${o.direction}:${o.nulls ?? ""}`,
+          )
+          .join("|"),
+      ].join("::");
+    case "TableConstructor":
+      return `table(${expr.fields
+        .map((field) => {
+          switch (field.type) {
+            case "PropField":
+              return `prop:${field.key}=${stableExprToString(field.value)}`;
+            case "DynamicField":
+              return `dyn:${stableExprToString(field.key)}=${stableExprToString(field.value)}`;
+            case "ExpressionField":
+              return `expr:${stableExprToString(field.value)}`;
+          }
+        })
+        .join(",")})`;
+    case "FunctionDefinition":
+      return "<function>";
+    default:
+      return "?";
+  }
 }
 
 // Wrap a value for select result tables so that the column key survives
@@ -657,20 +811,15 @@ function selectVal(v: LuaValue): LuaValue {
   return v === null || v === undefined ? LIQ_NULL : v;
 }
 
-// AFTER
-function unwrapAggregateValue(
-  v: AggregateResult,
-  aggregateInstrumentation?: AggregateRuntimeInstrumentation,
-): LuaValue {
-  return mergeAggregateRuntimeStats(aggregateInstrumentation, v);
+function unwrapAggregateValue(v: AggregateResult): LuaValue {
+  return v.value;
 }
 
 function mergeAggregateRuntimeStatsOnce(
   target: AggregateRuntimeInstrumentation | undefined,
   entry: AggregateEvalCacheEntry,
 ): void {
-  if (!target) return;
-  if (entry.counted) return;
+  if (!target || entry.counted) return;
   target.stats.rowsRemovedByAggregateFilter += entry.rowsFiltered ?? 0;
   entry.counted = true;
 }
@@ -691,7 +840,7 @@ export async function evalExpressionWithAggregates(
   outerEnv: LuaEnv,
   config: Config,
   aggregateInstrumentation?: AggregateRuntimeInstrumentation,
-  aggregateEvalCache?: AggregateEvalCache,
+  aggregateEvalContext?: AggregateEvalContext,
 ): Promise<LuaValue> {
   if (!containsAggregate(expr, config)) {
     return evalExpression(expr, env, sf);
@@ -706,7 +855,7 @@ export async function evalExpressionWithAggregates(
       outerEnv,
       config,
       aggregateInstrumentation,
-      aggregateEvalCache,
+      aggregateEvalContext,
     );
 
   if (expr.type === "FilteredCall") {
@@ -716,8 +865,8 @@ export async function evalExpressionWithAggregates(
       const name = fc.prefix.name;
       const spec = getAggregateSpec(name, config);
       if (spec) {
-        const sig = aggregateExprSignature(expr);
-        const cached = aggregateEvalCache?.get(sig);
+        const sig = aggregateExprSignature(expr, config);
+        const cached = aggregateEvalContext?.cache.get(sig);
         if (cached) {
           mergeAggregateRuntimeStatsOnce(aggregateInstrumentation, cached);
           return cached.value;
@@ -739,13 +888,18 @@ export async function evalExpressionWithAggregates(
           fc.orderBy,
         );
 
-        const value = unwrapAggregateValue(result, aggregateInstrumentation);
-        if (aggregateEvalCache) {
-          aggregateEvalCache.set(sig, {
+        const value = unwrapAggregateValue(result);
+        if (aggregateEvalContext) {
+          const entry: AggregateEvalCacheEntry = {
             value,
             rowsFiltered: result.rowsFiltered ?? 0,
-            counted: true,
-          });
+            counted: false,
+          };
+          aggregateEvalContext.cache.set(sig, entry);
+          mergeAggregateRuntimeStatsOnce(aggregateInstrumentation, entry);
+        } else if (aggregateInstrumentation) {
+          aggregateInstrumentation.stats.rowsRemovedByAggregateFilter +=
+            result.rowsFiltered ?? 0;
         }
         return value;
       }
@@ -761,8 +915,8 @@ export async function evalExpressionWithAggregates(
       const name = fc.prefix.name;
       const spec = getAggregateSpec(name, config);
       if (spec) {
-        const sig = aggregateExprSignature(expr);
-        const cached = aggregateEvalCache?.get(sig);
+        const sig = aggregateExprSignature(expr, config);
+        const cached = aggregateEvalContext?.cache.get(sig);
         if (cached) {
           mergeAggregateRuntimeStatsOnce(aggregateInstrumentation, cached);
           return cached.value;
@@ -784,13 +938,18 @@ export async function evalExpressionWithAggregates(
           agg.orderBy,
         );
 
-        const value = unwrapAggregateValue(result, aggregateInstrumentation);
-        if (aggregateEvalCache) {
-          aggregateEvalCache.set(sig, {
+        const value = unwrapAggregateValue(result);
+        if (aggregateEvalContext) {
+          const entry: AggregateEvalCacheEntry = {
             value,
             rowsFiltered: result.rowsFiltered ?? 0,
-            counted: true,
-          });
+            counted: false,
+          };
+          aggregateEvalContext.cache.set(sig, entry);
+          mergeAggregateRuntimeStatsOnce(aggregateInstrumentation, entry);
+        } else if (aggregateInstrumentation) {
+          aggregateInstrumentation.stats.rowsRemovedByAggregateFilter +=
+            result.rowsFiltered ?? 0;
         }
         return value;
       }
@@ -805,8 +964,8 @@ export async function evalExpressionWithAggregates(
       const name = fc.prefix.name;
       const spec = getAggregateSpec(name, config);
       if (spec) {
-        const sig = aggregateExprSignature(expr);
-        const cached = aggregateEvalCache?.get(sig);
+        const sig = aggregateExprSignature(expr, config);
+        const cached = aggregateEvalContext?.cache.get(sig);
         if (cached) {
           mergeAggregateRuntimeStatsOnce(aggregateInstrumentation, cached);
           return cached.value;
@@ -828,13 +987,18 @@ export async function evalExpressionWithAggregates(
           fc.orderBy,
         );
 
-        const value = unwrapAggregateValue(result, aggregateInstrumentation);
-        if (aggregateEvalCache) {
-          aggregateEvalCache.set(sig, {
+        const value = unwrapAggregateValue(result);
+        if (aggregateEvalContext) {
+          const entry: AggregateEvalCacheEntry = {
             value,
             rowsFiltered: result.rowsFiltered ?? 0,
-            counted: true,
-          });
+            counted: false,
+          };
+          aggregateEvalContext.cache.set(sig, entry);
+          mergeAggregateRuntimeStatsOnce(aggregateInstrumentation, entry);
+        } else if (aggregateInstrumentation) {
+          aggregateInstrumentation.stats.rowsRemovedByAggregateFilter +=
+            result.rowsFiltered ?? 0;
         }
         return value;
       }
@@ -1029,7 +1193,8 @@ async function precomputeSortKeys(
   const allKeys: any[][] = new Array(results.length);
   for (let i = 0; i < results.length; i++) {
     const item = results[i];
-    const itemEnv = mkEnv(objectVariable, item, env, sf);
+    const luaItem = unwrapGroupedItem(item);
+    const itemEnv = mkEnv(objectVariable, luaItem, env, sf);
     if (selectResults) {
       const row = selectResults[i];
       if (row) {
@@ -1042,11 +1207,7 @@ async function precomputeSortKeys(
     const keys: any[] = new Array(orderBy.length);
     for (let j = 0; j < orderBy.length; j++) {
       if (grouped) {
-        const groupTable = (item as LuaTable).rawGet("group");
-        const aggregateEvalCache =
-          ((item as LuaTable).rawGet("__aggregateEvalCache") as
-            | AggregateEvalCache
-            | undefined) ?? new Map<string, AggregateEvalCacheEntry>();
+        const groupTable = luaItem.rawGet("group");
         keys[j] = await evalExpressionWithAggregates(
           orderBy[j].expr,
           itemEnv,
@@ -1056,11 +1217,7 @@ async function precomputeSortKeys(
           env,
           config,
           aggregateInstrumentation,
-          aggregateEvalCache,
-        );
-        void (item as LuaTable).rawSet(
-          "__aggregateEvalCache",
-          aggregateEvalCache,
+          getGroupedAggregateContext(item),
         );
       } else {
         keys[j] = await evalExpression(orderBy[j].expr, itemEnv, sf);
@@ -1304,7 +1461,7 @@ export async function applyQuery(
       entry.items.push(item);
     }
 
-    results = [];
+    const groupedResults: GroupedValue[] = [];
     for (const { key, items } of groups.values()) {
       const groupTable = new LuaTable();
       for (let i = 0; i < items.length; i++) {
@@ -1319,8 +1476,12 @@ export async function applyQuery(
       const row = new LuaTable();
       void row.rawSet("key", key);
       void row.rawSet("group", groupTable);
-      results.push(row);
+      groupedResults.push({
+        item: row,
+        aggregateCtx: { cache: new Map<string, AggregateEvalCacheEntry>() },
+      });
     }
+    results = groupedResults as any[];
 
     emitStageStat(
       instrumentation,
@@ -1338,15 +1499,15 @@ export async function applyQuery(
     for (const value of results) {
       let condResult;
       if (grouped) {
+        const luaValue = unwrapGroupedItem(value);
         const itemEnv = buildGroupItemEnv(
           query.objectVariable,
           groupByNames,
-          value,
+          luaValue,
           env,
           sf,
         );
-        const groupTable = (value as LuaTable).rawGet("group");
-        const aggregateEvalCache: AggregateEvalCache = new Map();
+        const groupTable = luaValue.rawGet("group");
         condResult = await evalExpressionWithAggregates(
           query.having,
           itemEnv,
@@ -1356,11 +1517,7 @@ export async function applyQuery(
           env,
           config,
           aggregateInstrumentation,
-          aggregateEvalCache,
-        );
-        void (value as LuaTable).rawSet(
-          "__aggregateEvalCache",
-          aggregateEvalCache,
+          getGroupedAggregateContext(value),
         );
       } else {
         const itemEnv = buildItemEnvLocal(query.objectVariable, value, env, sf);
@@ -1383,7 +1540,7 @@ export async function applyQuery(
 
   const mkEnv = grouped
     ? (ov: string | undefined, item: any, e: LuaEnv, s: LuaStackFrame) =>
-        buildGroupItemEnv(ov, groupByNames, item, e, s)
+        buildGroupItemEnv(ov, groupByNames, unwrapGroupedItem(item), e, s)
     : buildItemEnvLocal;
 
   let selectResults: any[] | undefined;
@@ -1395,12 +1552,9 @@ export async function applyQuery(
     const selectExpr = query.select;
     selectResults = [];
     for (const item of results) {
+      const luaItem = unwrapGroupedItem(item);
       const itemEnv = mkEnv(query.objectVariable, item, env, sf);
-      const groupTable = (item as LuaTable).rawGet("group");
-      const aggregateEvalCache =
-        ((item as LuaTable).rawGet("__aggregateEvalCache") as
-          | AggregateEvalCache
-          | undefined) ?? new Map<string, AggregateEvalCacheEntry>();
+      const groupTable = luaItem.rawGet("group");
       const selected = await evalExpressionWithAggregates(
         selectExpr,
         itemEnv,
@@ -1410,11 +1564,7 @@ export async function applyQuery(
         env,
         config,
         aggregateInstrumentation,
-        aggregateEvalCache,
-      );
-      void (item as LuaTable).rawSet(
-        "__aggregateEvalCache",
-        aggregateEvalCache,
+        getGroupedAggregateContext(item),
       );
       selectResults.push(selected);
     }
@@ -1519,11 +1669,8 @@ export async function applyQuery(
       for (const item of results) {
         const itemEnv = mkEnv(query.objectVariable, item, env, sf);
         if (grouped) {
-          const groupTable = (item as LuaTable).rawGet("group");
-          const aggregateEvalCache =
-            ((item as LuaTable).rawGet("__aggregateEvalCache") as
-              | AggregateEvalCache
-              | undefined) ?? new Map<string, AggregateEvalCacheEntry>();
+          const luaItem = unwrapGroupedItem(item);
+          const groupTable = luaItem.rawGet("group");
           newResult.push(
             await evalExpressionWithAggregates(
               selectExpr,
@@ -1534,12 +1681,8 @@ export async function applyQuery(
               env,
               config,
               aggregateInstrumentation,
-              aggregateEvalCache,
+              getGroupedAggregateContext(item),
             ),
-          );
-          void (item as LuaTable).rawSet(
-            "__aggregateEvalCache",
-            aggregateEvalCache,
           );
         } else {
           newResult.push(await evalSelectExpression(query.select, itemEnv, sf));
@@ -1564,7 +1707,7 @@ export async function applyQuery(
     const seen = new Set();
     const distinctResult = [];
     for (const item of results) {
-      const key = generateKey(item);
+      const key = generateKey(unwrapGroupedItem(item));
       if (!seen.has(key)) {
         seen.add(key);
         distinctResult.push(item);
@@ -1616,7 +1759,7 @@ export async function applyQuery(
     );
   }
 
-  return results;
+  return grouped ? results.map(unwrapGroupedItem) : results;
 }
 
 /**
