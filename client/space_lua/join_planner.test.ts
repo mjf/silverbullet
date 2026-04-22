@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   attachAnalyzeQueryOpStats,
   buildJoinTree,
+  buildNormalizationInfoBySource,
   executeAndInstrument,
   executeJoinTree,
   explainJoinTree,
@@ -705,6 +706,163 @@ describe("join residual predicate stripping and explain", () => {
     expect(joinTree.left.joinResiduals?.map((e) => JSON.stringify(e))).toEqual([
       JSON.stringify(where),
     ]);
+  });
+});
+
+describe("single-source normalization metadata", () => {
+  it("builds complete normalization info when all source-local conjuncts are pushable", () => {
+    const expr = parseExpressionString("a.x == 1 and a.y == 2");
+    const info = buildNormalizationInfoBySource(expr, new Set(["a", "b"]));
+
+    expect(info.get("a")).toEqual({
+      state: "complete",
+      pushdownExpr: "((a.x == 1) and (a.y == 2))",
+      leftoverExpr: "none",
+    });
+    expect(info.has("b")).toBe(false);
+  });
+
+  it("builds partial normalization info when a source-local leftover remains", () => {
+    const expr = parseExpressionString("a.x == 1 and unknown_fn(a.y)");
+    const info = buildNormalizationInfoBySource(expr, new Set(["a", "b"]));
+
+    expect(info.get("a")).toEqual({
+      state: "partial",
+      pushdownExpr: "(a.x == 1)",
+      leftoverExpr: "unknown_fn(a.y)",
+    });
+  });
+
+  it("explain leaf renders partial normalization lines", () => {
+    const source = makeSource("a");
+    const plan = explainJoinTree(
+      { kind: "leaf", source },
+      {
+        analyze: false,
+        verbose: true,
+        summary: false,
+        costs: true,
+        timing: false,
+        hints: false,
+      },
+      new Map([["a", "(a.x == 1)"]]),
+      new Map([
+        [
+          "a",
+          {
+            state: "partial",
+            pushdownExpr: "(a.x == 1)",
+            leftoverExpr: "unknown_fn(a.y)",
+          },
+        ],
+      ]),
+    );
+
+    expect(plan.normalizationState).toBe("partial");
+    expect(plan.normalizedPushdownExpr).toBe("(a.x == 1)");
+    expect(plan.normalizedLeftoverExpr).toBe("unknown_fn(a.y)");
+
+    const rendered = formatExplainOutput(
+      {
+        plan,
+        planningTimeMs: 0,
+      },
+      {
+        analyze: false,
+        verbose: true,
+        summary: false,
+        costs: true,
+        timing: false,
+        hints: false,
+      },
+    );
+
+    expect(rendered.includes("Normalization: partial")).toBe(true);
+    expect(rendered.includes("Pushdown: (a.x == 1)")).toBe(true);
+    expect(rendered.includes("Leftover: unknown_fn(a.y)")).toBe(true);
+  });
+
+  it("does not render normalization lines when no normalization metadata exists", () => {
+    const source = makeSource("a");
+    const plan = explainJoinTree(
+      { kind: "leaf", source },
+      {
+        analyze: false,
+        verbose: true,
+        summary: false,
+        costs: true,
+        timing: false,
+        hints: false,
+      },
+    );
+
+    const rendered = formatExplainOutput(
+      {
+        plan,
+        planningTimeMs: 0,
+      },
+      {
+        analyze: false,
+        verbose: true,
+        summary: false,
+        costs: true,
+        timing: false,
+        hints: false,
+      },
+    );
+
+    expect(rendered.includes("Normalization:")).toBe(false);
+    expect(rendered.includes("Pushdown:")).toBe(false);
+    expect(rendered.includes("Leftover:")).toBe(false);
+  });
+
+  it("cross-source explain threads normalization metadata to matching scan leaves", () => {
+    const sources: JoinSource[] = [makeSource("a"), makeSource("b")];
+
+    const joinTree = buildJoinTree(sources);
+    const normalizationInfo = buildNormalizationInfoBySource(
+      parseExpressionString("a.x == 1 and unknown_fn(a.y) and b.flag == true"),
+      new Set(["a", "b"]),
+    );
+
+    const explain = explainJoinTree(
+      joinTree,
+      {
+        analyze: false,
+        verbose: true,
+        summary: false,
+        costs: true,
+        timing: false,
+        hints: false,
+      },
+      new Map([
+        ["a", "(a.x == 1)"],
+        ["b", "(b.flag == true)"],
+      ]),
+      normalizationInfo,
+    );
+
+    const leaves: ExplainNode[] = [];
+    const walk = (node: ExplainNode) => {
+      if (node.nodeType === "Scan" || node.nodeType === "FunctionScan") {
+        leaves.push(node);
+      }
+      for (const child of node.children) {
+        walk(child);
+      }
+    };
+    walk(explain);
+
+    const aLeaf = leaves.find((l) => l.source === "a");
+    const bLeaf = leaves.find((l) => l.source === "b");
+
+    expect(aLeaf?.normalizationState).toBe("partial");
+    expect(aLeaf?.normalizedPushdownExpr).toBe("(a.x == 1)");
+    expect(aLeaf?.normalizedLeftoverExpr).toBe("unknown_fn(a.y)");
+
+    expect(bLeaf?.normalizationState).toBe("complete");
+    expect(bLeaf?.normalizedPushdownExpr).toBe("(b.flag == true)");
+    expect(bLeaf?.normalizedLeftoverExpr).toBe("none");
   });
 });
 

@@ -341,6 +341,9 @@ export type ExplainNode = {
   statsSource?: string;
   executionScanKind?: string;
   predicatePushdown?: string;
+  normalizationState?: "complete" | "partial";
+  normalizedPushdownExpr?: string;
+  normalizedLeftoverExpr?: string;
 };
 
 export type AggregateDescription = {
@@ -364,6 +367,12 @@ export type ExplainResult = {
   plan: ExplainNode;
   planningTimeMs: number;
   executionTimeMs?: number;
+};
+
+export type SourceNormalizationInfo = {
+  state: "complete" | "partial";
+  pushdownExpr: string;
+  leftoverExpr: string;
 };
 
 // 8. Stats provenance helpers
@@ -2316,36 +2325,490 @@ export function extractSingleSourceFilters(
 ): { pushed: SingleSourceFilter[]; residual: LuaExpression | undefined } {
   if (!expr) return { pushed: [], residual: undefined };
 
-  const conjuncts = flattenAnd(expr);
+  const normalized = normalizePushdownExpression(expr);
   const pushed: SingleSourceFilter[] = [];
-  const remaining: LuaExpression[] = [];
+  const residualParts: LuaExpression[] = [];
 
-  for (const conjunct of conjuncts) {
-    const refs = collectReferencedSources(conjunct, sourceNames);
+  extractPushdownsFromExpr(normalized, sourceNames, pushed, residualParts);
 
-    if (refs.size === 1) {
-      const [sourceName] = refs;
-      if (isExplicitlyScopedToSource(conjunct, sourceNames, sourceName)) {
-        pushed.push({ sourceName, expression: conjunct });
-        continue;
-      }
-    }
+  return {
+    pushed,
+    residual: rebuildAndExpression(residualParts),
+  };
+}
 
-    remaining.push(conjunct);
+export function buildNormalizationInfoBySource(
+  expr: LuaExpression | undefined,
+  sourceNames: Set<string>,
+): Map<string, SourceNormalizationInfo> {
+  const info = new Map<
+    string,
+    { pushed: LuaExpression[]; leftover: LuaExpression[] }
+  >();
+
+  if (!expr) return new Map();
+
+  const normalized = normalizePushdownExpression(expr);
+  collectNormalizationInfo(normalized, sourceNames, info);
+
+  const result = new Map<string, SourceNormalizationInfo>();
+  for (const [sourceName, parts] of info) {
+    const pushedExpr = rebuildAndExpression(parts.pushed);
+    if (!pushedExpr) continue;
+
+    const leftoverExpr = rebuildAndExpression(parts.leftover);
+    result.set(sourceName, {
+      state: leftoverExpr ? "partial" : "complete",
+      pushdownExpr: exprToString(pushedExpr),
+      leftoverExpr: leftoverExpr ? exprToString(leftoverExpr) : "none",
+    });
   }
 
-  const residual =
-    remaining.length > 0
-      ? remaining.reduce((acc, e) => ({
-          type: "Binary" as const,
-          operator: "and",
-          left: acc,
-          right: e,
-          ctx: expr.ctx,
-        }))
-      : undefined;
+  return result;
+}
 
-  return { pushed, residual };
+function collectNormalizationInfo(
+  expr: LuaExpression,
+  sourceNames: Set<string>,
+  info: Map<string, { pushed: LuaExpression[]; leftover: LuaExpression[] }>,
+): void {
+  if (expr.type === "Binary" && expr.operator === "and") {
+    collectNormalizationInfo(expr.left, sourceNames, info);
+    collectNormalizationInfo(expr.right, sourceNames, info);
+    return;
+  }
+
+  const refs = collectReferencedSources(expr, sourceNames);
+  if (refs.size !== 1) return;
+
+  const [sourceName] = refs;
+  let entry = info.get(sourceName);
+  if (!entry) {
+    entry = { pushed: [], leftover: [] };
+    info.set(sourceName, entry);
+  }
+
+  if (
+    isExplicitlyScopedToSource(expr, sourceNames, sourceName) &&
+    isPushdownSafeExpressionForSource(expr, sourceNames, sourceName)
+  ) {
+    entry.pushed.push(normalizePushdownExpression(expr));
+  } else {
+    entry.leftover.push(expr);
+  }
+}
+
+function extractPushdownsFromExpr(
+  expr: LuaExpression,
+  sourceNames: Set<string>,
+  pushed: SingleSourceFilter[],
+  residualParts: LuaExpression[],
+): void {
+  const refs = collectReferencedSources(expr, sourceNames);
+
+  if (refs.size === 1) {
+    const [sourceName] = refs;
+    if (
+      isExplicitlyScopedToSource(expr, sourceNames, sourceName) &&
+      isPushdownSafeExpressionForSource(expr, sourceNames, sourceName)
+    ) {
+      pushed.push({
+        sourceName,
+        expression: normalizePushdownExpression(expr),
+      });
+      return;
+    }
+  }
+
+  if (expr.type === "Binary" && expr.operator === "and") {
+    extractPushdownsFromExpr(expr.left, sourceNames, pushed, residualParts);
+    extractPushdownsFromExpr(expr.right, sourceNames, pushed, residualParts);
+    return;
+  }
+
+  residualParts.push(expr);
+}
+
+function isPushdownSafeExpressionForSource(
+  expr: LuaExpression,
+  sourceNames: Set<string>,
+  targetSource: string,
+): boolean {
+  switch (expr.type) {
+    case "Nil":
+    case "Boolean":
+    case "Number":
+    case "String":
+      return true;
+
+    case "Variable":
+      return expr.name === targetSource;
+
+    case "PropertyAccess":
+      if (
+        expr.object.type === "Variable" &&
+        sourceNames.has(expr.object.name)
+      ) {
+        return expr.object.name === targetSource;
+      }
+      return isPushdownSafeExpressionForSource(
+        expr.object,
+        sourceNames,
+        targetSource,
+      );
+
+    case "Parenthesized":
+      return isPushdownSafeExpressionForSource(
+        expr.expression,
+        sourceNames,
+        targetSource,
+      );
+
+    case "Unary":
+      return (
+        expr.operator === "not" &&
+        isPushdownSafeExpressionForSource(
+          expr.argument,
+          sourceNames,
+          targetSource,
+        )
+      );
+
+    case "Binary":
+      switch (expr.operator) {
+        case "and":
+        case "or":
+        case "==":
+        case "~=":
+        case "!=":
+        case "<":
+        case "<=":
+        case ">":
+        case ">=":
+          return (
+            isPushdownSafeExpressionForSource(
+              expr.left,
+              sourceNames,
+              targetSource,
+            ) &&
+            isPushdownSafeExpressionForSource(
+              expr.right,
+              sourceNames,
+              targetSource,
+            )
+          );
+        default:
+          return false;
+      }
+
+    default:
+      return false;
+  }
+}
+
+function normalizePushdownExpression(expr: LuaExpression): LuaExpression {
+  switch (expr.type) {
+    case "Parenthesized":
+      return normalizePushdownExpression(expr.expression);
+
+    case "Unary": {
+      const normalizedArg = normalizePushdownExpression(expr.argument);
+      if (expr.operator === "not") {
+        return normalizeNegation({
+          ...expr,
+          argument: normalizedArg,
+        } as LuaExpression);
+      }
+      return {
+        ...expr,
+        argument: normalizedArg,
+      };
+    }
+
+    case "Binary": {
+      const left = normalizePushdownExpression(expr.left);
+      const right = normalizePushdownExpression(expr.right);
+
+      if (expr.operator === "and") {
+        const parts = dedupeExpressions([
+          ...collectAndChain(left),
+          ...collectAndChain(right),
+        ]);
+        return rebuildAndExpression(parts) ?? {
+          type: "Boolean",
+          value: true,
+          ctx: expr.ctx,
+        };
+      }
+
+      if (expr.operator === "or") {
+        const parts = dedupeExpressions([
+          ...collectOrChain(left),
+          ...collectOrChain(right),
+        ]);
+        const rebuilt = rebuildOrExpression(parts);
+        return normalizeSameColumnOrChain(rebuilt ?? {
+          type: "Boolean",
+          value: false,
+          ctx: expr.ctx,
+        });
+      }
+
+      return normalizeBinaryComparison({
+        ...expr,
+        left,
+        right,
+      } as LuaExpression);
+    }
+
+    default:
+      return expr;
+  }
+}
+
+function normalizeBinaryComparison(expr: LuaExpression): LuaExpression {
+  if (expr.type !== "Binary") return expr;
+
+  const op = expr.operator;
+  if (
+    op !== "==" &&
+    op !== "~=" &&
+    op !== "!=" &&
+    op !== "<" &&
+    op !== "<=" &&
+    op !== ">" &&
+    op !== ">="
+  ) {
+    return expr;
+  }
+
+  if (isLiteralExpr(expr.left) && isColumnRefExpr(expr.right)) {
+    const flipped = flipOp(op);
+    if (flipped) {
+      return {
+        ...expr,
+        operator: flipped as typeof expr.operator,
+        left: expr.right,
+        right: expr.left,
+      };
+    }
+  }
+
+  return expr;
+}
+
+function normalizeNegation(expr: LuaExpression): LuaExpression {
+  if (expr.type !== "Unary" || expr.operator !== "not") return expr;
+
+  const arg = expr.argument;
+
+  if (arg.type === "Parenthesized") {
+    return normalizeNegation({
+      ...expr,
+      argument: arg.expression,
+    } as LuaExpression);
+  }
+
+  if (arg.type === "Unary" && arg.operator === "not") {
+    return normalizePushdownExpression(arg.argument);
+  }
+
+  if (arg.type === "Binary") {
+    switch (arg.operator) {
+      case "==":
+        return normalizePushdownExpression({
+          ...arg,
+          operator: "!=",
+        } as LuaExpression);
+      case "!=":
+      case "~=":
+        return normalizePushdownExpression({
+          ...arg,
+          operator: "==",
+        } as LuaExpression);
+      case "<":
+        return normalizePushdownExpression({
+          ...arg,
+          operator: ">=",
+        } as LuaExpression);
+      case "<=":
+        return normalizePushdownExpression({
+          ...arg,
+          operator: ">",
+        } as LuaExpression);
+      case ">":
+        return normalizePushdownExpression({
+          ...arg,
+          operator: "<=",
+        } as LuaExpression);
+      case ">=":
+        return normalizePushdownExpression({
+          ...arg,
+          operator: "<",
+        } as LuaExpression);
+      default:
+        return {
+          ...expr,
+          argument: normalizePushdownExpression(arg),
+        };
+    }
+  }
+
+  return {
+    ...expr,
+    argument: normalizePushdownExpression(arg),
+  };
+}
+
+function normalizeSameColumnOrChain(expr: LuaExpression): LuaExpression {
+  const set = extractSameColumnOrLiteralSet(expr);
+  if (!set) return expr;
+
+  const leftBase: LuaExpression = {
+    type: "PropertyAccess",
+    object: {
+      type: "Variable",
+      name: set.sourceName,
+      ctx: expr.ctx,
+    },
+    property: set.column,
+    ctx: expr.ctx,
+  } as LuaExpression;
+
+  const disjuncts = set.literals.map((literal) => ({
+    type: "Binary" as const,
+    operator: "==" as const,
+    left: leftBase,
+    right: literal,
+    ctx: expr.ctx,
+  }));
+
+  return rebuildOrExpression(disjuncts) ?? expr;
+}
+
+function extractSameColumnOrLiteralSet(
+  expr: LuaExpression,
+): {
+  sourceName: string;
+  column: string;
+  literals: LuaExpression[];
+} | null {
+  const parts = collectOrChain(expr);
+  if (parts.length < 2) return null;
+
+  let sourceName: string | undefined;
+  let column: string | undefined;
+  const literals: LuaExpression[] = [];
+
+  for (const part of parts) {
+    if (part.type !== "Binary" || part.operator !== "==") {
+      return null;
+    }
+
+    const normalized = normalizeBinaryComparison(part);
+    if (normalized.type !== "Binary" || normalized.operator !== "==") {
+      return null;
+    }
+
+    if (
+      normalized.left.type !== "PropertyAccess" ||
+      normalized.left.object.type !== "Variable" ||
+      !isLiteralExpr(normalized.right)
+    ) {
+      return null;
+    }
+
+    const currentSource = normalized.left.object.name;
+    const currentColumn = normalized.left.property;
+
+    if (sourceName === undefined) sourceName = currentSource;
+    if (column === undefined) column = currentColumn;
+
+    if (sourceName !== currentSource || column !== currentColumn) {
+      return null;
+    }
+
+    literals.push(normalized.right);
+  }
+
+  const uniqueLiterals = dedupeExpressions(literals).sort((a, b) =>
+    exprToString(a).localeCompare(exprToString(b)),
+  );
+
+  if (sourceName === undefined || column === undefined) {
+    return null;
+  }
+
+  return {
+    sourceName,
+    column,
+    literals: uniqueLiterals,
+  };
+}
+
+function collectAndChain(expr: LuaExpression): LuaExpression[] {
+  if (expr.type === "Binary" && expr.operator === "and") {
+    return [...collectAndChain(expr.left), ...collectAndChain(expr.right)];
+  }
+  return [expr];
+}
+
+function collectOrChain(expr: LuaExpression): LuaExpression[] {
+  if (expr.type === "Binary" && expr.operator === "or") {
+    return [...collectOrChain(expr.left), ...collectOrChain(expr.right)];
+  }
+  return [expr];
+}
+
+function dedupeExpressions(exprs: LuaExpression[]): LuaExpression[] {
+  const out: LuaExpression[] = [];
+  for (const expr of exprs) {
+    if (!out.some((existing) => exprStructurallyEquals(existing, expr))) {
+      out.push(expr);
+    }
+  }
+  return out;
+}
+
+function rebuildAndExpression(
+  exprs: LuaExpression[],
+): LuaExpression | undefined {
+  if (exprs.length === 0) return undefined;
+  return exprs.slice(1).reduce(
+    (acc, expr) =>
+      ({
+        type: "Binary",
+        operator: "and",
+        left: acc,
+        right: expr,
+        ctx: acc.ctx,
+      }) as LuaExpression,
+    exprs[0],
+  );
+}
+
+function rebuildOrExpression(
+  exprs: LuaExpression[],
+): LuaExpression | undefined {
+  if (exprs.length === 0) return undefined;
+  return exprs.slice(1).reduce(
+    (acc, expr) =>
+      ({
+        type: "Binary",
+        operator: "or",
+        left: acc,
+        right: expr,
+        ctx: acc.ctx,
+      }) as LuaExpression,
+    exprs[0],
+  );
+}
+
+function isColumnRefExpr(expr: LuaExpression): boolean {
+  return (
+    expr.type === "PropertyAccess" &&
+    expr.object.type === "Variable"
+  );
 }
 
 function isExplicitlyScopedToSource(
@@ -2692,6 +3155,7 @@ function extractTransitiveCandidates(
   sourceName: string,
 ): TransitiveCandidate[] {
   const results: TransitiveCandidate[] = [];
+  expr = normalizePushdownExpression(expr);
 
   // Handle AND conjunctions
   if (expr.type === "Binary" && expr.operator === "and") {
@@ -2869,6 +3333,7 @@ export function explainJoinTree(
   tree: JoinNode,
   _opts: ExplainOptions,
   pushedFilterExprBySource?: Map<string, string>,
+  normalizationInfoBySource?: Map<string, SourceNormalizationInfo>,
 ): ExplainNode {
   if (tree.kind === "leaf") {
     const rows = estimatedRows(tree.source);
@@ -2877,6 +3342,22 @@ export function explainJoinTree(
     const pushedFilterExpr = pushedFilterExprBySource?.get(tree.source.name);
     const predicatePushdownKind =
       tree.source.stats?.executionCapabilities?.predicatePushdown;
+
+    let normalizationState: ExplainNode["normalizationState"] | undefined;
+    let normalizedPushdownExpr: string | undefined;
+    let normalizedLeftoverExpr: string | undefined;
+
+    const normalizationInfo = normalizationInfoBySource?.get(tree.source.name);
+
+    if (normalizationInfo) {
+      normalizationState = normalizationInfo.state;
+      normalizedPushdownExpr = normalizationInfo.pushdownExpr;
+      normalizedLeftoverExpr = normalizationInfo.leftoverExpr;
+    } else if (pushedFilterExpr) {
+      normalizationState = "complete";
+      normalizedPushdownExpr = pushedFilterExpr;
+      normalizedLeftoverExpr = "none";
+    }
 
     const sourceHints: string[] = [];
     if (tree.source.materialized) {
@@ -2909,16 +3390,26 @@ export function explainJoinTree(
       statsSource: tree.source.stats?.statsSource,
       executionScanKind: tree.source.stats?.executionCapabilities?.scanKind,
       predicatePushdown: predicatePushdownKind,
+      normalizationState,
+      normalizedPushdownExpr,
+      normalizedLeftoverExpr,
       children: [],
     };
   }
 
-  const leftPlan = explainJoinTree(tree.left, _opts, pushedFilterExprBySource);
+  const leftPlan = explainJoinTree(
+    tree.left,
+    _opts,
+    pushedFilterExprBySource,
+    normalizationInfoBySource,
+  );
   const rightPlan = explainJoinTree(
     tree.right,
     _opts,
     pushedFilterExprBySource,
+    normalizationInfoBySource,
   );
+
   const jt = tree.joinType ?? "inner";
 
   const nodeType: ExplainNodeType =
@@ -4547,6 +5038,16 @@ function formatNode(
 
     if (node.predicatePushdown) {
       lines.push(`${detailPad}Pushdown Capability: ${node.predicatePushdown}`);
+    }
+
+    if (node.normalizationState) {
+      lines.push(`${detailPad}Normalization: ${node.normalizationState}`);
+      lines.push(
+        `${detailPad}Pushdown: ${node.normalizedPushdownExpr ?? "none"}`,
+      );
+      lines.push(
+        `${detailPad}Leftover: ${node.normalizedLeftoverExpr ?? "none"}`,
+      );
     }
 
     if (node.selectivity !== undefined) {

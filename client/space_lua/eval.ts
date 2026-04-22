@@ -43,6 +43,7 @@ import {
   applyPushedFilters,
   attachAnalyzeQueryOpStats,
   buildJoinTree,
+  buildNormalizationInfoBySource,
   type ExplainNode,
   type ExplainOptions,
   type ExplainResult,
@@ -57,6 +58,7 @@ import {
   generateTransitivePredicates,
   type JoinPlannerConfig,
   type JoinSource,
+  type SourceNormalizationInfo,
   stripUsedJoinPredicates,
   validatePostJoinSourceReferences,
   wrapPlanWithQueryOps,
@@ -1523,6 +1525,14 @@ export function evalExpression(
               pushedFilterExprBySource.set(src.name, combined);
             }
 
+            const normalizationInfoBySource: Map<
+              string,
+              SourceNormalizationInfo
+            > = buildNormalizationInfoBySource(
+              whereClause?.expression,
+              sourceNames,
+            );
+
             // Materialize and filter single-source pushdown inputs before join
             // planning so both stats and execution use the filtered sources.
             // Try delegation first: if the source supports native filtering
@@ -1740,6 +1750,7 @@ export function evalExpression(
                   joinTree,
                   explainOpts,
                   pushedFilterExprBySource,
+                  normalizationInfoBySource,
                 ),
                 {
                   ...explainQuery,
