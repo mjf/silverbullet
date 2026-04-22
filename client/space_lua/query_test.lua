@@ -6710,3 +6710,406 @@ do
     "151e: expected removed-row count 3, got: " .. tostring(plan)
   )
 end
+
+-- 152. Aggregate filter rows are deduped across having + select + order by
+
+do
+  local plan = query [[
+    explain analyze verbose
+    from
+      t = {
+        { g = "a", v = 1, keep = true },
+        { g = "a", v = 2, keep = false },
+        { g = "b", v = 3, keep = false },
+        { g = "b", v = 4, keep = false },
+        { g = "b", v = 5, keep = true },
+      }
+    group by
+      t.g
+    having
+      sum(t.v) filter(where t.keep == true) > 0
+    select {
+      g = key,
+      total = sum(t.v) filter(where t.keep == true),
+    }
+    order by
+      sum(t.v) filter(where t.keep == true) desc
+  ]]
+
+  plan = tostring(plan)
+
+  assertTrue(
+    string.find(plan, "Rows Removed by Aggregate Filter: 3", 1, true) ~= nil,
+    "152: expected deduped removed-row count 3, got: " .. tostring(plan)
+  )
+  assertTrue(
+    string.find(plan, "Rows Removed by Aggregate Filter: 6", 1, true) == nil,
+    "152: aggregate filter rows must not be double-counted across having/select/order by: " .. tostring(plan)
+  )
+end
+
+-- 152a. Different aggregate filters are counted independently
+
+do
+  local plan = query [[
+    explain analyze verbose
+    from
+      t = {
+        { g = "a", v = 1, keep = true,  hot = false },
+        { g = "a", v = 2, keep = false, hot = true  },
+        { g = "b", v = 3, keep = false, hot = false },
+        { g = "b", v = 4, keep = false, hot = true  },
+        { g = "b", v = 5, keep = true,  hot = true  },
+      }
+    group by
+      t.g
+    select {
+      kept = sum(t.v) filter(where t.keep == true),
+      hot  = sum(t.v) filter(where t.hot == true),
+    }
+  ]]
+
+  plan = tostring(plan)
+
+  -- keep=false rows removed: 3
+  -- hot=false rows removed: 2
+  -- total should be 5
+  assertTrue(
+    string.find(plan, "Rows Removed by Aggregate Filter: 5", 1, true) ~= nil,
+    "152a: expected combined removed-row count 5 for distinct aggregate filters, got: " .. tostring(plan)
+  )
+end
+
+-- 152b. Different order-by aggregates must not alias by position
+
+do
+  local r = query [[
+    from
+      pages
+    where
+      tags[1] ~= nil
+    group by
+      tags[1]
+    having
+      count() >= 2
+    select {
+      tag = key,
+      by_age = array_agg(name order by age asc),
+      by_size = array_agg(name order by size desc),
+    }
+    order by
+      tag
+    limit
+      2
+  ]]
+
+  assertEquals(#r, 2)
+
+  assertEquals(r[1].tag, "personal")
+  assertEquals(r[1].by_age[1], "Carol")
+  assertEquals(r[1].by_age[2], "Dave")
+  assertEquals(r[1].by_size[1], "Dave")
+  assertEquals(r[1].by_size[2], "Carol")
+
+  assertEquals(r[2].tag, "work")
+  assertEquals(r[2].by_age[1], "Bob")
+  assertEquals(r[2].by_age[2], "Alice")
+  assertEquals(r[2].by_age[3], "Greg")
+  assertEquals(r[2].by_size[1], "Bob")
+  assertEquals(r[2].by_size[2], "Alice")
+  assertEquals(r[2].by_size[3], "Greg")
+end
+
+-- 152c. Repeated identical aggregates inside one select are deduped for stats and value
+
+do
+  local plan = query [[
+    explain analyze verbose
+    from
+      t = {
+        { g = "a", v = 1, keep = true },
+        { g = "a", v = 2, keep = false },
+        { g = "a", v = 3, keep = false },
+        { g = "b", v = 4, keep = true },
+      }
+    group by
+      t.g
+    select {
+      x = sum(t.v) filter(where t.keep == true),
+      y = sum(t.v) filter(where t.keep == true),
+    }
+  ]]
+
+  plan = tostring(plan)
+
+  -- Only two rows fail keep==true across all input rows.
+  assertTrue(
+    string.find(plan, "Rows Removed by Aggregate Filter: 2", 1, true) ~= nil,
+    "152c: expected repeated identical aggregates in one select to count once, got: " .. tostring(plan)
+  )
+  assertTrue(
+    string.find(plan, "Rows Removed by Aggregate Filter: 4", 1, true) == nil,
+    "152c: repeated identical aggregates in one select must not double-count: " .. tostring(plan)
+  )
+
+  local r = query [[
+    from
+      t = {
+        { g = "a", v = 1, keep = true },
+        { g = "a", v = 2, keep = false },
+        { g = "a", v = 3, keep = false },
+        { g = "b", v = 4, keep = true },
+      }
+    group by
+      t.g
+    order by
+      key
+    select {
+      g = key,
+      x = sum(t.v) filter(where t.keep == true),
+      y = sum(t.v) filter(where t.keep == true),
+    }
+  ]]
+
+  assertEquals(r[1].g, "a")
+  assertEquals(r[1].x, 1)
+  assertEquals(r[1].y, 1)
+  assertEquals(r[2].g, "b")
+  assertEquals(r[2].x, 4)
+  assertEquals(r[2].y, 4)
+end
+
+-- 152d. Repeated identical aggregates across having and select are deduped
+
+do
+  local plan = query [[
+    explain analyze verbose
+    from
+      t = {
+        { g = "a", v = 1, keep = true },
+        { g = "a", v = 2, keep = false },
+        { g = "b", v = 3, keep = false },
+        { g = "b", v = 4, keep = true },
+      }
+    group by
+      t.g
+    having
+      sum(t.v) filter(where t.keep == true) > 0
+    select {
+      g = key,
+      total = sum(t.v) filter(where t.keep == true),
+      again = sum(t.v) filter(where t.keep == true),
+    }
+  ]]
+
+  plan = tostring(plan)
+
+  -- Two rows fail keep==true across all input rows.
+  assertTrue(
+    string.find(plan, "Rows Removed by Aggregate Filter: 2", 1, true) ~= nil,
+    "152d: expected dedupe across having and repeated select aggregates, got: " .. tostring(plan)
+  )
+  assertTrue(
+    string.find(plan, "Rows Removed by Aggregate Filter: 4", 1, true) == nil,
+    "152d: aggregate filter rows must not be recounted across having/select: " .. tostring(plan)
+  )
+end
+
+-- 152e. Aggregate without filter does not contribute removed-row stats
+
+do
+  local plan = query [[
+    explain analyze verbose
+    from
+      t = {
+        { g = "a", v = 1 },
+        { g = "a", v = 2 },
+        { g = "b", v = 3 },
+      }
+    group by
+      t.g
+    select {
+      total = sum(t.v),
+      n = count(),
+    }
+  ]]
+
+  plan = tostring(plan)
+
+  assertTrue(
+    string.find(plan, "Rows Removed by Aggregate Filter:", 1, true) == nil,
+    "152e: aggregates without filter must not report removed-row stats: " .. tostring(plan)
+  )
+end
+
+-- 152f. Mixed filtered and unfiltered aggregates only count filtered removals
+
+do
+  local plan = query [[
+    explain analyze verbose
+    from
+      t = {
+        { g = "a", v = 1, keep = true },
+        { g = "a", v = 2, keep = false },
+        { g = "b", v = 3, keep = false },
+        { g = "b", v = 4, keep = true },
+      }
+    group by
+      t.g
+    select {
+      total = sum(t.v),
+      kept = sum(t.v) filter(where t.keep == true),
+      n = count(),
+    }
+  ]]
+
+  plan = tostring(plan)
+
+  assertTrue(
+    string.find(plan, "Rows Removed by Aggregate Filter: 2", 1, true) ~= nil,
+    "152f: only filtered aggregates should contribute removed-row count, got: " .. tostring(plan)
+  )
+end
+
+-- 152g. Same aggregate function, same args, different order by are distinct
+
+do
+  local r = query [[
+    from
+      t = {
+        { g = "x", name = "a", k = 2 },
+        { g = "x", name = "b", k = 3 },
+        { g = "x", name = "c", k = 1 },
+      }
+    group by
+      t.g
+    select {
+      asc_names = array_agg(t.name order by t.k asc),
+      desc_names = array_agg(t.name order by t.k desc),
+    }
+  ]]
+
+  assertEquals(#r, 1)
+  assertEquals(r[1].asc_names[1], "c")
+  assertEquals(r[1].asc_names[2], "a")
+  assertEquals(r[1].asc_names[3], "b")
+  assertEquals(r[1].desc_names[1], "b")
+  assertEquals(r[1].desc_names[2], "a")
+  assertEquals(r[1].desc_names[3], "c")
+end
+
+-- 152h. Same aggregate function, same args, different filter are distinct
+
+do
+  local r = query [[
+    from
+      t = {
+        { g = "x", v = 1, keep = true,  hot = false },
+        { g = "x", v = 2, keep = false, hot = true  },
+        { g = "x", v = 3, keep = true,  hot = true  },
+      }
+    group by
+      t.g
+    select {
+      kept = sum(t.v) filter(where t.keep == true),
+      hot  = sum(t.v) filter(where t.hot == true),
+    }
+  ]]
+
+  assertEquals(#r, 1)
+  assertEquals(r[1].kept, 4)
+  assertEquals(r[1].hot, 5)
+end
+
+-- 152i. Aggregate filter stats survive distinct/limit pipeline stages
+
+do
+  local plan = query [[
+    explain analyze verbose
+    from
+      t = {
+        { g = "a", v = 1, keep = true },
+        { g = "a", v = 2, keep = false },
+        { g = "b", v = 3, keep = false },
+        { g = "b", v = 4, keep = true },
+      }
+    group by
+      t.g
+    select distinct {
+      total = sum(t.v) filter(where t.keep == true),
+    }
+    limit
+      1
+  ]]
+
+  plan = tostring(plan)
+
+  assertTrue(
+    string.find(plan, "Rows Removed by Aggregate Filter: 2", 1, true) ~= nil,
+    "152i: downstream distinct/limit must not disturb aggregate filter stats: " .. tostring(plan)
+  )
+end
+
+-- 152j. Empty aggregate filter result still dedupes correctly
+
+do
+  local plan = query [[
+    explain analyze verbose
+    from
+      t = {
+        { g = "a", v = 1, keep = false },
+        { g = "a", v = 2, keep = false },
+        { g = "b", v = 3, keep = false },
+      }
+    group by
+      t.g
+    having
+      count() >= 1
+    select {
+      s1 = sum(t.v) filter(where t.keep == true),
+      s2 = sum(t.v) filter(where t.keep == true),
+    }
+  ]]
+
+  plan = tostring(plan)
+
+  assertTrue(
+    string.find(plan, "Rows Removed by Aggregate Filter: 3", 1, true) ~= nil,
+    "152j: empty filtered aggregates should still count removed rows once, got: " .. tostring(plan)
+  )
+  assertTrue(
+    string.find(plan, "Rows Removed by Aggregate Filter: 6", 1, true) == nil,
+    "152j: empty filtered aggregates must not double-count: " .. tostring(plan)
+  )
+end
+
+-- 152k. Grouped order by on aggregate does not corrupt repeated select aggregates
+
+do
+  local r = query [[
+    from
+      t = {
+        { g = "a", v = 1, keep = true },
+        { g = "a", v = 2, keep = false },
+        { g = "b", v = 3, keep = true },
+        { g = "b", v = 4, keep = false },
+      }
+    group by
+      t.g
+    select {
+      g = key,
+      s1 = sum(t.v) filter(where t.keep == true),
+      s2 = sum(t.v) filter(where t.keep == true),
+    }
+    order by
+      sum(t.v) filter(where t.keep == true) desc
+  ]]
+
+  assertEquals(#r, 2)
+  assertEquals(r[1].g, "b")
+  assertEquals(r[1].s1, 3)
+  assertEquals(r[1].s2, 3)
+  assertEquals(r[2].g, "a")
+  assertEquals(r[2].s1, 1)
+  assertEquals(r[2].s2, 1)
+end
