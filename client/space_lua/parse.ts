@@ -1494,9 +1494,17 @@ function parseQueryClause(t: ParseTree, ctx: ASTCtx): LuaQueryClause {
       if (!fieldListNode) {
         throw new Error("GroupByClause missing FieldList");
       }
+      const fields = parseFieldList(fieldListNode, ctx);
+      for (const field of fields) {
+        if (field.type === "DynamicField") {
+          throw new Error(
+            "dynamic keyed fields are not allowed in 'group by'",
+          );
+        }
+      }
       return {
         type: "GroupBy",
-        fields: parseFieldList(fieldListNode, ctx),
+        fields,
         ctx: context(t, ctx),
       };
     }
