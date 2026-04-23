@@ -177,14 +177,8 @@ LeadingClause { ckw<"leading"> FieldList }
 WhereClause { ckw<"where"> exp }
 LimitClause { ckw<"limit"> exp ("," exp)? }
 OffsetClause { ckw<"offset"> exp }
-
 OrderByClause { ckw<"order">  ckw<"by"> list<OrderBy> }
-OrderByExpr {
-  exp |
-  OrderBySelectKey { BracketKey }
-}
-OrderBy { OrderByExpr (ckw<"desc"> | ckw<"asc"> | UsingClause)? (ckw<"nulls"> (ckw<"first"> | ckw<"last">))? }
-
+OrderBy { exp (ckw<"desc"> | ckw<"asc"> | UsingClause)? (ckw<"nulls"> (ckw<"first"> | ckw<"last">))? }
 SelectClause { ckw<"select"> setQuantifier? FieldList }
 GroupByClause { ckw<"group"> ckw<"by"> FieldList }
 HavingClause { ckw<"having"> exp }
@@ -201,10 +195,8 @@ JoinHint {
 JoinType { ckw<"inner"> | ckw<"semi"> | ckw<"anti"> }
 JoinMethod { ckw<"hash"> | ckw<"merge"> | ckw<"loop"> UsingClause? }
 
-BracketKey { "[" exp "]" }
-
 field[@isGroup=Field] {
-  FieldDynamic { BracketKey "=" exp } |
+  FieldDynamic { "[" exp "]" "=" exp } |
   FieldProp { Name "=" exp } |
   FieldExp { exp }
 }

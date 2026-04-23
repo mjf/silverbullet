@@ -1427,7 +1427,6 @@ function parseQueryClause(t: ParseTree, ctx: ASTCtx): LuaQueryClause {
       }
 
       const fields = parseFromFieldList(fieldListNode, ctx);
-      validateFromFieldsForClause(fields);
 
       return {
         type: "From",
@@ -1688,20 +1687,6 @@ function parseJoinHint(t: ParseTree, ctx: ASTCtx): LuaJoinHint {
   return hint;
 }
 
-function validateFromFieldsForClause(fields: LuaFromField[]): void {
-  if (fields.length <= 1) {
-    return;
-  }
-
-  for (const field of fields) {
-    if (field.type !== "PropField") {
-      throw new Error(
-        "multi-source 'from' requires named sources",
-      );
-    }
-  }
-}
-
 function parseFromFieldList(t: ParseTree, ctx: ASTCtx): LuaFromField[] {
   if (t.type !== "FromFieldList") {
     throw new Error(`Expected FromFieldList, got ${t.type}`);
@@ -1851,16 +1836,11 @@ function parseOrderByExpression(
   }
 
   if (child.type === "OrderBySelectKey") {
-    const bracketKey = child.children?.find((c) => c.type === "BracketKey");
-    if (!bracketKey) {
-      throw new Error("OrderBySelectKey missing BracketKey");
-    }
-
-    const keyExprNode = bracketKey.children?.find(
+    const keyExprNode = child.children?.find(
       (c) => c.type && c.type !== "[" && c.type !== "]",
     );
     if (!keyExprNode) {
-      throw new Error("BracketKey missing key expression");
+      throw new Error("OrderBySelectKey missing key expression");
     }
 
     const key = parseExpression(keyExprNode, ctx);
@@ -2023,31 +2003,18 @@ function parseTableField(t: ParseTree, ctx: ASTCtx): LuaTableField {
         ctx: context(t, ctx),
       };
     case "FieldDynamic": {
-      const bracketKey = t.children?.find((c) => c.type === "BracketKey");
-      const valueNode = t.children
-        ?.slice()
-        .reverse()
-        .find((c) => c.type && c.type !== "=");
-
-      if (!bracketKey) {
-        throw new Error("FieldDynamic missing BracketKey");
-      }
-
-      const keyNode = bracketKey.children?.find(
-        (c) => c.type && c.type !== "[" && c.type !== "]",
+      const exprChildren = t.children!.filter(
+        (c) => c.type && c.type !== "[" && c.type !== "]" && c.type !== "=",
       );
-      if (!keyNode) {
-        throw new Error("BracketKey missing key expression");
-      }
 
-      if (!valueNode || valueNode === bracketKey) {
-        throw new Error("FieldDynamic missing value expression");
+      if (exprChildren.length < 2) {
+        throw new Error("FieldDynamic requires key and value expressions");
       }
 
       return {
         type: "DynamicField",
-        key: parseExpression(keyNode, ctx),
-        value: parseExpression(valueNode, ctx),
+        key: parseExpression(exprChildren[0], ctx),
+        value: parseExpression(exprChildren[1], ctx),
         ctx: context(t, ctx),
       };
     }
