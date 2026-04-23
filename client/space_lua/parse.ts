@@ -1423,11 +1423,15 @@ function parseQueryClause(t: ParseTree, ctx: ASTCtx): LuaQueryClause {
       // children: ckw<"from">, FromFieldList
       const fieldListNode = t.children!.find((c) => c.type === "FromFieldList");
       if (!fieldListNode) {
-        throw new Error("FromClause missing FromFieldList");
+        throw new Error("`from` clause is missing sources");
       }
+
+      const fields = parseFromFieldList(fieldListNode, ctx);
+      validateFromFieldsForClause(fields);
+
       return {
         type: "From",
-        fields: parseFromFieldList(fieldListNode, ctx),
+        fields,
         ctx: context(t, ctx),
       };
     }
@@ -1519,11 +1523,21 @@ function parseQueryClause(t: ParseTree, ctx: ASTCtx): LuaQueryClause {
       // children: ckw<"leading">, FieldList
       const fieldListNode = t.children!.find((c) => c.type === "FieldList");
       if (!fieldListNode) {
-        throw new Error("LeadingClause missing FieldList");
+        throw new Error("'leading' clause is missing sources");
       }
+
+      const fields = parseFieldList(fieldListNode, ctx);
+      for (const field of fields) {
+        if (!(field.type === "ExpressionField" && field.value.type === "Variable")) {
+          throw new Error(
+            "'leading' entries must be plain source names",
+          );
+        }
+      }
+
       return {
         type: "Leading",
-        fields: parseFieldList(fieldListNode, ctx),
+        fields,
         ctx: context(t, ctx),
       };
     }
@@ -1672,6 +1686,20 @@ function parseJoinHint(t: ParseTree, ctx: ASTCtx): LuaJoinHint {
   if (joinType) hint.joinType = joinType;
   if (using !== undefined) hint.using = using;
   return hint;
+}
+
+function validateFromFieldsForClause(fields: LuaFromField[]): void {
+  if (fields.length <= 1) {
+    return;
+  }
+
+  for (const field of fields) {
+    if (field.type !== "PropField") {
+      throw new Error(
+        "multi-source 'from' requires named sources",
+      );
+    }
+  }
 }
 
 function parseFromFieldList(t: ParseTree, ctx: ASTCtx): LuaFromField[] {
