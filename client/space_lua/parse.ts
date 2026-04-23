@@ -22,6 +22,7 @@ import type {
   LuaJoinHint,
   LuaLValue,
   LuaOrderBy,
+  LuaOrderBySelectKeyExpression,
   LuaPrefixExpression,
   LuaQueryClause,
   LuaStatement,
@@ -1800,12 +1801,55 @@ function parseWithClause(t: ParseTree): LuaWithHints {
   return hints;
 }
 
+function parseOrderByExpression(
+  t: ParseTree,
+  ctx: ASTCtx,
+): LuaExpression {
+  if (t.type !== "OrderByExpr") {
+    return parseExpression(t, ctx);
+  }
+
+  const child = t.children?.[0];
+  if (!child) {
+    throw new Error("OrderByExpr missing child");
+  }
+
+  if (child.type === "OrderBySelectKey") {
+    const bracketKey = child.children?.find((c) => c.type === "BracketKey");
+    if (!bracketKey) {
+      throw new Error("OrderBySelectKey missing BracketKey");
+    }
+
+    const keyExprNode = bracketKey.children?.find(
+      (c) => c.type && c.type !== "[" && c.type !== "]",
+    );
+    if (!keyExprNode) {
+      throw new Error("BracketKey missing key expression");
+    }
+
+    const key = parseExpression(keyExprNode, ctx);
+    if (key.type !== "String") {
+      throw new Error("order by projected key must use a string literal");
+    }
+
+    const expr: LuaOrderBySelectKeyExpression = {
+      type: "OrderBySelectKey",
+      key,
+      ctx: context(child, ctx),
+    };
+    return expr;
+  }
+
+  return parseExpression(child, ctx);
+}
+
 // Parse a single OrderBy node (shared by query OrderByClause and AggOrderBy)
 function parseOrderByNode(child: ParseTree, ctx: ASTCtx): LuaOrderBy {
   const kids = child.children!;
   let direction: "asc" | "desc" = "asc";
   let nulls: "first" | "last" | undefined;
   let usingVal: string | LuaFunctionBody | undefined;
+
   for (let i = 1; i < kids.length; i++) {
     const typ = kids[i].type;
     if (typ === "desc") direction = "desc";
@@ -1816,9 +1860,12 @@ function parseOrderByNode(child: ParseTree, ctx: ASTCtx): LuaOrderBy {
       usingVal = parseUsingClause(kids[i], ctx);
     }
   }
+
+  const exprNode = kids.find((k) => k.type === "OrderByExpr") ?? kids[0];
+
   const ob: LuaOrderBy = {
     type: "Order",
-    expression: parseExpression(kids[0], ctx),
+    expression: parseOrderByExpression(exprNode, ctx),
     direction,
     ctx: context(child, ctx),
   };
@@ -1939,13 +1986,35 @@ function parseTableField(t: ParseTree, ctx: ASTCtx): LuaTableField {
         value: parseExpression(t.children![2], ctx),
         ctx: context(t, ctx),
       };
-    case "FieldDynamic":
+    case "FieldDynamic": {
+      const bracketKey = t.children?.find((c) => c.type === "BracketKey");
+      const valueNode = t.children
+        ?.slice()
+        .reverse()
+        .find((c) => c.type && c.type !== "=");
+
+      if (!bracketKey) {
+        throw new Error("FieldDynamic missing BracketKey");
+      }
+
+      const keyNode = bracketKey.children?.find(
+        (c) => c.type && c.type !== "[" && c.type !== "]",
+      );
+      if (!keyNode) {
+        throw new Error("BracketKey missing key expression");
+      }
+
+      if (!valueNode || valueNode === bracketKey) {
+        throw new Error("FieldDynamic missing value expression");
+      }
+
       return {
         type: "DynamicField",
-        key: parseExpression(t.children![1], ctx),
-        value: parseExpression(t.children![4], ctx),
+        key: parseExpression(keyNode, ctx),
+        value: parseExpression(valueNode, ctx),
         ctx: context(t, ctx),
       };
+    }
     default:
       console.error(t);
       throw new Error(`Unknown table field type: ${t.type}`);

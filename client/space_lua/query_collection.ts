@@ -17,6 +17,7 @@ import type {
   LuaFilteredCallExpression,
   LuaFunctionBody,
   LuaFunctionCallExpression,
+  LuaOrderBySelectKeyExpression,
   LuaParenthesizedExpression,
   LuaPropField,
   LuaUnaryExpression,
@@ -1237,6 +1238,59 @@ async function usingCompare(
   return 0;
 }
 
+function orderByNeedsSelectKeys(orderBy: LuaOrderBy[] | undefined): boolean {
+  if (!orderBy) return false;
+  return orderBy.some((o) => o.expr.type === "OrderBySelectKey");
+}
+
+async function evalOrderByExpr(
+  expr: LuaExpression,
+  itemEnv: LuaEnv,
+  sf: LuaStackFrame,
+  grouped: boolean,
+  groupTable: LuaTable | undefined,
+  objectVariable: string | undefined,
+  outerEnv: LuaEnv,
+  config: Config,
+  selectRow: any,
+  aggregateInstrumentation?: AggregateRuntimeInstrumentation,
+  aggregateCtx?: AggregateEvalContext,
+): Promise<LuaValue> {
+  if (expr.type === "OrderBySelectKey") {
+    const ob = expr as LuaOrderBySelectKeyExpression;
+
+    if (ob.key.type !== "String") {
+      throw new LuaRuntimeError(
+        "order by projected key must use a string literal",
+        sf.withCtx(ob.ctx),
+      );
+    }
+
+    if (!(selectRow instanceof LuaTable)) {
+      return null;
+    }
+
+    const v = luaGet(selectRow, ob.key.value, sf.astCtx ?? null, sf);
+    return isSqlNull(v) ? null : v;
+  }
+
+  if (grouped) {
+    return evalExpressionWithAggregates(
+      expr,
+      itemEnv,
+      sf,
+      groupTable!,
+      objectVariable,
+      outerEnv,
+      config,
+      aggregateInstrumentation,
+      aggregateCtx,
+    );
+  }
+
+  return evalExpression(expr, itemEnv, sf);
+}
+
 /**
  * Pre-compute all sort keys for each result item (Schwartzian transform)
  * and evaluate each `order by` expression exactly once per item
@@ -1263,38 +1317,40 @@ async function precomputeSortKeys(
     const item = results[i];
     const luaItem = unwrapGroupedItem(item);
     const itemEnv = mkEnv(objectVariable, luaItem, env, sf);
-    if (selectResults) {
-      const row = selectResults[i];
-      if (row) {
-        for (const k of luaKeys(row)) {
-          const v = luaGet(row, k, sf.astCtx ?? null, sf);
-          itemEnv.setLocal(k, isSqlNull(v) ? null : v);
-        }
+    const selectRow = selectResults?.[i];
+
+    if (selectRow instanceof LuaTable) {
+      for (const k of luaKeys(selectRow)) {
+        const v = luaGet(selectRow, k, sf.astCtx ?? null, sf);
+        itemEnv.setLocal(k, isSqlNull(v) ? null : v);
       }
     }
+
     const keys: any[] = new Array(orderBy.length);
-    if (grouped) {
-      const aggregateCtx = getGroupedAggregateContext(item);
+    const aggregateCtx = grouped
+      ? getGroupedAggregateContext(item)
+      : undefined;
+    if (aggregateCtx) {
       resetAggregateEvalContext(aggregateCtx);
-      const groupTable = luaItem.rawGet("group");
-      for (let j = 0; j < orderBy.length; j++) {
-        keys[j] = await evalExpressionWithAggregates(
-          orderBy[j].expr,
-          itemEnv,
-          sf,
-          groupTable,
-          objectVariable,
-          env,
-          config,
-          aggregateInstrumentation,
-          aggregateCtx,
-        );
-      }
-    } else {
-      for (let j = 0; j < orderBy.length; j++) {
-        keys[j] = await evalExpression(orderBy[j].expr, itemEnv, sf);
-      }
     }
+    const groupTable = grouped ? luaItem.rawGet("group") : undefined;
+
+    for (let j = 0; j < orderBy.length; j++) {
+      keys[j] = await evalOrderByExpr(
+        orderBy[j].expr,
+        itemEnv,
+        sf,
+        grouped,
+        groupTable,
+        objectVariable,
+        env,
+        config,
+        selectRow,
+        aggregateInstrumentation,
+        aggregateCtx,
+      );
+    }
+
     allKeys[i] = keys;
   }
   return allKeys;
@@ -1619,30 +1675,40 @@ export async function applyQuery(
 
   let selectResults: any[] | undefined;
 
-  // Pre-compute select for grouped + ordered queries
-  if (grouped && query.select && query.orderBy) {
+  const needsSelectResultsForOrderBy =
+    !!query.select &&
+    !!query.orderBy &&
+    (grouped || orderByNeedsSelectKeys(query.orderBy));
+
+  // Pre-compute select results when ORDER BY depends on projected values.
+  if (needsSelectResultsForOrderBy) {
     const stageStart = nowMs();
     const inputRows = results.length;
-    const selectExpr = query.select;
+    const selectExpr = query.select!;
     selectResults = [];
     for (const item of results) {
-      const luaItem = unwrapGroupedItem(item);
-      const aggregateCtx = getGroupedAggregateContext(item);
-      resetAggregateEvalContext(aggregateCtx);
       const itemEnv = mkEnv(query.objectVariable, item, env, sf);
-      const groupTable = luaItem.rawGet("group");
-      const selected = await evalExpressionWithAggregates(
-        selectExpr,
-        itemEnv,
-        sf,
-        groupTable,
-        query.objectVariable,
-        env,
-        config,
-        aggregateInstrumentation,
-        aggregateCtx,
-      );
-      selectResults.push(selected);
+
+      if (grouped) {
+        const luaItem = unwrapGroupedItem(item);
+        const aggregateCtx = getGroupedAggregateContext(item);
+        resetAggregateEvalContext(aggregateCtx);
+        const groupTable = luaItem.rawGet("group");
+        const selected = await evalExpressionWithAggregates(
+          selectExpr,
+          itemEnv,
+          sf,
+          groupTable,
+          query.objectVariable,
+          env,
+          config,
+          aggregateInstrumentation,
+          aggregateCtx,
+        );
+        selectResults.push(selected);
+      } else {
+        selectResults.push(await evalSelectExpression(selectExpr, itemEnv, sf));
+      }
     }
     selectResults = normalizeSelectResults(selectResults);
     emitStageStat(

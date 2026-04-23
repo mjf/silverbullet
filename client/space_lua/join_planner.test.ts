@@ -1649,7 +1649,7 @@ describe("aggregate-local explain nodes", () => {
     const filterNode = aggNode.children[0];
     expect(filterNode.nodeType).toBe("Filter");
     expect(filterNode.filterType).toBe("aggregate");
-    expect(filterNode.filterExpr).toContain("sum(t.v) filter((t.v > 10))");
+    expect(filterNode.filterExpr).toContain("sum(t.v) filter(t.v > 10)");
   });
 
   it("renders Filter (Aggregate) in explain output", () => {
@@ -1683,7 +1683,7 @@ describe("aggregate-local explain nodes", () => {
 
     expect(rendered.includes("Filter (Aggregate)")).toBe(true);
     expect(
-      rendered.includes("Aggregate Filter: sum(t.v) filter((t.v > 10))"),
+      rendered.includes("Aggregate Filter: sum(t.v) filter(t.v > 10)"),
     ).toBe(true);
   });
 

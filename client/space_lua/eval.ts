@@ -42,6 +42,7 @@ import {
 import {
   applyPushedFilters,
   attachAnalyzeQueryOpStats,
+  buildExplainScanNode,
   buildJoinTree,
   buildNormalizationInfoBySource,
   type ExplainNode,
@@ -1089,40 +1090,18 @@ function explainSingleSource(
   stats?: CollectionStats,
   withHints?: LuaFromField["withHints"],
   materialized?: boolean,
+  pushedFilterExpr?: string,
+  normalizationInfo?: SourceNormalizationInfo,
 ): ExplainNode {
-  const rows = withHints?.rows ?? stats?.rowCount ?? 100;
-  const width = withHints?.width ?? stats?.avgColumnCount ?? 5;
-  const cost = withHints?.cost ?? rows;
-  const isFnScan = sourceExpression.type === "FunctionCall";
-
-  const sourceHints: string[] = [];
-  if (materialized) {
-    sourceHints.push("materialized");
-  }
-  if (withHints?.rows !== undefined) {
-    sourceHints.push(`rows=${withHints.rows}`);
-  }
-  if (withHints?.width !== undefined) {
-    sourceHints.push(`width=${withHints.width}`);
-  }
-  if (withHints?.cost !== undefined) {
-    sourceHints.push(`cost=${withHints.cost}`);
-  }
-
-  return {
-    nodeType: isFnScan ? "FunctionScan" : "Scan",
-    source: sourceName,
-    functionCall: isFnScan ? exprToString(sourceExpression) : undefined,
-    sourceHints: sourceHints.length > 0 ? sourceHints : undefined,
-    startupCost: 0,
-    estimatedCost: cost,
-    estimatedRows: rows,
-    estimatedWidth: width,
-    statsSource: stats?.statsSource,
-    executionScanKind: stats?.executionCapabilities?.scanKind,
-    predicatePushdown: stats?.executionCapabilities?.predicatePushdown,
-    children: [],
-  };
+  return buildExplainScanNode({
+    sourceName,
+    sourceExpression,
+    stats,
+    withHints,
+    materialized,
+    pushedFilterExpr,
+    normalizationInfo,
+  });
 }
 
 /**
@@ -1916,6 +1895,19 @@ export function evalExpression(
 
             const stats = await getStatsForValue(collection, env, sf);
             const sourceName = objectVariable ?? "_";
+            const singleSourceNames = new Set([sourceName]);
+            const normalizationInfoBySource = buildNormalizationInfoBySource(
+              query.where,
+              singleSourceNames,
+            );
+            const pushedFilterExprBySource = new Map<string, string>();
+            const normalizationInfo = normalizationInfoBySource.get(sourceName);
+            if (normalizationInfo) {
+              pushedFilterExprBySource.set(
+                sourceName,
+                normalizationInfo.pushdownExpr,
+              );
+            }
 
             let explainPlan: ExplainNode | undefined;
             if (explainOpts) {
@@ -1930,6 +1922,8 @@ export function evalExpression(
                   stats,
                   fromSource.withHints,
                   fromSource.materialized,
+                  pushedFilterExprBySource.get(sourceName),
+                  normalizationInfo,
                 ),
                 explainQuery,
                 explainSourceStats,

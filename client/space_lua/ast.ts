@@ -177,7 +177,8 @@ export type LuaExpression =
   | LuaFunctionDefinition
   | LuaQueryExpression
   | LuaFilteredCallExpression
-  | LuaAggregateCallExpression;
+  | LuaAggregateCallExpression
+  | LuaOrderBySelectKeyExpression;
 
 export type LuaNilLiteral = {
   type: "Nil";
@@ -294,6 +295,12 @@ export type LuaAggregateCallExpression = {
   type: "AggregateCall";
   call: LuaFunctionCallExpression;
   orderBy: LuaOrderBy[];
+} & ASTContext;
+
+export type LuaOrderBySelectKeyExpression = {
+  type: "OrderBySelectKey";
+  key: LuaExpression;
+  ctx: ASTCtx;
 } & ASTContext;
 
 // Join hint attached to a from-clause source binding

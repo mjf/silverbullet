@@ -3329,6 +3329,75 @@ function explainNdvSource(
   return "row-count heuristic";
 }
 
+export function buildExplainScanNode(args: {
+  sourceName: string;
+  sourceExpression: LuaExpression;
+  stats?: CollectionStats;
+  withHints?: LuaWithHints;
+  materialized?: boolean;
+  hint?: LuaJoinHint;
+  pushedFilterExpr?: string;
+  normalizationInfo?: SourceNormalizationInfo;
+}): ExplainNode {
+  const rows =
+    args.withHints?.rows ?? args.stats?.rowCount ?? DEFAULT_ESTIMATED_ROWS;
+  const width =
+    args.withHints?.width ??
+    args.stats?.avgColumnCount ??
+    DEFAULT_ESTIMATED_WIDTH;
+  const estimatedCost = args.withHints?.cost ?? rows;
+  const isFnScan = args.sourceExpression.type === "FunctionCall";
+
+  let normalizationState: ExplainNode["normalizationState"] | undefined;
+  let normalizedPushdownExpr: string | undefined;
+  let normalizedLeftoverExpr: string | undefined;
+
+  if (args.normalizationInfo) {
+    normalizationState = args.normalizationInfo.state;
+    normalizedPushdownExpr = args.normalizationInfo.pushdownExpr;
+    normalizedLeftoverExpr = args.normalizationInfo.leftoverExpr;
+  } else if (args.pushedFilterExpr) {
+    normalizationState = "complete";
+    normalizedPushdownExpr = args.pushedFilterExpr;
+    normalizedLeftoverExpr = "none";
+  }
+
+  const sourceHints: string[] = [];
+  if (args.materialized) {
+    sourceHints.push("materialized");
+  }
+  if (args.withHints?.rows !== undefined) {
+    sourceHints.push(`rows=${args.withHints.rows}`);
+  }
+  if (args.withHints?.width !== undefined) {
+    sourceHints.push(`width=${args.withHints.width}`);
+  }
+  if (args.withHints?.cost !== undefined) {
+    sourceHints.push(`cost=${args.withHints.cost}`);
+  }
+
+  return {
+    nodeType: isFnScan ? "FunctionScan" : "Scan",
+    source: args.sourceName,
+    functionCall: isFnScan ? exprToString(args.sourceExpression) : undefined,
+    hintUsed: args.hint ? formatHintLabel(args.hint) : undefined,
+    sourceHints: sourceHints.length > 0 ? sourceHints : undefined,
+    startupCost: 0,
+    estimatedCost,
+    estimatedRows: rows,
+    estimatedWidth: width,
+    filterExpr: args.pushedFilterExpr,
+    pushedDownFilter: !!args.pushedFilterExpr,
+    statsSource: args.stats?.statsSource,
+    executionScanKind: args.stats?.executionCapabilities?.scanKind,
+    predicatePushdown: args.stats?.executionCapabilities?.predicatePushdown,
+    normalizationState,
+    normalizedPushdownExpr,
+    normalizedLeftoverExpr,
+    children: [],
+  };
+}
+
 export function explainJoinTree(
   tree: JoinNode,
   _opts: ExplainOptions,
@@ -3336,65 +3405,16 @@ export function explainJoinTree(
   normalizationInfoBySource?: Map<string, SourceNormalizationInfo>,
 ): ExplainNode {
   if (tree.kind === "leaf") {
-    const rows = estimatedRows(tree.source);
-    const width = estimatedWidth(tree.source);
-    const isFnScan = tree.source.expression.type === "FunctionCall";
-    const pushedFilterExpr = pushedFilterExprBySource?.get(tree.source.name);
-    const predicatePushdownKind =
-      tree.source.stats?.executionCapabilities?.predicatePushdown;
-
-    let normalizationState: ExplainNode["normalizationState"] | undefined;
-    let normalizedPushdownExpr: string | undefined;
-    let normalizedLeftoverExpr: string | undefined;
-
-    const normalizationInfo = normalizationInfoBySource?.get(tree.source.name);
-
-    if (normalizationInfo) {
-      normalizationState = normalizationInfo.state;
-      normalizedPushdownExpr = normalizationInfo.pushdownExpr;
-      normalizedLeftoverExpr = normalizationInfo.leftoverExpr;
-    } else if (pushedFilterExpr) {
-      normalizationState = "complete";
-      normalizedPushdownExpr = pushedFilterExpr;
-      normalizedLeftoverExpr = "none";
-    }
-
-    const sourceHints: string[] = [];
-    if (tree.source.materialized) {
-      sourceHints.push("materialized");
-    }
-    if (tree.source.withHints?.rows !== undefined) {
-      sourceHints.push(`rows=${tree.source.withHints.rows}`);
-    }
-    if (tree.source.withHints?.width !== undefined) {
-      sourceHints.push(`width=${tree.source.withHints.width}`);
-    }
-    if (tree.source.withHints?.cost !== undefined) {
-      sourceHints.push(`cost=${tree.source.withHints.cost}`);
-    }
-
-    return {
-      nodeType: isFnScan ? "FunctionScan" : "Scan",
-      source: tree.source.name,
-      functionCall: isFnScan ? exprToString(tree.source.expression) : undefined,
-      hintUsed: tree.source.hint
-        ? formatHintLabel(tree.source.hint)
-        : undefined,
-      sourceHints: sourceHints.length > 0 ? sourceHints : undefined,
-      startupCost: 0,
-      estimatedCost: estimatedSourceCost(tree.source),
-      estimatedRows: rows,
-      estimatedWidth: width,
-      filterExpr: pushedFilterExpr,
-      pushedDownFilter: !!pushedFilterExpr,
-      statsSource: tree.source.stats?.statsSource,
-      executionScanKind: tree.source.stats?.executionCapabilities?.scanKind,
-      predicatePushdown: predicatePushdownKind,
-      normalizationState,
-      normalizedPushdownExpr,
-      normalizedLeftoverExpr,
-      children: [],
-    };
+    return buildExplainScanNode({
+      sourceName: tree.source.name,
+      sourceExpression: tree.source.expression,
+      stats: tree.source.stats,
+      withHints: tree.source.withHints,
+      materialized: tree.source.materialized,
+      hint: tree.source.hint,
+      pushedFilterExpr: pushedFilterExprBySource?.get(tree.source.name),
+      normalizationInfo: normalizationInfoBySource?.get(tree.source.name),
+    });
   }
 
   const leftPlan = explainJoinTree(
@@ -3736,8 +3756,8 @@ export function wrapPlanWithQueryOps(
   const allAggDescs = dedupeAggregateDescriptions(allAggDescsRaw);
 
   if (query.groupBy && query.groupBy.length > 0) {
-    const keys = query.groupBy.map(
-      (g) => g.alias ?? formatOutputExpression(g.expr, runtimeConfig),
+    const keys = query.groupBy.map((g) =>
+      formatOutputExpression(g.expr, runtimeConfig),
     );
     const ndvGroupRows = estimateGroupRowsFromNdv(
       root.estimatedRows,
@@ -4143,6 +4163,8 @@ export function exprToString(expr: LuaExpression): string {
       return String(expr.value);
     case "Nil":
       return "nil";
+    case "OrderBySelectKey":
+      return `[${exprToString(expr.key)}]`;
     case "FunctionCall": {
       const prefix = exprToString(expr.prefix);
       const args = expr.args.map(exprToString).join(", ");
@@ -4161,7 +4183,7 @@ export function exprToString(expr: LuaExpression): string {
       return s;
     }
     case "FilteredCall":
-      return `${exprToString(expr.call)} filter((${exprToString(expr.filter)}))`;
+      return `${exprToString(expr.call)} filter(${exprToString(expr.filter)})`;
     case "AggregateCall": {
       let s = exprToString(expr.call);
       if (expr.orderBy.length > 0) {
@@ -4578,7 +4600,13 @@ function wrapAggregateLocalOps(
       estimatedRows: wrapped.estimatedRows,
       estimatedWidth: wrapped.estimatedWidth,
       filterExpr: aggregatesWithFilter
-        .map((agg) => `${agg.name}(${agg.args}) filter(${agg.filter})`)
+        .map((agg) => {
+          const filter =
+            agg.filter?.startsWith("(") && agg.filter.endsWith(")")
+              ? agg.filter.slice(1, -1)
+              : agg.filter;
+          return `${agg.name}(${agg.args}) filter(${filter})`;
+        })
         .join(", "),
       filterType: "aggregate",
       statsSource: wrapped.statsSource,
@@ -5043,10 +5071,10 @@ function formatNode(
     if (node.normalizationState) {
       lines.push(`${detailPad}Normalization: ${node.normalizationState}`);
       lines.push(
-        `${detailPad}Pushdown: ${node.normalizedPushdownExpr ?? "none"}`,
+        `${detailPad}Normalized Pushdown: ${node.normalizedPushdownExpr ?? "none"}`,
       );
       lines.push(
-        `${detailPad}Leftover: ${node.normalizedLeftoverExpr ?? "none"}`,
+        `${detailPad}Normalized Leftover: ${node.normalizedLeftoverExpr ?? "none"}`,
       );
     }
 
