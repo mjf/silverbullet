@@ -7113,3 +7113,969 @@ do
   assertEquals(r[2].s1, 1)
   assertEquals(r[2].s2, 1)
 end
+
+-- 153. Query-only `in` operator
+
+-- 153a. where: basic `in` with bound field
+do
+  local r = query [[
+    from
+      p = pages
+    where
+      p.name in { "Alice", "Bob", "Greg" }
+    select {
+      name = p.name,
+    }
+    order by
+      p.name
+  ]]
+
+  assertEquals(#r, 3)
+  assertEquals(r[1].name, "Alice")
+  assertEquals(r[2].name, "Bob")
+  assertEquals(r[3].name, "Greg")
+end
+
+-- 153b. where: basic `in` with unbound field
+do
+  local r = query [[
+    from
+      pages
+    where
+      name in { "Alice", "Carol" }
+    select {
+      name = name,
+    }
+    order by
+      name
+  ]]
+
+  assertEquals(#r, 2)
+  assertEquals(r[1].name, "Alice")
+  assertEquals(r[2].name, "Carol")
+end
+
+-- 153c. where: numeric `in`
+do
+  local r = query [[
+    from
+      p = pages
+    where
+      p.size in { 1, 3, 20 }
+    select {
+      name = p.name,
+      size = p.size,
+    }
+    order by
+      p.size
+  ]]
+
+  assertEquals(#r, 3)
+  assertEquals(r[1].name, "Fran")
+  assertEquals(r[1].size, 1)
+  assertEquals(r[2].name, "Ed")
+  assertEquals(r[2].size, 3)
+  assertEquals(r[3].name, "Bob")
+  assertEquals(r[3].size, 20)
+end
+
+-- 153d. where: boolean `in`
+do
+  local data = {
+    { name = "a", ok = true },
+    { name = "b", ok = false },
+    { name = "c", ok = true },
+  }
+
+  local r = query [[
+    from
+      p = data
+    where
+      p.ok in { true }
+    select {
+      name = p.name,
+    }
+    order by
+      p.name
+  ]]
+
+  assertEquals(#r, 2)
+  assertEquals(r[1].name, "a")
+  assertEquals(r[2].name, "c")
+end
+
+-- 153e. where: `not ... in`
+do
+  local r = query [[
+    from
+      p = pages
+    where
+      not p.name in { "Alice", "Bob", "Greg" }
+    select {
+      name = p.name,
+    }
+    order by
+      p.name
+  ]]
+
+  assertEquals(#r, 4)
+  assertEquals(r[1].name, "Carol")
+  assertEquals(r[2].name, "Dave")
+  assertEquals(r[3].name, "Ed")
+  assertEquals(r[4].name, "Fran")
+end
+
+-- 153f. where: `in {}` always false
+do
+  local r = query [[
+    from
+      p = pages
+    where
+      p.name in {}
+    select {
+      name = p.name,
+    }
+  ]]
+
+  assertEquals(#r, 0)
+end
+
+-- 153g. where: `not ... in {}` always true
+do
+  local r = query [[
+    from
+      p = pages
+    where
+      not p.name in {}
+    select {
+      name = p.name,
+    }
+  ]]
+
+  assertEquals(#r, #pages)
+end
+
+-- 153h. where: duplicates in RHS table do not matter
+do
+  local r = query [[
+    from
+      p = pages
+    where
+      p.name in { "Bob", "Bob", "Alice", "Bob" }
+    select {
+      name = p.name,
+    }
+    order by
+      p.name
+  ]]
+
+  assertEquals(#r, 2)
+  assertEquals(r[1].name, "Alice")
+  assertEquals(r[2].name, "Bob")
+end
+
+-- 153i. where: `{ nil }` behaves like an empty RHS under Lua table semantics
+do
+  local r = query [[
+    from
+      p = pages
+    where
+      p.tags[3] in { nil }
+    select {
+      name = p.name,
+    }
+  ]]
+
+  assertEquals(#r, 0)
+end
+
+-- 153j. where: `{ nil }` behaves like an empty RHS under Lua table semantics
+do
+  local r = query [[
+    from
+      p = pages
+    where
+      p.tags[1] in { nil }
+    select {
+      name = p.name,
+    }
+    order by
+      p.name
+  ]]
+
+  assertEquals(#r, 0)
+end
+
+-- 153k. where: nil mixed with other values in RHS
+do
+  local r = query [[
+    from
+      p = pages
+    where
+      p.tags[1] in { nil, "work" }
+    select {
+      name = p.name,
+    }
+    order by
+      p.name
+  ]]
+
+  -- Alice, Bob, Greg have "work"; Ed has nil
+  assertEquals(#r, 4)
+  assertEquals(r[1].name, "Alice")
+  assertEquals(r[2].name, "Bob")
+  assertEquals(r[3].name, "Ed")
+  assertEquals(r[4].name, "Greg")
+end
+
+-- 153l. where: RHS may be a variable holding a table
+do
+  local allowed = { "Alice", "Fran" }
+
+  local r = query [[
+    from
+      p = pages
+    where
+      p.name in allowed
+    select {
+      name = p.name,
+    }
+    order by
+      p.name
+  ]]
+
+  assertEquals(#r, 2)
+  assertEquals(r[1].name, "Alice")
+  assertEquals(r[2].name, "Fran")
+end
+
+-- 153m. where: RHS may be an expression producing a table
+do
+  local r = query [[
+    from
+      p = pages
+    where
+      p.name in { "Alice", "Bob" .. "" }
+    select {
+      name = p.name,
+    }
+    order by
+      p.name
+  ]]
+
+  assertEquals(#r, 2)
+  assertEquals(r[1].name, "Alice")
+  assertEquals(r[2].name, "Bob")
+end
+
+-- 153n. where: `in` works on projected query values
+do
+  local r = query [[
+    from
+      p = pages
+    where
+      p.size in { 5, 10, 15 }
+    select {
+      name = p.name,
+      size = p.size,
+    }
+    order by
+      p.size
+  ]]
+
+  assertEquals(#r, 3)
+  assertEquals(r[1].name, "Carol")
+  assertEquals(r[2].name, "Alice")
+  assertEquals(r[3].name, "Dave")
+end
+
+-- 153o. where: error when RHS is nil
+do
+  local ok, err = pcall(function()
+    local nothing = nil
+    local _r = query [[
+      from
+        p = pages
+      where
+        p.name in nothing
+      select {
+        name = p.name,
+      }
+    ]]
+  end)
+
+  assertEquals(ok, false)
+  assertTrue(
+    string.find(tostring(err), "'in' right%-hand side must be a table or array") ~= nil,
+    "expected rhs nil error, got: " .. tostring(err)
+  )
+end
+
+-- 153p. where: error when RHS is non-table scalar
+do
+  local ok, err = pcall(function()
+    local _r = query [[
+      from
+        p = pages
+      where
+        p.name in 123
+      select {
+        name = p.name,
+      }
+    ]]
+  end)
+
+  assertEquals(ok, false)
+  assertTrue(
+    string.find(tostring(err), "'in' right%-hand side must be a table or array") ~= nil,
+    "expected rhs scalar error, got: " .. tostring(err)
+  )
+end
+
+-- 153q. having: basic `in` without group by
+do
+  local r = query [[
+    from
+      p = pages
+    having
+      p.name in { "Alice", "Ed" }
+    select {
+      name = p.name,
+    }
+    order by
+      p.name
+  ]]
+
+  assertEquals(#r, 2)
+  assertEquals(r[1].name, "Alice")
+  assertEquals(r[2].name, "Ed")
+end
+
+-- 153r. having: `not ... in` without group by
+do
+  local r = query [[
+    from
+      p = pages
+    having
+      not p.name in { "Alice", "Ed" }
+    select {
+      name = p.name,
+    }
+    order by
+      p.name
+  ]]
+
+  assertEquals(#r, 5)
+  assertEquals(r[1].name, "Bob")
+  assertEquals(r[2].name, "Carol")
+  assertEquals(r[3].name, "Dave")
+  assertEquals(r[4].name, "Fran")
+  assertEquals(r[5].name, "Greg")
+end
+
+-- 153s. having: grouped query using key in { ... }
+do
+  local r = query [[
+    from
+      p = pages
+    where
+      p.tags[1] ~= nil
+    group by
+      p.tags[1]
+    having
+      key in { "work", "random" }
+    select {
+      tag = key,
+      n = count(),
+    }
+    order by
+      tag
+  ]]
+
+  assertEquals(#r, 2)
+  assertEquals(r[1].tag, "random")
+  assertEquals(r[1].n, 1)
+  assertEquals(r[2].tag, "work")
+  assertEquals(r[2].n, 3)
+end
+
+-- 153t. having: grouped query with `not key in { ... }`
+do
+  local r = query [[
+    from
+      p = pages
+    where
+      p.tags[1] ~= nil
+    group by
+      p.tags[1]
+    having
+      not key in { "work", "random" }
+    select {
+      tag = key,
+      n = count(),
+    }
+  ]]
+
+  assertEquals(#r, 1)
+  assertEquals(r[1].tag, "personal")
+  assertEquals(r[1].n, 2)
+end
+
+-- 153u. having: grouped query with aggregate result in { ... }
+do
+  local r = query [[
+    from
+      p = pages
+    where
+      p.tags[1] ~= nil
+    group by
+      p.tags[1]
+    having
+      count() in { 1, 3 }
+    select {
+      tag = key,
+      n = count(),
+    }
+    order by
+      tag
+  ]]
+
+  assertEquals(#r, 2)
+  assertEquals(r[1].tag, "random")
+  assertEquals(r[1].n, 1)
+  assertEquals(r[2].tag, "work")
+  assertEquals(r[2].n, 3)
+end
+
+-- 153v. having: grouped query with `#group in { ... }`
+do
+  local r = query [[
+    from
+      p = pages
+    where
+      p.tags[1] ~= nil
+    group by
+      p.tags[1]
+    having
+      #group in { 2, 3 }
+    select {
+      tag = key,
+      n = #group,
+    }
+    order by
+      tag
+  ]]
+
+  assertEquals(#r, 2)
+  assertEquals(r[1].tag, "personal")
+  assertEquals(r[1].n, 2)
+  assertEquals(r[2].tag, "work")
+  assertEquals(r[2].n, 3)
+end
+
+-- 153w. select: `in` in projected expression, bound
+do
+  local r = query [[
+    from
+      p = pages
+    select {
+      name = p.name,
+      hit = p.name in { "Alice", "Bob" },
+    }
+    order by
+      p.name
+  ]]
+
+  assertEquals(#r, 7)
+  assertEquals(r[1].name, "Alice")
+  assertEquals(r[1].hit, true)
+  assertEquals(r[2].name, "Bob")
+  assertEquals(r[2].hit, true)
+  assertEquals(r[3].name, "Carol")
+  assertEquals(r[3].hit, false)
+end
+
+-- 153x. select: `not ... in` in projected expression, unbound
+do
+  local r = query [[
+    from
+      pages
+    select {
+      name = name,
+      miss = not name in { "Alice", "Bob" },
+    }
+    order by
+      name
+  ]]
+
+  assertEquals(#r, 7)
+  assertEquals(r[1].name, "Alice")
+  assertEquals(r[1].miss, false)
+  assertEquals(r[2].name, "Bob")
+  assertEquals(r[2].miss, false)
+  assertEquals(r[3].name, "Carol")
+  assertEquals(r[3].miss, true)
+end
+
+-- 153y. select: scalar projection using `in`
+do
+  local r = query [[
+    from
+      p = pages
+    select all
+      p.name in { "Alice", "Greg" }
+    order by
+      p.name
+  ]]
+
+  assertEquals(#r, 7)
+  assertEquals(r[1], true)
+  assertEquals(r[2], false)
+  assertEquals(r[3], false)
+  assertEquals(r[4], false)
+  assertEquals(r[5], false)
+  assertEquals(r[6], false)
+  assertEquals(r[7], true)
+end
+
+-- 153z. group by: grouping on boolean result of `in`
+do
+  local r = query [[
+    from
+      p = pages
+    group by
+      p.name in { "Alice", "Bob" }
+    select {
+      k = key,
+      n = count(),
+    }
+    order by
+      k desc
+  ]]
+
+  assertEquals(#r, 2)
+  assertEquals(r[1].k, true)
+  assertEquals(r[1].n, 2)
+  assertEquals(r[2].k, false)
+  assertEquals(r[2].n, 5)
+end
+
+-- 153aa. order by: boolean expression using `in`
+do
+  local r = query [[
+    from
+      p = pages
+    select {
+      name = p.name,
+    }
+    order by
+      p.name in { "Alice", "Bob" } desc,
+      p.name
+  ]]
+
+  assertEquals(#r, 7)
+  assertEquals(r[1].name, "Alice")
+  assertEquals(r[2].name, "Bob")
+  assertEquals(r[3].name, "Carol")
+end
+
+-- 153ab. order by: projected key expression using `in`
+do
+  local r = query [[
+    from
+      p = pages
+    select {
+      name = p.name,
+      hit = p.name in { "Alice", "Bob" },
+    }
+    order by
+      hit desc, name
+  ]]
+
+  assertEquals(#r, 7)
+  assertEquals(r[1].name, "Alice")
+  assertEquals(r[1].hit, true)
+  assertEquals(r[2].name, "Bob")
+  assertEquals(r[2].hit, true)
+  assertEquals(r[3].name, "Carol")
+  assertEquals(r[3].hit, false)
+end
+
+-- 153ac. aggregate filter(where ...): `in` on bound field
+do
+  local r = query [[
+    from
+      p = pages
+    group by
+      "all"
+    select {
+      picked = count() filter(where p.name in { "Alice", "Bob", "Greg" }),
+    }
+  ]]
+
+  assertEquals(#r, 1)
+  assertEquals(r[1].picked, 3)
+end
+
+-- 153ad. aggregate filter(where ...): `not ... in` on bound field
+do
+  local r = query [[
+    from
+      p = pages
+    group by
+      "all"
+    select {
+      skipped = count() filter(where not p.name in { "Alice", "Bob", "Greg" }),
+    }
+  ]]
+
+  assertEquals(#r, 1)
+  assertEquals(r[1].skipped, 4)
+end
+
+-- 153ae. aggregate filter(where ...): `in` on unbound field
+do
+  local r = query [[
+    from
+      pages
+    group by
+      "all"
+    select {
+      picked = count() filter(where name in { "Alice", "Ed" }),
+    }
+  ]]
+
+  assertEquals(#r, 1)
+  assertEquals(r[1].picked, 2)
+end
+
+-- 153af. multi-source where: `in` on one source alongside join predicate
+do
+  local depts = {
+    { dept = "eng" },
+    { dept = "sales" },
+    { dept = "hr" },
+  }
+  local employees = {
+    { name = "Alice", dept = "eng" },
+    { name = "Bob", dept = "eng" },
+    { name = "Carol", dept = "sales" },
+    { name = "Eve", dept = "hr" },
+  }
+
+  local r = query [[
+    from
+      d = depts,
+      e = employees
+    where
+      d.dept == e.dept and e.name in { "Alice", "Carol" }
+    select {
+      dept = d.dept,
+      name = e.name,
+    }
+    order by
+      dept, name
+  ]]
+
+  assertEquals(#r, 2)
+  assertEquals(r[1].dept, "eng")
+  assertEquals(r[1].name, "Alice")
+  assertEquals(r[2].dept, "sales")
+  assertEquals(r[2].name, "Carol")
+end
+
+-- 153ag. multi-source where: `not ... in` on one source alongside join predicate
+do
+  local depts = {
+    { dept = "eng" },
+    { dept = "sales" },
+    { dept = "hr" },
+  }
+  local employees = {
+    { name = "Alice", dept = "eng" },
+    { name = "Bob", dept = "eng" },
+    { name = "Carol", dept = "sales" },
+    { name = "Eve", dept = "hr" },
+  }
+
+  local r = query [[
+    from
+      d = depts,
+      e = employees
+    where
+      d.dept == e.dept and not e.name in { "Alice", "Carol" }
+    select {
+      dept = d.dept,
+      name = e.name,
+    }
+    order by
+      dept, name
+  ]]
+
+  assertEquals(#r, 2)
+  assertEquals(r[1].dept, "eng")
+  assertEquals(r[1].name, "Bob")
+  assertEquals(r[2].dept, "hr")
+  assertEquals(r[2].name, "Eve")
+end
+
+-- 153ah. aggregate order by: `in` expression as sort key
+do
+  local data = {
+    { grp = "x", name = "Greg" },
+    { grp = "x", name = "Alice" },
+    { grp = "x", name = "Bob" },
+    { grp = "x", name = "Carol" },
+  }
+
+  local r = query [[
+    from
+      p = data
+    group by
+      p.grp
+    select {
+      names = array_agg(
+        p.name
+        order by p.name in { "Alice", "Bob" } desc, p.name asc
+      ),
+    }
+  ]]
+
+  assertEquals(#r, 1)
+  assertEquals(r[1].names[1], "Alice")
+  assertEquals(r[1].names[2], "Bob")
+  assertEquals(r[1].names[3], "Carol")
+  assertEquals(r[1].names[4], "Greg")
+end
+
+-- 153ai. aggregate order by: `not ... in` expression as sort key
+do
+  local data = {
+    { grp = "x", name = "Greg" },
+    { grp = "x", name = "Alice" },
+    { grp = "x", name = "Bob" },
+    { grp = "x", name = "Carol" },
+  }
+
+  local r = query [[
+    from
+      p = data
+    group by
+      p.grp
+    select {
+      names = array_agg(
+        p.name
+        order by not p.name in { "Alice", "Bob" } desc, p.name asc
+      ),
+    }
+  ]]
+
+  assertEquals(#r, 1)
+  assertEquals(r[1].names[1], "Carol")
+  assertEquals(r[1].names[2], "Greg")
+  assertEquals(r[1].names[3], "Alice")
+  assertEquals(r[1].names[4], "Bob")
+end
+
+-- 153aj. aggregate order by: unbound `in` expression as sort key
+do
+  local data = {
+    { grp = "x", name = "Greg" },
+    { grp = "x", name = "Alice" },
+    { grp = "x", name = "Bob" },
+    { grp = "x", name = "Carol" },
+  }
+
+  local r = query [[
+    from
+      data
+    group by
+      grp
+    select {
+      names = array_agg(
+        name
+        order by name in { "Alice", "Bob" } desc, name asc
+      ),
+    }
+  ]]
+
+  assertEquals(#r, 1)
+  assertEquals(r[1].names[1], "Alice")
+  assertEquals(r[1].names[2], "Bob")
+  assertEquals(r[1].names[3], "Carol")
+  assertEquals(r[1].names[4], "Greg")
+end
+
+-- 153ak. aggregate order by + filter(where ... in ...)
+do
+  local data = {
+    { grp = "x", name = "Greg", keep = false },
+    { grp = "x", name = "Alice", keep = true },
+    { grp = "x", name = "Bob", keep = true },
+    { grp = "x", name = "Carol", keep = false },
+  }
+
+  local r = query [[
+    from
+      p = data
+    group by
+      p.grp
+    select {
+      names = array_agg(
+        p.name
+        order by p.name in { "Alice", "Bob" } desc, p.name asc
+      ) filter(where p.name in { "Alice", "Bob", "Carol" }),
+    }
+  ]]
+
+  assertEquals(#r, 1)
+  assertEquals(r[1].names[1], "Alice")
+  assertEquals(r[1].names[2], "Bob")
+  assertEquals(r[1].names[3], "Carol")
+end
+
+-- 153al. aggregate order by: `in {}` yields all false and falls back to next key
+do
+  local data = {
+    { grp = "x", name = "Greg" },
+    { grp = "x", name = "Alice" },
+    { grp = "x", name = "Bob" },
+  }
+
+  local r = query [[
+    from
+      p = data
+    group by
+      p.grp
+    select {
+      names = array_agg(
+        p.name
+        order by p.name in {} desc, p.name asc
+      ),
+    }
+  ]]
+
+  assertEquals(#r, 1)
+  assertEquals(r[1].names[1], "Alice")
+  assertEquals(r[1].names[2], "Bob")
+  assertEquals(r[1].names[3], "Greg")
+end
+
+-- 153am. having: error when RHS is nil
+do
+  local ok, err = pcall(function()
+    local nothing = nil
+    local _r = query [[
+      from
+        p = pages
+      group by
+        "all"
+      having
+        count() in nothing
+      select {
+        n = count(),
+      }
+    ]]
+  end)
+
+  assertEquals(ok, false)
+  assertTrue(
+    string.find(tostring(err), "'in' right%-hand side must be a table or array") ~= nil,
+    "expected having rhs nil error, got: " .. tostring(err)
+  )
+end
+
+-- 153z. aggregate filter: `in` inside filter(where ...)
+
+-- 153z1. count with filter(where ... in ...)
+do
+  local r = query [[
+    from
+      p = pages
+    group by
+      "all"
+    select {
+      picked = count() filter(where p.name in { "Alice", "Greg", "Ed" }),
+      skipped = count() filter(where not p.name in { "Alice", "Greg", "Ed" }),
+    }
+  ]]
+
+  assertEquals(#r, 1)
+  assertEquals(r[1].picked, 3)
+  assertEquals(r[1].skipped, 4)
+end
+
+-- 153z2. array_agg with filter(where ... in ...)
+do
+  local r = query [[
+    from
+      p = pages
+    group by
+      "all"
+    select {
+      names = array_agg(p.name order by p.name asc)
+        filter(where p.tags[1] in { "work", "random" }),
+    }
+  ]]
+
+  assertEquals(#r, 1)
+  assertEquals(#r[1].names, 4)
+  assertEquals(r[1].names[1], "Alice")
+  assertEquals(r[1].names[2], "Bob")
+  assertEquals(r[1].names[3], "Fran")
+  assertEquals(r[1].names[4], "Greg")
+end
+
+-- 154. aggregate order by: `in` inside aggregate order-by expression
+
+-- 154a. array_agg ordered by boolean `in` expression desc
+do
+  local r = query [[
+    from
+      p = pages
+    group by
+      "all"
+    select {
+      names = array_agg(
+        p.name
+        order by p.name in { "Alice", "Greg" } desc, p.name asc
+      ),
+    }
+  ]]
+
+  assertEquals(#r, 1)
+  -- true first, then false; tie-break by name asc
+  assertEquals(r[1].names[1], "Alice")
+  assertEquals(r[1].names[2], "Greg")
+  assertEquals(r[1].names[3], "Bob")
+  assertEquals(r[1].names[4], "Carol")
+  assertEquals(r[1].names[5], "Dave")
+  assertEquals(r[1].names[6], "Ed")
+  assertEquals(r[1].names[7], "Fran")
+end
+
+-- 154b. array_agg ordered by `not ... in ...` desc
+do
+  local r = query [[
+    from
+      p = pages
+    group by
+      "all"
+    select {
+      names = array_agg(
+        p.name
+        order by not p.name in { "Alice", "Greg" } desc, p.name asc
+      ),
+    }
+  ]]
+
+  assertEquals(#r, 1)
+  -- names not in set first, then the listed names
+  assertEquals(r[1].names[1], "Bob")
+  assertEquals(r[1].names[2], "Carol")
+  assertEquals(r[1].names[3], "Dave")
+  assertEquals(r[1].names[4], "Ed")
+  assertEquals(r[1].names[5], "Fran")
+  assertEquals(r[1].names[6], "Alice")
+  assertEquals(r[1].names[7], "Greg")
+end

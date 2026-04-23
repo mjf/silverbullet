@@ -2501,6 +2501,20 @@ function isPushdownSafeExpressionForSource(
           return false;
       }
 
+    case "QueryIn":
+      return (
+        isPushdownSafeExpressionForSource(
+          expr.left,
+          sourceNames,
+          targetSource,
+        ) &&
+        isPushdownSafeExpressionForSource(
+          expr.right,
+          sourceNames,
+          targetSource,
+        )
+      );
+
     default:
       return false;
   }
@@ -2915,6 +2929,12 @@ function isExplicitlyScopedToSource(
         }
       });
 
+    case "QueryIn":
+      return (
+        isExplicitlyScopedToSource(expr.left, sourceNames, targetSource) &&
+        isExplicitlyScopedToSource(expr.right, sourceNames, targetSource)
+      );
+
     default:
       return false;
   }
@@ -2976,6 +2996,10 @@ function walkExprForSources(
     case "TableAccess":
       walkExprForSources(expr.object, sourceNames, refs);
       walkExprForSources(expr.key, sourceNames, refs);
+      break;
+    case "QueryIn":
+      walkExprForSources(expr.left, sourceNames, refs);
+      walkExprForSources(expr.right, sourceNames, refs);
       break;
     default:
       break;
@@ -4224,6 +4248,8 @@ export function exprToString(expr: LuaExpression): string {
       }
       return `{ ${parts.join(", ")} }`;
     }
+    case "QueryIn":
+      return `${exprToString(expr.left)} in ${exprToString(expr.right)}`;
     default:
       return "?";
   }
@@ -4385,6 +4411,11 @@ function exprStructurallyEquals(a: LuaExpression, b: LuaExpression): boolean {
     }
     case "FunctionDefinition":
       return a === b;
+    case "QueryIn":
+      return (
+        exprStructurallyEquals(a.left, (b as typeof a).left) &&
+        exprStructurallyEquals(a.right, (b as typeof a).right)
+      );
     default:
       return false;
   }

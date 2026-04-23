@@ -624,6 +624,11 @@ function containsAggregate(expr: LuaExpression, config?: Config): boolean {
             return false;
         }
       });
+    case "QueryIn":
+      return (
+        containsAggregate(expr.left, config) ||
+        containsAggregate(expr.right, config)
+      );
     default:
       return false;
   }
@@ -1140,6 +1145,40 @@ export async function evalExpressionWithAggregates(
   if (expr.type === "Parenthesized") {
     const paren = expr as LuaParenthesizedExpression;
     return singleResult(await recurse(paren.expression));
+  }
+  if (expr.type === "QueryIn") {
+    const left = singleResult(await recurse(expr.left));
+    const right = singleResult(await recurse(expr.right));
+
+    if (right instanceof LuaTable) {
+      for (let i = 1; i <= right.length; i++) {
+        const candidate = right.rawGet(i);
+        if (candidate === left) {
+          return true;
+        }
+      }
+
+      for (const key of luaKeys(right)) {
+        if (typeof key === "number" && Number.isInteger(key)) {
+          continue;
+        }
+        const candidate = right.rawGet(key);
+        if (candidate === left) {
+          return true;
+        }
+      }
+
+      return false;
+    }
+
+    if (Array.isArray(right)) {
+      return right.some((candidate) => candidate === left);
+    }
+
+    throw new LuaRuntimeError(
+      "'in' right-hand side must be a table or array",
+      sf.withCtx(expr.ctx),
+    );
   }
   return evalExpression(expr, env, sf);
 }

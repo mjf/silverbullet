@@ -111,6 +111,7 @@ import {
   luaFormatNumber,
   luaGet,
   luaIndexValue,
+  luaKeys,
   luaMarkToBeClosed,
   luaSet,
   luaTruthy,
@@ -1293,6 +1294,65 @@ export function evalExpression(
         };
 
         return rpThen(value, applyUnary);
+      }
+      case "QueryIn": {
+        const leftVal = evalExpression(e.left, env, sf);
+        const rightVal = evalExpression(e.right, env, sf);
+
+        const applyIn = (left: LuaValue, right: LuaValue): LuaValue => {
+          const leftSingle = singleResult(left);
+          const rightSingle = singleResult(right);
+
+          if (rightSingle instanceof LuaTable) {
+            for (let i = 1; i <= rightSingle.length; i++) {
+              const candidate = rightSingle.rawGet(i);
+              if (candidate === leftSingle) {
+                return true;
+              }
+            }
+
+            for (const key of luaKeys(rightSingle)) {
+              if (typeof key === "number" && Number.isInteger(key)) {
+                continue;
+              }
+              const candidate = rightSingle.rawGet(key);
+              if (candidate === leftSingle) {
+                return true;
+              }
+            }
+
+            return false;
+          }
+
+          if (Array.isArray(rightSingle)) {
+            return rightSingle.some((candidate) => candidate === leftSingle);
+          }
+
+          throw new LuaRuntimeError(
+            "'in' right-hand side must be a table or array",
+            sf.withCtx(e.ctx),
+          );
+        };
+
+        if (!isPromise(leftVal) && !isPromise(rightVal)) {
+          return applyIn(leftVal, rightVal);
+        }
+
+        if (isPromise(leftVal) && !isPromise(rightVal)) {
+          return (leftVal as Promise<LuaValue>).then((lv) =>
+            applyIn(lv, rightVal),
+          );
+        }
+
+        if (!isPromise(leftVal) && isPromise(rightVal)) {
+          return (rightVal as Promise<LuaValue>).then((rv) =>
+            applyIn(leftVal, rv),
+          );
+        }
+
+        return (leftVal as Promise<LuaValue>).then((lv) =>
+          (rightVal as Promise<LuaValue>).then((rv) => applyIn(lv, rv)),
+        );
       }
       case "Variable":
       case "FunctionCall":

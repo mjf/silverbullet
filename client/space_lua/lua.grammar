@@ -11,6 +11,7 @@
   xor @left,
   bitor @left,
   compare @left,
+  in @left,
   and @left,
   or @left
 }
@@ -88,6 +89,7 @@ exp {
   Query |
   FilteredCall { FunctionCall ckw<"filter"> "(" ckw<"where"> exp ")" }
 }
+
 
 Query {
   kw<"query"> "[[" QueryClause* "]]"
@@ -233,6 +235,7 @@ LiteralString { simpleString }
 BinaryExpression {
   exp !or kw<"or"> exp |
   exp !and kw<"and"> exp |
+  exp !in kw<"in"> exp |
   exp !compare CompareOp exp |
   exp !bitor BitOp{"|"} exp |
   exp !bitand BitOp{"&"} exp |

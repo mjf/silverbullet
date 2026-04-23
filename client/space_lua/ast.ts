@@ -176,6 +176,7 @@ export type LuaExpression =
   | LuaTableConstructor
   | LuaFunctionDefinition
   | LuaQueryExpression
+  | LuaQueryInExpression
   | LuaFilteredCallExpression
   | LuaAggregateCallExpression
   | LuaOrderBySelectKeyExpression;
@@ -300,6 +301,13 @@ export type LuaAggregateCallExpression = {
 export type LuaOrderBySelectKeyExpression = {
   type: "OrderBySelectKey";
   key: LuaExpression;
+  ctx: ASTCtx;
+} & ASTContext;
+
+export type LuaQueryInExpression = {
+  type: "QueryIn";
+  left: LuaExpression;
+  right: LuaExpression;
   ctx: ASTCtx;
 } & ASTContext;
 

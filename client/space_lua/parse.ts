@@ -1247,14 +1247,47 @@ function parseExpression(t: ParseTree, ctx: ASTCtx): LuaExpression {
         ctx: context(t, ctx),
       };
     }
-    case "BinaryExpression":
+    case "BinaryExpression": {
+      const operator = t.children![1].children![0].text!;
+
+      if (operator === "in") {
+        const left = parseExpression(t.children![0], ctx);
+        const right = parseExpression(t.children![2], ctx);
+
+        // Normalize:
+        //   not a in b
+        // into:
+        //   not (a in b)
+        if (left.type === "Unary" && left.operator === "not") {
+          return {
+            type: "Unary",
+            operator: "not",
+            argument: {
+              type: "QueryIn",
+              left: left.argument,
+              right,
+              ctx: context(t, ctx),
+            },
+            ctx: context(t, ctx),
+          };
+        }
+
+        return {
+          type: "QueryIn",
+          left,
+          right,
+          ctx: context(t, ctx),
+        };
+      }
+
       return {
         type: "Binary",
-        operator: t.children![1].children![0].text!,
+        operator,
         left: parseExpression(t.children![0], ctx),
         right: parseExpression(t.children![2], ctx),
         ctx: context(t, ctx),
       };
+    }
     case "UnaryExpression": {
       const op = t.children![0].children![0].text!;
       if (op === "+") {
