@@ -484,8 +484,15 @@ export class ObjectIndex {
             avgColumnCount: 0,
             statsSource: "computed-empty",
             executionCapabilities: {
-              predicatePushdown: "none",
-              scanKind: "index-scan",
+              engines: [
+                {
+                  id: "object-index-empty-scan",
+                  name: "Object index empty scan",
+                  kind: "index",
+                  capabilities: ["scan-index"],
+                  baseCostWeight: 1.0,
+                },
+              ],
             },
           };
         }
@@ -529,8 +536,53 @@ export class ObjectIndex {
           mcv: mcv.size > 0 ? mcv : undefined,
           statsSource,
           executionCapabilities: {
-            predicatePushdown: indexTrusted ? "bitmap-extended" : "none",
-            scanKind: "index-scan",
+            engines: [
+              {
+                id: indexTrusted
+                  ? "object-index-bitmap-extended"
+                  : "object-index-scan",
+                name: indexTrusted
+                  ? "Object index bitmap extended scan"
+                  : "Object index scan",
+                kind: "index",
+                capabilities: indexTrusted
+                  ? [
+                      "scan-index",
+                      "scan-bitmap",
+                      "stage-where",
+                      "pred-eq",
+                      "pred-neq",
+                      "pred-gt",
+                      "pred-gte",
+                      "pred-lt",
+                      "pred-lte",
+                      "expr-literal",
+                      "expr-column-qualified",
+                      "expr-column-unqualified",
+                      "bool-and",
+                      "stats-row-count",
+                      ...(indexComplete ? (["stats-ndv", "stats-mcv"] as const) : []),
+                    ]
+                  : [
+                      "scan-index",
+                      "stats-row-count",
+                      ...(indexComplete ? (["stats-ndv", "stats-mcv"] as const) : []),
+                    ],
+                baseCostWeight: indexTrusted ? 0.6 : 1.0,
+                capabilityCosts: indexTrusted
+                  ? {
+                      "pred-eq": 0.7,
+                      "pred-neq": 0.9,
+                      "pred-gt": 0.8,
+                      "pred-gte": 0.8,
+                      "pred-lt": 0.8,
+                      "pred-lte": 0.8,
+                      "bool-and": 0.7,
+                    }
+                  : undefined,
+                priority: indexTrusted ? 20 : 10,
+              },
+            ],
           },
         };
       },

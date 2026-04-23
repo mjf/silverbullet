@@ -79,7 +79,9 @@ import {
   untagNumber,
 } from "./numeric.ts";
 import {
+  collectionHasPlannerCapability,
   computeStatsFromArray,
+  makeExecutionCapabilities,
   type CollectionStats,
   type LuaCollectionQuery,
   type LuaGroupByEntry,
@@ -291,7 +293,6 @@ export function luaOp(
 ): any {
   switch (op) {
     case "+": {
-      // Ultra-fast path: both plain numbers with no float type annotation (int + int)
       if (
         typeof left === "number" &&
         typeof right === "number" &&
@@ -310,7 +311,6 @@ export function luaOp(
         rightType !== "float"
       ) {
         const r = left - right;
-        // Integer subtraction can produce -0 (e.g. 0 - 0), normalize to +0
         return r === 0 ? 0 : r;
       }
       return luaArithGeneric("-", left, right, leftType, rightType, ctx, sf);
@@ -323,7 +323,6 @@ export function luaOp(
         rightType !== "float"
       ) {
         const r = left * right;
-        // Integer multiplication can produce -0 (e.g. 0 * -1), normalize to +0
         return r === 0 ? 0 : r;
       }
       return luaArithGeneric("*", left, right, leftType, rightType, ctx, sf);
@@ -341,11 +340,9 @@ export function luaOp(
       );
     }
     case "..": {
-      // Fast path: string .. string (most common in SilverBullet — key building, templates)
       if (typeof left === "string" && typeof right === "string") {
         return left + right;
       }
-      // Fast path: string .. number or number .. string
       if (typeof left === "string" && typeof right === "number") {
         return left + luaFormatNumber(right);
       }
@@ -385,7 +382,6 @@ export function luaOp(
       }
     }
     case "==": {
-      // Fast path for same-type primitives
       if (typeof left === typeof right && typeof left !== "object") {
         return left === right;
       }
@@ -403,11 +399,9 @@ export function luaOp(
       return !luaEqWithMetamethod(left, right, ctx, sf);
     }
     case "<": {
-      // Fast path: both plain numbers
       if (typeof left === "number" && typeof right === "number") {
         return left < right;
       }
-      // Fast path: both strings
       if (typeof left === "string" && typeof right === "string") {
         return left < right;
       }
@@ -420,7 +414,6 @@ export function luaOp(
         return left <= right;
       return luaRelWithMetamethod("<=", left, right, ctx, sf);
     }
-    // Lua: `a>b` is `b<a`, `a>=b` is `b<=a`
     case ">": {
       if (typeof left === "number" && typeof right === "number")
         return left > right;
@@ -437,7 +430,6 @@ export function luaOp(
     }
   }
 
-  // Remaining operators: //, %, bitwise
   const handler = operatorsMetaMethods[op];
   if (!handler) {
     throw new LuaRuntimeError(`Unknown operator ${op}`, sf.withCtx(ctx));
@@ -496,7 +488,6 @@ function luaArithGeneric(
 
     const normalized = normalizeArithmeticResult(result, resultType);
 
-    // Operators `/` and `^` produce float, wrap only if needed.
     if (op === "/" || op === "^") {
       if (normalized === 0) {
         return makeLuaZero(normalized, "float");
@@ -622,7 +613,6 @@ function luaMod(
   const q = Math.floor(left / right);
   const result = left - q * right;
 
-  // Preserve -0.0 from left operand in float mode
   if (result === 0 && resultType === "float" && isNegativeZero(left)) {
     return makeLuaZero(-0, "float");
   }
@@ -970,7 +960,7 @@ async function buildQueryFromClauses(
   overrides?: { where?: LuaExpression },
 ): Promise<LuaCollectionQuery> {
   const query: LuaCollectionQuery = {
-    distinct: true, // default; overridden by Select clause if present
+    distinct: true,
   };
 
   for (const clause of q.clauses) {
@@ -1025,10 +1015,7 @@ function unknownDefaultStats(): CollectionStats {
     ndv: new Map(),
     avgColumnCount: 5,
     statsSource: "unknown-default",
-    executionCapabilities: {
-      predicatePushdown: "none",
-      scanKind: "kv-scan",
-    },
+    executionCapabilities: makeExecutionCapabilities("kv", ["scan-kv"]),
   };
 }
 
@@ -1060,7 +1047,6 @@ async function getStatsForValue(
     }
   }
 
-  // Queryable objects without getStats: use default estimate, don't materialize
   if (
     val &&
     typeof val === "object" &&
@@ -1139,6 +1125,23 @@ async function materializeValueAsItems(
   return [val];
 }
 
+function collectionSupportsPredicateDelegation(
+  stats: CollectionStats | undefined,
+): boolean {
+  return (
+    collectionHasPlannerCapability(stats, "stage-where") &&
+    (
+      collectionHasPlannerCapability(stats, "pred-eq") ||
+      collectionHasPlannerCapability(stats, "pred-neq") ||
+      collectionHasPlannerCapability(stats, "pred-lt") ||
+      collectionHasPlannerCapability(stats, "pred-lte") ||
+      collectionHasPlannerCapability(stats, "pred-gt") ||
+      collectionHasPlannerCapability(stats, "pred-gte") ||
+      collectionHasPlannerCapability(stats, "pred-in")
+    )
+  );
+}
+
 export function evalExpression(
   e: LuaExpression,
   env: LuaEnv,
@@ -1177,7 +1180,6 @@ export function evalExpression(
       case "Unary": {
         const u = asUnary(e);
 
-        // Fast path: negation of numeric literal
         if (u.operator === "-" && u.argument.type === "Number") {
           const num = u.argument;
           if (num.value === 0) {
@@ -1197,7 +1199,6 @@ export function evalExpression(
             const arg = singleResult(typed.value);
 
             return unaryWithMeta(arg, "__unm", u.ctx, sf, () => {
-              // Numeric-string coercion for unary minus
               if (typeof arg === "string") {
                 const n = coerceToNumber(arg);
                 if (n === null) {
@@ -1226,8 +1227,6 @@ export function evalExpression(
 
               const out = luaUnaryMinus(plain, argType);
 
-              // If the operand is a float-tagged boxed number, unary
-              // minus must keep the result float-typed.
               if (isTaggedFloat(arg)) {
                 if (out === 0) {
                   return makeLuaZero(out, "float");
@@ -1235,7 +1234,6 @@ export function evalExpression(
                 return makeLuaFloat(out);
               }
 
-              // Preserve numeric kind for zero results
               if (out === 0) {
                 const outType = argType ?? inferNumericType(plain);
                 return makeLuaZero(out, outType);
@@ -1363,8 +1361,6 @@ export function evalExpression(
       case "TableConstructor": {
         const tc = asTableConstructor(e);
         const table = new LuaTable();
-        // Expression fields assign consecutive integer keys starting
-        // at 1 and advance even when the value is `nil`.
         let nextArrayIndex = 1;
 
         const processField = (
@@ -1464,7 +1460,6 @@ export function evalExpression(
           return (async () => {
             const planT0 = performance.now();
 
-            // Check for plan order hint
             const planClause = q.clauses.find((c) => c.type === "Leading") as
               | LuaLeadingClause
               | undefined;
@@ -1480,9 +1475,6 @@ export function evalExpression(
 
             const materializedOverrides = new Map<string, any[]>();
 
-            // Gather planning stats only. This is planner metadata gathering,
-            // not execution of the actual query pipeline, except for sources
-            // explicitly marked `materialized`, which are eagerly realized once.
             for (const src of fromSource.sources) {
               const val = await evalExpression(src.expression, env, sf);
 
@@ -1493,8 +1485,20 @@ export function evalExpression(
                   ...computeStatsFromArray(items),
                   statsSource: "recomputed-materialized-exact",
                   executionCapabilities: {
-                    predicatePushdown: "none",
-                    scanKind: "materialized",
+                    engines: [
+                      {
+                        id: "materialized-recomputed",
+                        name: "Materialized recomputed rows",
+                        kind: "scan",
+                        capabilities: [
+                          "scan-materialized",
+                          "stats-row-count",
+                          "stats-ndv",
+                        ],
+                        baseCostWeight: 1.0,
+                        priority: 10,
+                      },
+                    ],
                   },
                 };
                 continue;
@@ -1517,7 +1521,6 @@ export function evalExpression(
               }
             }
 
-            // Extract equi-predicates from WHERE for join key pushdown
             const whereClause = q.clauses.find((c) => c.type === "Where");
             const sourceNames = new Set(fromSource.sources.map((s) => s.name));
             const equiPreds = extractEquiPredicates(
@@ -1525,19 +1528,14 @@ export function evalExpression(
               sourceNames,
             );
 
-            // Extract range predicates for selectivity estimation
             const rangePreds = extractRangePredicates(
               whereClause?.expression,
               sourceNames,
             );
 
-            // Single-source filter pushdown: extract filters that reference
-            // exactly one source and apply them before the join.
             const { pushed: pushedFilters, residual: pushdownResidualWhere } =
               extractSingleSourceFilters(whereClause?.expression, sourceNames);
 
-            // Transitive predicate generation — propagate single-source
-            // filters through equi-predicates to filter the other joined source.
             const transitiveFilters = generateTransitivePredicates(
               pushedFilters,
               equiPreds,
@@ -1572,10 +1570,6 @@ export function evalExpression(
               sourceNames,
             );
 
-            // Materialize and filter single-source pushdown inputs before join
-            // planning so both stats and execution use the filtered sources.
-            // Try delegation first: if the source supports native filtering
-            // (e.g. bitmap index), let it handle the predicate directly.
             for (const src of fromSource.sources) {
               const srcFilters = pushedFilters.filter(
                 (f) => f.sourceName === src.name,
@@ -1586,10 +1580,8 @@ export function evalExpression(
 
               const val = await evalExpression(src.expression, env, sf);
 
-              // Can the source handle filtering natively?
               const canDelegate =
-                src.stats?.executionCapabilities?.predicatePushdown !==
-                  "none" &&
+                collectionSupportsPredicateDelegation(src.stats) &&
                 val &&
                 typeof val === "object" &&
                 "query" in val &&
@@ -1598,9 +1590,6 @@ export function evalExpression(
               let filtered: any[];
 
               if (canDelegate) {
-                // Build a combined WHERE from all pushed filters for this source.
-                // The source's query() + extractBitmapPredicate handles qualified
-                // access via objectVariable matching.
                 const combinedWhere: LuaExpression =
                   srcFilters.length === 1
                     ? srcFilters[0].expression
@@ -1615,8 +1604,6 @@ export function evalExpression(
                         srcFilters[0].expression,
                       );
 
-                // Delegate: source uses bitmap index for what it can,
-                // applyQuery handles residual predicates internally.
                 filtered = await (val as any).query(
                   { where: combinedWhere, objectVariable: src.name },
                   env,
@@ -1624,7 +1611,6 @@ export function evalExpression(
                   globalThis.client?.config,
                 );
               } else {
-                // Fallback: materialize all rows, filter in JS
                 const items = await materializeValueAsItems(val, env, sf);
                 filtered = await applyPushedFilters(
                   items,
@@ -1640,8 +1626,6 @@ export function evalExpression(
               const originalMcv = src.stats?.mcv;
               const filteredStats = computeStatsFromArray(filtered);
 
-              // Preserve bitmap-index NDV/MCV when available,
-              // capped to filtered row count
               const filteredRowCount = filteredStats.rowCount;
               let finalNdv = filteredStats.ndv;
               let finalMcv = filteredStats.mcv;
@@ -1663,16 +1647,89 @@ export function evalExpression(
                 mcv: finalMcv,
                 unfilteredRowCount: originalRowCount,
                 statsSource: "recomputed-filtered-exact",
-                executionCapabilities: {
-                  ...(src.stats?.executionCapabilities ?? {}),
-                  scanKind: canDelegate ? "delegated-bitmap" : "materialized",
-                },
+                executionCapabilities: canDelegate
+                  ? {
+                      engines: [
+                        {
+                          id: "delegated-filter",
+                          name: "Delegated filtered source",
+                          kind: "bitmap",
+                          capabilities: [
+                            "scan-bitmap",
+                            "stage-where",
+                            "stats-row-count",
+                            ...(collectionHasPlannerCapability(src.stats, "pred-eq")
+                              ? (["pred-eq"] as const)
+                              : []),
+                            ...(collectionHasPlannerCapability(src.stats, "pred-neq")
+                              ? (["pred-neq"] as const)
+                              : []),
+                            ...(collectionHasPlannerCapability(src.stats, "pred-lt")
+                              ? (["pred-lt"] as const)
+                              : []),
+                            ...(collectionHasPlannerCapability(src.stats, "pred-lte")
+                              ? (["pred-lte"] as const)
+                              : []),
+                            ...(collectionHasPlannerCapability(src.stats, "pred-gt")
+                              ? (["pred-gt"] as const)
+                              : []),
+                            ...(collectionHasPlannerCapability(src.stats, "pred-gte")
+                              ? (["pred-gte"] as const)
+                              : []),
+                            ...(collectionHasPlannerCapability(src.stats, "pred-in")
+                              ? (["pred-in"] as const)
+                              : []),
+                            ...(collectionHasPlannerCapability(src.stats, "bool-and")
+                              ? (["bool-and"] as const)
+                              : []),
+                            ...(collectionHasPlannerCapability(src.stats, "bool-or")
+                              ? (["bool-or"] as const)
+                              : []),
+                            ...(collectionHasPlannerCapability(src.stats, "bool-not")
+                              ? (["bool-not"] as const)
+                              : []),
+                            ...(collectionHasPlannerCapability(src.stats, "expr-literal")
+                              ? (["expr-literal"] as const)
+                              : []),
+                            ...(collectionHasPlannerCapability(
+                              src.stats,
+                              "expr-column-qualified",
+                            )
+                              ? (["expr-column-qualified"] as const)
+                              : []),
+                            ...(collectionHasPlannerCapability(
+                              src.stats,
+                              "expr-column-unqualified",
+                            )
+                              ? (["expr-column-unqualified"] as const)
+                              : []),
+                          ],
+                          baseCostWeight: 0.6,
+                          priority: 20,
+                        },
+                      ],
+                    }
+                  : {
+                      engines: [
+                        {
+                          id: "materialized-filtered",
+                          name: "Materialized filtered rows",
+                          kind: "scan",
+                          capabilities: [
+                            "scan-materialized",
+                            "stats-row-count",
+                            "stats-ndv",
+                          ],
+                          baseCostWeight: 1.0,
+                          priority: 10,
+                        },
+                      ],
+                    },
               };
 
               materializedOverrides.set(src.name, filtered);
             }
 
-            // Planner config from user settings
             const plannerConfig: JoinPlannerConfig | undefined = globalThis
               .client?.config
               ? {
@@ -1703,7 +1760,6 @@ export function evalExpression(
                 }
               : undefined;
 
-            // Build optimized join tree
             const joinTree = buildJoinTree(
               fromSource.sources,
               planOrder,
@@ -1713,19 +1769,11 @@ export function evalExpression(
               plannerConfig,
             );
 
-            // Remove predicates already consumed by the join tree.
-            // This is required for correct semi/anti semantics, where the
-            // join predicate must not be re-applied as a post-join filter.
-            // It also strips residual join predicates attached to join nodes
-            // so they no longer appear in the post-join WHERE.
             const residualWhere = stripUsedJoinPredicates(
               pushdownResidualWhere,
               joinTree,
             );
 
-            // Validate that right-side sources of SEMI/ANTI joins are not
-            // referenced from post-join query clauses. They may participate
-            // in the join predicate itself, but are not available afterward.
             const selectClauseForValidation = q.clauses.find(
               (c) => c.type === "Select",
             );
@@ -1768,7 +1816,6 @@ export function evalExpression(
               sf,
             );
 
-            // Build explain plan shape from the same logical plan used for execution.
             let explainPlan: ExplainNode | undefined;
             if (explainOpts) {
               const explainQuery = await buildQueryFromClauses(q, env, sf, {
@@ -1802,7 +1849,6 @@ export function evalExpression(
               );
             }
 
-            // Planning ends here — capture boundary before execution
             const planEndT = performance.now();
 
             if (explainOpts && !explainOpts.analyze) {
@@ -1890,9 +1936,6 @@ export function evalExpression(
 
             const joinedCollection = toCollection(result);
 
-            // Map clauses to query parameters. The join predicates already embedded
-            // into the join tree must not be re-applied here, but any residual WHERE
-            // must still be evaluated on the joined rows before grouping/aggregation.
             const query = await buildQueryFromClauses(q, env, sf, {
               where: residualWhere,
             });
@@ -1904,7 +1947,6 @@ export function evalExpression(
           })();
         }
 
-        // Single-source
         const {
           objectVariable,
           expression: objectExpression,
@@ -1918,8 +1960,6 @@ export function evalExpression(
               throw new LuaRuntimeError("Collection is nil", sf.withCtx(q.ctx));
             }
 
-            // If already a queryable collection (e.g. DataStoreQueryCollection),
-            // use directly - skip all LuaTable/JS conversion.
             if (forceMaterialized) {
               const items = await materializeValueAsItems(collection, env, sf);
               collection = toCollection(items);
@@ -1929,27 +1969,22 @@ export function evalExpression(
               "query" in collection &&
               typeof (collection as any).query === "function"
             ) {
-              // Already queryable, use as-is
             } else if (collection instanceof LuaTable && collection.empty()) {
-              // Empty table → empty array
               collection = toCollection([]);
             } else if (collection instanceof LuaTable) {
               if (collection.length > 0) {
-                // Array-like table: extract array items, keep as LuaTables
                 const arr: any[] = [];
                 for (let i = 1; i <= collection.length; i++) {
                   arr.push(collection.rawGet(i));
                 }
                 collection = toCollection(arr);
               } else {
-                // Record-like table (no array part): treat as singleton
                 collection = toCollection([collection]);
               }
             } else {
               collection = toCollection(luaValueToJS(collection, sf));
             }
 
-            // Build up query object
             const query = await buildQueryFromClauses(q, env, sf);
             query.objectVariable = objectVariable;
 
@@ -1993,7 +2028,6 @@ export function evalExpression(
               );
             }
 
-            // Planning ends here — capture boundary before execution
             const planEndT = performance.now();
 
             if (explainOpts && !explainOpts.analyze) {
@@ -2056,7 +2090,6 @@ export function evalExpression(
               return formatExplainOutput(result, explainOpts);
             }
 
-            // Always use the possibly-wrapped collection
             return (collection as any)
               .query(query, env, sf, globalThis.client?.config)
               .then(jsToLuaValue);
@@ -2070,7 +2103,6 @@ export function evalExpression(
         );
     }
   } catch (err: any) {
-    // Repackage any non Lua-specific exceptions with some position information
     if (!err.constructor.name.startsWith("Lua")) {
       throw new LuaRuntimeError(err.message, sf.withCtx(e.ctx), err);
     } else {
@@ -2099,10 +2131,8 @@ function evalPrefixExpression(
       return evalExpression(p.expression, env, sf);
     }
 
-    // <<expr>>[<<expr>>]
     case "TableAccess": {
       const ta = asTableAccess(e);
-      // Sync-first: evaluate object and key without allocating Promise when both are sync.
       const objV = evalPrefixExpression(ta.object, env, sf);
       const keyV = evalExpression(ta.key, env, sf);
 
@@ -2119,10 +2149,8 @@ function evalPrefixExpression(
       );
     }
 
-    // <expr>.property
     case "PropertyAccess": {
       const pa = asPropertyAccess(e);
-      // Sync-first: evaluate object; avoid Promise when object is sync.
       const objV = evalPrefixExpression(pa.object, env, sf);
       if (!isPromise(objV)) {
         return luaGet(singleResult(objV), pa.property, pa.ctx, sf);
@@ -2135,8 +2163,6 @@ function evalPrefixExpression(
     case "FunctionCall": {
       const fc = asFunctionCall(e);
 
-      // `order by` inside function arguments is only valid for aggregate
-      // calls evaluated by the query engine
       if (fc.orderBy && fc.orderBy.length > 0) {
         throw new LuaRuntimeError(
           `'order by' is not allowed in non-aggregate function calls`,
@@ -2155,7 +2181,6 @@ function evalPrefixExpression(
         throw new LuaRuntimeError(nilMsg, sf.withCtx(fc.prefix.ctx));
       }
 
-      // Fast path: non-method call with sync prefix
       if (!fc.name && !isPromise(prefixValue)) {
         const argsVal = evalExpressions(fc.args, env, sf);
         if (!isPromise(argsVal)) {
@@ -2170,7 +2195,6 @@ function evalPrefixExpression(
         calleeVal: LuaValue,
         selfArgs: LuaValue[],
       ): LuaValue | Promise<LuaValue> => {
-        // Normal argument handling for hello:there(a, b, c) type calls
         if (fc.name) {
           const self = calleeVal;
           calleeVal = luaIndexValue(calleeVal, fc.name, sf);
@@ -2218,7 +2242,6 @@ function evalPrefixExpression(
   }
 }
 
-// Helper functions to reduce duplication
 function evalMetamethod(
   left: any,
   right: any,
@@ -2243,7 +2266,6 @@ function evalMetamethod(
   }
 }
 
-// Unary metamethod lookup and call
 function evalUnaryMetamethod(
   value: any,
   metaMethod: "__unm" | "__bnot",
@@ -2261,7 +2283,6 @@ function evalUnaryMetamethod(
   return luaCall(fn, [value], ctx, sf);
 }
 
-// Unary metamethod handling (with fallback)
 function unaryWithMeta(
   arg: any,
   meta: "__unm" | "__bnot",
@@ -2279,7 +2300,6 @@ function unaryWithMeta(
   return fallback();
 }
 
-// Logical short-circuit evaluation
 function evalLogical(
   op: "and" | "or",
   leftExpr: LuaExpression,
@@ -2356,7 +2376,6 @@ function evalBinaryWithLR(
     : undefined;
   const leftVal = evalExpression(leftExpr, env, sf);
 
-  // Sync-first fast path: avoid closure allocation when both operands are sync
   if (!isPromise(leftVal)) {
     const rightVal = evalExpression(rightExpr, env, sf);
     if (!isPromise(rightVal)) {
@@ -2440,7 +2459,6 @@ function getBinaryMM(
   mmName: string,
   sf: LuaStackFrame,
 ): any | null {
-  // Look in a's metatable first; if absent, look in b's.
   const ma = getMetatable(a, sf);
   if (ma) {
     const mmA = ma.rawGet(mmName);
@@ -2471,7 +2489,6 @@ function luaEqWithMetamethod(
   const ta = luaTypeName(a);
   const tb = luaTypeName(b);
 
-  // __eq only applies to tables/userdata
   const aOk = ta === "table" || ta === "userdata";
   const bOk = tb === "table" || tb === "userdata";
   if (!aOk || !bOk) {
@@ -2493,7 +2510,6 @@ function luaEqWithMetamethod(
     throw new LuaRuntimeError(`attempt to call a ${ty} value`, sf.withCtx(ctx));
   };
 
-  // Try left __eq first, then right.
   const mm = getEqMM(a) ?? getEqMM(b);
   if (!mm) {
     return false;
@@ -2548,12 +2564,10 @@ function luaRelWithMetamethod(
  * - throw error otherwise.
  */
 function luaLengthOp(val: any, ctx: ASTCtx, sf: LuaStackFrame): LuaValue {
-  // Strings: ignore `__len`
   if (typeof val === "string") {
     return val.length;
   }
 
-  // Tables: prefer metatable `__len` to raw length
   if (val instanceof LuaTable) {
     const mt = getMetatable(val, sf);
     if (mt) {
@@ -2565,7 +2579,6 @@ function luaLengthOp(val: any, ctx: ASTCtx, sf: LuaStackFrame): LuaValue {
     return val.length;
   }
 
-  // Other values: allow metatable `__len` first
   {
     const mt = getMetatable(val, sf);
     if (mt) {
@@ -2576,12 +2589,10 @@ function luaLengthOp(val: any, ctx: ASTCtx, sf: LuaStackFrame): LuaValue {
     }
   }
 
-  // JS arrays (interop): length if no `__len` override
   if (Array.isArray(val)) {
     return val.length;
   }
 
-  // Otherwise error with type
   const t = luaTypeOf(val) as LuaType;
   throw new LuaRuntimeError(
     `attempt to get length of a ${t} value`,
@@ -2597,22 +2608,18 @@ function evalExpressions(
   const len = es.length;
   if (len === 0) return [];
 
-  // Evaluate all arguments (sync-first); avoid .map() closure overhead
   const parts = new Array(len);
   for (let i = 0; i < len; i++) {
     parts[i] = evalExpression(es[i], env, sf);
   }
   const argsVal = rpAll(parts);
 
-  // In Lua multi-returns propagate only in tail position of an expression list.
   const finalize = (argsResolved: any[]) => {
     const out: LuaValue[] = [];
     const lastIdx = argsResolved.length - 1;
-    // All but last expression produce a single value
     for (let i = 0; i < lastIdx; i++) {
       out.push(singleResult(argsResolved[i]));
     }
-    // Last expression preserves multiple results
     const last = argsResolved[lastIdx];
     if (last instanceof LuaMultiRes) {
       out.push(...last.flatten().values);
@@ -2723,7 +2730,6 @@ function evalBlockNoClose(
   if (fnHasGotos === false || (!hasGotoFlag && !hasLabelFlag)) {
     const dup = b.dupLabelError;
     if (dup) {
-      // Duplicated labels detected by parser.
       throw new LuaRuntimeError(
         `label '${dup.name}' already defined`,
         sf.withCtx(dup.ctx),
@@ -2837,7 +2843,6 @@ export function evalStatement(
       );
 
       const apply = (values: LuaValue[], lvalues: { env: any; key: any }[]) => {
-        // Create the error-reporting frame once, not per-lvalue
         let errSf: LuaStackFrame | undefined;
         const ps: Promise<any>[] = [];
         for (let i = 0; i < lvalues.length; i++) {
@@ -2914,9 +2919,6 @@ export function evalStatement(
         return;
       }
 
-      // Evaluate initializers left-to-right and bind/mark `<close>`
-      // locals as soon as they receive a value.  This ensures earlier
-      // `<close>` locals are closed if a later initializer errors.
       const exprs = l.expressions!;
       const out: LuaValue[] = [];
       let boundCount = 0;
@@ -2960,8 +2962,6 @@ export function evalStatement(
 
           bindAvailable();
 
-          // If we already have enough values for all locals, remaining
-          // expressions will not affect the binding, so we can stop.
           if (out.length >= l.names.length && !isLastExpr) {
             return;
           }
@@ -2978,7 +2978,7 @@ export function evalStatement(
       return;
     }
     case "Label": {
-      const _lab = asLabel(s); // No-op!
+      const _lab = asLabel(s);
       return;
     }
     case "Goto": {
@@ -2992,10 +2992,6 @@ export function evalStatement(
         return evalBlockNoClose(b, env, sf, returnOnReturn);
       }
 
-      // Blocks establish a boundary (mark) and close all entries
-      // created within the block on exit or error, shrinking the stack
-      // back to mark.  This is _required_ for correct `pcall` and
-      // `xpcall` boundary semantics.
       const closeStack = luaEnsureCloseStack(sf);
       const mark = closeStack.length;
 
@@ -3018,7 +3014,6 @@ export function evalStatement(
     }
     case "If": {
       const iff = asIf(s);
-      // Evaluate conditions in order; avoid awaiting when not necessary
       const conds = iff.conditions;
 
       const runFrom = (
@@ -3050,7 +3045,6 @@ export function evalStatement(
     case "While": {
       const w = asWhile(s);
 
-      // Sync-first loop that re-enters sync mode after each async iteration
       const runSyncFirst = ():
         | undefined
         | ControlSignal
@@ -3094,7 +3088,6 @@ export function evalStatement(
     case "Repeat": {
       const rep = asRepeat(s);
 
-      // Sync-first loop that re-enters sync mode after each async iteration
       const runSyncFirst = ():
         | undefined
         | ControlSignal
@@ -3145,7 +3138,6 @@ export function evalStatement(
       let body = fn.body;
       let propNames = fn.name.propNames;
       if (fn.name.colonName) {
-        // function hello:there() -> function hello.there(self) transformation
         body = {
           ...fn.body,
           parameters: ["self", ...fn.body.parameters],
@@ -3257,7 +3249,6 @@ export function evalStatement(
             return evalStatement(fr.block, localEnv, sf, returnOnReturn);
           };
 
-      // Continuation that re-enters sync mode after each async iteration
       const runFromIndex = (
         loopEnv: LuaEnv,
         end: number,
@@ -3372,8 +3363,6 @@ export function evalStatement(
       const afterExprs = (resolved: any[]) => {
         const iteratorMultiRes = new LuaMultiRes(resolved).flatten();
         let iteratorValue: ILuaFunction | any = iteratorMultiRes.values[0];
-        // Handle the case where the iterator is a table and we need
-        // to call the `each` function.
         if (Array.isArray(iteratorValue) || iteratorValue instanceof LuaTable) {
           iteratorValue = (env.get("each") as ILuaFunction).call(
             sf,
@@ -3419,7 +3408,6 @@ export function evalStatement(
           throw e;
         };
 
-        // Allocate the reusable env once before the loop
         const loopEnv = canReuseEnv ? new LuaEnv(env) : null;
 
         const makeIterEnv = (): LuaEnv => {
@@ -3429,7 +3417,6 @@ export function evalStatement(
           return new LuaEnv(env);
         };
 
-        // Sync-first loop that re-enters sync mode after each async iteration
         const runSyncFirst = (): any => {
           while (true) {
             const iterCall = luaCall(

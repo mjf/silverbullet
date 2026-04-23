@@ -42,6 +42,10 @@ import {
 } from "./runtime.ts";
 import { asyncMergeSort } from "./util.ts";
 
+// Constants
+const KV_ENGINE_BASE_COST_WEIGHT = 1.4;
+const MATERIALIZED_ENGINE_BASE_COST_WEIGHT = 1.0;
+
 /**
  * Provenance / confidence class for collection statistics.
  *
@@ -68,9 +72,52 @@ export type StatsSource =
   | "computed-empty"
   | "unknown-default";
 
+export type PlannerCapability =
+  | "pred-eq"
+  | "pred-neq"
+  | "pred-lt"
+  | "pred-lte"
+  | "pred-gt"
+  | "pred-gte"
+  | "pred-in"
+  | "bool-and"
+  | "bool-or"
+  | "bool-not"
+  | "expr-literal"
+  | "expr-column-qualified"
+  | "expr-column-unqualified"
+  | "stage-where"
+  | "stage-order-by"
+  | "stage-limit"
+  | "stage-offset"
+  | "scan-kv"
+  | "scan-index"
+  | "scan-bitmap"
+  | "scan-materialized"
+  | "stats-row-count"
+  | "stats-ndv"
+  | "stats-mcv";
+
+export type QueryEngineKind =
+  | "scan"
+  | "kv"
+  | "bitmap"
+  | "index"
+  | "custom";
+
+export type QueryEngineCapability = {
+  id: string;
+  name: string;
+  kind: QueryEngineKind;
+  capabilities: PlannerCapability[];
+  baseCostWeight?: number;
+  capabilityCosts?: Partial<Record<PlannerCapability, number>>;
+  priority?: number;
+  metadata?: Record<string, string | number | boolean>;
+};
+
 export type CollectionExecutionCapabilities = {
-  predicatePushdown?: "none" | "basic" | "bitmap-basic" | "bitmap-extended";
-  scanKind?: "index-scan" | "kv-scan" | "delegated-bitmap" | "materialized";
+  engines: QueryEngineCapability[];
 };
 
 // Collection statistics for the cost-based planner
@@ -422,6 +469,14 @@ export function computeStatsFromArray(
   const ndv = new Map<string, number>();
   let totalColumnCount = 0;
 
+  const materializedScanEngine: QueryEngineCapability = {
+    id: "materialized-array-scan",
+    name: "Materialized array scan",
+    kind: "scan",
+    capabilities: ["scan-materialized"],
+    baseCostWeight: MATERIALIZED_ENGINE_BASE_COST_WEIGHT,
+  };
+
   if (items.length === 0) {
     return {
       rowCount: 0,
@@ -429,14 +484,12 @@ export function computeStatsFromArray(
       avgColumnCount: 0,
       statsSource: "computed-empty",
       executionCapabilities: {
-        predicatePushdown: "none",
-        scanKind: "materialized",
+        engines: [materializedScanEngine],
       },
     };
   }
 
   if (items.length <= EXACT_THRESHOLD) {
-    // Exact counting for small arrays
     const seen = new Map<string, Set<string>>();
     for (const item of items) {
       if (typeof item === "object" && item !== null) {
@@ -456,6 +509,7 @@ export function computeStatsFromArray(
         }
       }
     }
+
     for (const [k, s] of seen) {
       ndv.set(k, s.size);
     }
@@ -468,13 +522,20 @@ export function computeStatsFromArray(
       avgColumnCount,
       statsSource: "computed-exact-small",
       executionCapabilities: {
-        predicatePushdown: "none",
-        scanKind: "materialized",
+        engines: [
+          {
+            ...materializedScanEngine,
+            capabilities: [
+              "scan-materialized",
+              "stats-row-count",
+              "stats-ndv",
+            ],
+          },
+        ],
       },
     };
   }
 
-  // Sketch-based for large arrays
   const sketches = new Map<string, HalfXorSketch>();
   for (const item of items) {
     if (typeof item === "object" && item !== null) {
@@ -493,6 +554,7 @@ export function computeStatsFromArray(
       }
     }
   }
+
   for (const [k, sketch] of sketches) {
     ndv.set(k, sketch.estimate());
   }
@@ -505,8 +567,16 @@ export function computeStatsFromArray(
     avgColumnCount,
     statsSource: "computed-sketch-large",
     executionCapabilities: {
-      predicatePushdown: "none",
-      scanKind: "materialized",
+      engines: [
+        {
+          ...materializedScanEngine,
+          capabilities: [
+            "scan-materialized",
+            "stats-row-count",
+            "stats-ndv",
+          ],
+        },
+      ],
     },
   };
 }
@@ -2289,14 +2359,102 @@ export class DataStoreQueryCollection implements LuaQueryCollection {
     const rowCount = await this.dataStore.kv.countQuery({
       prefix: this.prefix,
     });
+
     return {
       rowCount,
       ndv: new Map(),
       statsSource: rowCount === 0 ? "computed-empty" : "unknown-default",
       executionCapabilities: {
-        predicatePushdown: "basic",
-        scanKind: "kv-scan",
+        engines: [
+          {
+            id: "kv-basic-filter",
+            name: "KV basic filter scan",
+            kind: "kv",
+            capabilities: [
+              "scan-kv",
+              "stage-where",
+              "pred-eq",
+              "pred-neq",
+              "pred-lt",
+              "pred-lte",
+              "pred-gt",
+              "pred-gte",
+              "bool-and",
+              "expr-literal",
+              "expr-column-qualified",
+              "expr-column-unqualified",
+              "stats-row-count",
+            ],
+            baseCostWeight: KV_ENGINE_BASE_COST_WEIGHT,
+            capabilityCosts: {
+              "pred-eq": 0.9,
+              "pred-neq": 1.0,
+              "pred-lt": 1.0,
+              "pred-lte": 1.0,
+              "pred-gt": 1.0,
+              "pred-gte": 1.0,
+              "bool-and": 0.8,
+            },
+          },
+        ],
       },
     };
   }
+}
+
+export function normalizeExecutionEngines(
+  caps: CollectionExecutionCapabilities | undefined,
+): QueryEngineCapability[] {
+  return caps?.engines ?? [];
+}
+
+export function makeQueryEngineCapability(
+  kind: QueryEngineKind,
+  capabilities: PlannerCapability[],
+  overrides: Partial<QueryEngineCapability> = {},
+): QueryEngineCapability {
+  return {
+    id: overrides.id ?? kind,
+    name: overrides.name ?? kind,
+    kind,
+    capabilities,
+    baseCostWeight: overrides.baseCostWeight,
+    capabilityCosts: overrides.capabilityCosts,
+    priority: overrides.priority,
+    metadata: overrides.metadata,
+  };
+}
+
+export function makeExecutionCapabilities(
+  kind: QueryEngineKind,
+  capabilities: PlannerCapability[],
+  overrides: Partial<QueryEngineCapability> = {},
+): CollectionExecutionCapabilities {
+  return {
+    engines: [makeQueryEngineCapability(kind, capabilities, overrides)],
+  };
+}
+
+export function collectionHasPlannerCapability(
+  stats: CollectionStats | undefined,
+  capability: PlannerCapability,
+): boolean {
+  const engines = stats?.executionCapabilities?.engines ?? [];
+  return engines.some((engine) => engine.capabilities.includes(capability));
+}
+
+export function collectionHasEngineKind(
+  stats: CollectionStats | undefined,
+  kind: QueryEngineKind,
+): boolean {
+  const engines = stats?.executionCapabilities?.engines ?? [];
+  return engines.some((engine) => engine.kind === kind);
+}
+
+export function collectionPrimaryEngine(
+  stats: CollectionStats | undefined,
+): QueryEngineCapability | undefined {
+  const engines = stats?.executionCapabilities?.engines ?? [];
+  if (engines.length === 0) return undefined;
+  return [...engines].sort((a, b) => (b.priority ?? 0) - (a.priority ?? 0))[0];
 }

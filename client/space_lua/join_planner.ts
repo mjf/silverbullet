@@ -11,10 +11,12 @@ import type {
   LuaWithHints,
 } from "./ast.ts";
 import { evalExpression, luaTableToArray } from "./eval.ts";
-import type {
-  AggregateRuntimeStats,
-  CollectionStats,
-  StatsSource,
+import {
+  collectionHasPlannerCapability,
+  collectionPrimaryEngine,
+  type AggregateRuntimeStats,
+  type CollectionStats,
+  type StatsSource,
 } from "./query_collection.ts";
 import {
   LuaEnv,
@@ -344,6 +346,9 @@ export type ExplainNode = {
   normalizationState?: "complete" | "partial";
   normalizedPushdownExpr?: string;
   normalizedLeftoverExpr?: string;
+
+  engineIds?: string[];
+  plannerCapabilities?: string[];
 };
 
 export type AggregateDescription = {
@@ -1274,22 +1279,34 @@ function executionScanPenalty(
   source: JoinSource,
   config?: JoinPlannerConfig,
 ): number {
-  const caps = source.stats?.executionCapabilities;
-  if (!caps) return 1.0;
+  const primary = collectionPrimaryEngine(source.stats);
+  if (!primary) return 1.0;
 
-  if (
-    caps.predicatePushdown === "bitmap-basic" ||
-    caps.predicatePushdown === "bitmap-extended"
-  ) {
-    return getBitmapScanPenalty(config);
+  const hasWherePushdown = collectionHasPlannerCapability(
+    source.stats,
+    "stage-where",
+  );
+  const hasBitmapScan = collectionHasPlannerCapability(
+    source.stats,
+    "scan-bitmap",
+  );
+  const hasIndexScan = collectionHasPlannerCapability(
+    source.stats,
+    "scan-index",
+  );
+  const hasKvScan = collectionHasPlannerCapability(source.stats, "scan-kv");
+
+  let penalty = primary.baseCostWeight ?? 1.0;
+
+  if (hasBitmapScan && hasWherePushdown) {
+    penalty *= getBitmapScanPenalty(config);
+  } else if (hasIndexScan && !hasWherePushdown) {
+    penalty *= getIndexScanNoPushdownPenalty(config);
+  } else if (hasKvScan) {
+    penalty *= getKvScanPenalty(config);
   }
-  if (caps.scanKind === "index-scan" && caps.predicatePushdown === "none") {
-    return getIndexScanNoPushdownPenalty(config);
-  }
-  if (caps.scanKind === "kv-scan") {
-    return getKvScanPenalty(config);
-  }
-  return 1.0;
+
+  return penalty;
 }
 
 // 12. Physical operator selection
@@ -2164,7 +2181,6 @@ async function dispatchJoin(
     }
   }
 
-  // No equi-pred: fall back to loop join
   if (residuals && residuals.length > 0) {
     return residualLoopJoin(
       leftRows,
@@ -2819,10 +2835,7 @@ function rebuildOrExpression(
 }
 
 function isColumnRefExpr(expr: LuaExpression): boolean {
-  return (
-    expr.type === "PropertyAccess" &&
-    expr.object.type === "Variable"
-  );
+  return expr.type === "PropertyAccess" && expr.object.type === "Variable";
 }
 
 function isExplicitlyScopedToSource(
@@ -3064,16 +3077,6 @@ export async function applyPushedFiltersWithStats(
 
 // Transitive predicate generation
 
-/**
- * Generate new single-source filters by propagating existing pushed filters
- * through equi-predicates.
- *
- * Example: given filter `a.name > 'M'` and equi-pred `a.name == b.name`,
- * generates `b.name > 'M'` as a new pushed filter for source `b`.
- *
- * Only propagates simple comparison predicates (column op literal) where
- * the column participates in an equi-join.
- */
 export function generateTransitivePredicates(
   pushedFilters: SingleSourceFilter[],
   equiPreds: EquiPredicate[],
@@ -3090,7 +3093,6 @@ export function generateTransitivePredicates(
     );
 
     for (const candidate of candidates) {
-      // Find equi-predicates that link this column to another source
       for (const ep of equiPreds) {
         let targetSource: string | null = null;
         let targetColumn: string | null = null;
@@ -3112,7 +3114,6 @@ export function generateTransitivePredicates(
         if (!targetSource || !targetColumn) continue;
         if (!sourceNames.has(targetSource)) continue;
 
-        // Don't generate duplicates
         const alreadyExists = pushedFilters.some(
           (f) =>
             f.sourceName === targetSource &&
@@ -3139,7 +3140,6 @@ export function generateTransitivePredicates(
         );
         if (alreadyGenerated) continue;
 
-        // Build the transitive predicate AST: targetSource.targetColumn op literal
         const newExpr: LuaExpression = {
           type: "Binary",
           operator: candidate.op,
@@ -3170,10 +3170,6 @@ type TransitiveCandidate = {
   literalExpr: LuaExpression;
 };
 
-/**
- * Extract simple `source.column op literal` patterns from a filter expression
- * that can be propagated transitively.
- */
 function extractTransitiveCandidates(
   expr: LuaExpression,
   sourceName: string,
@@ -3181,7 +3177,6 @@ function extractTransitiveCandidates(
   const results: TransitiveCandidate[] = [];
   expr = normalizePushdownExpression(expr);
 
-  // Handle AND conjunctions
   if (expr.type === "Binary" && expr.operator === "and") {
     results.push(...extractTransitiveCandidates(expr.left, sourceName));
     results.push(...extractTransitiveCandidates(expr.right, sourceName));
@@ -3203,14 +3198,12 @@ function extractTransitiveCandidates(
     return results;
   }
 
-  // Try: source.column op literal
   const leftCol = extractSourceColumn(expr.left, sourceName);
   if (leftCol && isLiteralExpr(expr.right)) {
     results.push({ column: leftCol, op, literalExpr: expr.right });
     return results;
   }
 
-  // Try: literal op source.column (flip)
   const rightCol = extractSourceColumn(expr.right, sourceName);
   if (rightCol && isLiteralExpr(expr.left)) {
     const flipped = flipOp(op);
@@ -3275,11 +3268,9 @@ function isStructurallyEquivalentFilter(
 ): boolean {
   if (expr.type !== "Binary" || expr.operator !== op) return false;
 
-  // Check left is source.column
   const leftCol = extractSourceColumn(expr.left, sourceName);
   if (leftCol !== column) return false;
 
-  // Check right is same literal
   return exprStructurallyEquals(expr.right, literalExpr);
 }
 
@@ -3353,6 +3344,52 @@ function explainNdvSource(
   return "row-count heuristic";
 }
 
+function explainExecutionScanKind(
+  stats: CollectionStats | undefined,
+): string | undefined {
+  const primary = collectionPrimaryEngine(stats);
+  if (!primary) return undefined;
+
+  if (collectionHasPlannerCapability(stats, "scan-bitmap")) {
+    return "bitmap";
+  }
+  if (collectionHasPlannerCapability(stats, "scan-index")) {
+    return "index";
+  }
+  if (collectionHasPlannerCapability(stats, "scan-kv")) {
+    return "kv";
+  }
+  if (collectionHasPlannerCapability(stats, "scan-materialized")) {
+    return "materialized";
+  }
+  return primary.kind;
+}
+
+function explainPredicatePushdown(
+  stats: CollectionStats | undefined,
+): string | undefined {
+  if (!collectionHasPlannerCapability(stats, "stage-where")) {
+    return (stats?.executionCapabilities?.engines?.length ?? 0) > 0
+      ? "none"
+      : undefined;
+  }
+
+  if (
+    collectionHasPlannerCapability(stats, "scan-bitmap") &&
+    (collectionHasPlannerCapability(stats, "pred-in") ||
+      collectionHasPlannerCapability(stats, "bool-or") ||
+      collectionHasPlannerCapability(stats, "bool-not"))
+  ) {
+    return "bitmap-extended";
+  }
+
+  if (collectionHasPlannerCapability(stats, "scan-bitmap")) {
+    return "bitmap-basic";
+  }
+
+  return "basic";
+}
+
 export function buildExplainScanNode(args: {
   sourceName: string;
   sourceExpression: LuaExpression;
@@ -3400,6 +3437,22 @@ export function buildExplainScanNode(args: {
     sourceHints.push(`cost=${args.withHints.cost}`);
   }
 
+  const engines = args.stats?.executionCapabilities?.engines ?? [];
+  const plannerCapabilities = new Set<string>();
+  for (const engine of engines) {
+    for (const capability of engine.capabilities) {
+      plannerCapabilities.add(capability);
+    }
+  }
+
+  const engineIds =
+    engines.length > 0 ? engines.map((engine) => engine.id) : undefined;
+
+  const plannerCapabilitiesList =
+    plannerCapabilities.size > 0
+      ? [...plannerCapabilities].sort()
+      : undefined;
+
   return {
     nodeType: isFnScan ? "FunctionScan" : "Scan",
     source: args.sourceName,
@@ -3413,11 +3466,13 @@ export function buildExplainScanNode(args: {
     filterExpr: args.pushedFilterExpr,
     pushedDownFilter: !!args.pushedFilterExpr,
     statsSource: args.stats?.statsSource,
-    executionScanKind: args.stats?.executionCapabilities?.scanKind,
-    predicatePushdown: args.stats?.executionCapabilities?.predicatePushdown,
+    executionScanKind: explainExecutionScanKind(args.stats),
+    predicatePushdown: explainPredicatePushdown(args.stats),
     normalizationState,
     normalizedPushdownExpr,
     normalizedLeftoverExpr,
+    engineIds,
+    plannerCapabilities: plannerCapabilitiesList,
     children: [],
   };
 }
@@ -5095,6 +5150,16 @@ function formatNode(
       lines.push(`${detailPad}Execution Scan: ${node.executionScanKind}`);
     }
 
+    if (node.engineIds && node.engineIds.length > 0) {
+      lines.push(`${detailPad}Engines: ${node.engineIds.join(", ")}`);
+    }
+
+    if (node.plannerCapabilities && node.plannerCapabilities.length > 0) {
+      lines.push(
+        `${detailPad}Planner Capabilities: ${node.plannerCapabilities.join(", ")}`
+      );
+    }
+
     if (node.predicatePushdown) {
       lines.push(`${detailPad}Pushdown Capability: ${node.predicatePushdown}`);
     }
@@ -5212,7 +5277,6 @@ function assignResidualPredicatesToLowestCoveringJoin(
 
     const refs = collectReferencedSources(conjunct, allSourceNames);
 
-    // Residual join predicates must reference at least two sources.
     if (refs.size < 2) {
       continue;
     }
@@ -5236,7 +5300,6 @@ function assignResidualPredicateToLowestCoveringJoin(
   const leftCoversAll = isSubsetOf(refs, leftSources);
   const rightCoversAll = isSubsetOf(refs, rightSources);
 
-  // Prefer the lowest covering join node.
   if (leftCoversAll) {
     return assignResidualPredicateToLowestCoveringJoin(
       node.left,
@@ -5252,7 +5315,6 @@ function assignResidualPredicateToLowestCoveringJoin(
     );
   }
 
-  // This is the lowest join node whose source-set covers the predicate.
   if (!node.joinResiduals) {
     node.joinResiduals = [];
   }
