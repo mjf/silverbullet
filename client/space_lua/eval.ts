@@ -44,6 +44,7 @@ import {
   attachAnalyzeQueryOpStats,
   buildExplainScanNode,
   buildJoinTree,
+  buildLeadingHintInfo,
   buildNormalizationInfoBySource,
   type ExplainNode,
   type ExplainOptions,
@@ -51,6 +52,7 @@ import {
   executeAndInstrument,
   executeJoinTree,
   explainJoinTree,
+  exprToDisplayString,
   exprToString,
   extractEquiPredicates,
   extractRangePredicates,
@@ -1130,15 +1132,13 @@ function collectionSupportsPredicateDelegation(
 ): boolean {
   return (
     collectionHasPlannerCapability(stats, "stage-where") &&
-    (
-      collectionHasPlannerCapability(stats, "pred-eq") ||
+    (collectionHasPlannerCapability(stats, "pred-eq") ||
       collectionHasPlannerCapability(stats, "pred-neq") ||
       collectionHasPlannerCapability(stats, "pred-lt") ||
       collectionHasPlannerCapability(stats, "pred-lte") ||
       collectionHasPlannerCapability(stats, "pred-gt") ||
       collectionHasPlannerCapability(stats, "pred-gte") ||
-      collectionHasPlannerCapability(stats, "pred-in")
-    )
+      collectionHasPlannerCapability(stats, "pred-in"))
   );
 }
 
@@ -1554,7 +1554,7 @@ export function evalExpression(
 
               const combined =
                 srcFilters.length === 1
-                  ? exprToString(srcFilters[0].expression)
+                  ? exprToDisplayString(srcFilters[0].expression)
                   : srcFilters
                       .map((f) => `(${exprToString(f.expression)})`)
                       .join(" and ");
@@ -1658,37 +1658,70 @@ export function evalExpression(
                             "scan-bitmap",
                             "stage-where",
                             "stats-row-count",
-                            ...(collectionHasPlannerCapability(src.stats, "pred-eq")
+                            ...(collectionHasPlannerCapability(
+                              src.stats,
+                              "pred-eq",
+                            )
                               ? (["pred-eq"] as const)
                               : []),
-                            ...(collectionHasPlannerCapability(src.stats, "pred-neq")
+                            ...(collectionHasPlannerCapability(
+                              src.stats,
+                              "pred-neq",
+                            )
                               ? (["pred-neq"] as const)
                               : []),
-                            ...(collectionHasPlannerCapability(src.stats, "pred-lt")
+                            ...(collectionHasPlannerCapability(
+                              src.stats,
+                              "pred-lt",
+                            )
                               ? (["pred-lt"] as const)
                               : []),
-                            ...(collectionHasPlannerCapability(src.stats, "pred-lte")
+                            ...(collectionHasPlannerCapability(
+                              src.stats,
+                              "pred-lte",
+                            )
                               ? (["pred-lte"] as const)
                               : []),
-                            ...(collectionHasPlannerCapability(src.stats, "pred-gt")
+                            ...(collectionHasPlannerCapability(
+                              src.stats,
+                              "pred-gt",
+                            )
                               ? (["pred-gt"] as const)
                               : []),
-                            ...(collectionHasPlannerCapability(src.stats, "pred-gte")
+                            ...(collectionHasPlannerCapability(
+                              src.stats,
+                              "pred-gte",
+                            )
                               ? (["pred-gte"] as const)
                               : []),
-                            ...(collectionHasPlannerCapability(src.stats, "pred-in")
+                            ...(collectionHasPlannerCapability(
+                              src.stats,
+                              "pred-in",
+                            )
                               ? (["pred-in"] as const)
                               : []),
-                            ...(collectionHasPlannerCapability(src.stats, "bool-and")
+                            ...(collectionHasPlannerCapability(
+                              src.stats,
+                              "bool-and",
+                            )
                               ? (["bool-and"] as const)
                               : []),
-                            ...(collectionHasPlannerCapability(src.stats, "bool-or")
+                            ...(collectionHasPlannerCapability(
+                              src.stats,
+                              "bool-or",
+                            )
                               ? (["bool-or"] as const)
                               : []),
-                            ...(collectionHasPlannerCapability(src.stats, "bool-not")
+                            ...(collectionHasPlannerCapability(
+                              src.stats,
+                              "bool-not",
+                            )
                               ? (["bool-not"] as const)
                               : []),
-                            ...(collectionHasPlannerCapability(src.stats, "expr-literal")
+                            ...(collectionHasPlannerCapability(
+                              src.stats,
+                              "expr-literal",
+                            )
                               ? (["expr-literal"] as const)
                               : []),
                             ...(collectionHasPlannerCapability(
@@ -1855,6 +1888,7 @@ export function evalExpression(
               const result: ExplainResult = {
                 plan: explainPlan!,
                 planningTimeMs: Math.round((planEndT - planT0) * 1000) / 1000,
+                leadingHint: buildLeadingHintInfo(planOrder, explainPlan!),
               };
               return formatExplainOutput(result, explainOpts);
             }
@@ -1922,6 +1956,7 @@ export function evalExpression(
                 plan: explainPlan!,
                 planningTimeMs: Math.round((planEndT - planT0) * 1000) / 1000,
                 executionTimeMs: Math.round((execEndT - execT0) * 1000) / 1000,
+                leadingHint: buildLeadingHintInfo(planOrder, explainPlan!),
               };
               return formatExplainOutput(result, explainOpts);
             }

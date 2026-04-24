@@ -283,7 +283,6 @@ export type ExplainNode = {
   method?: "hash" | "loop" | "merge";
   hintUsed?: string;
   sourceHints?: string[];
-  leadingHint?: string[];
   startupCost: number;
   estimatedCost: number;
   estimatedRows: number;
@@ -344,6 +343,8 @@ export type ExplainNode = {
   executionScanKind?: string;
   predicatePushdown?: string;
   normalizationState?: "complete" | "partial";
+  originalPredicateExpr?: string;
+  normalizedPredicateExpr?: string;
   normalizedPushdownExpr?: string;
   normalizedLeftoverExpr?: string;
 
@@ -372,12 +373,22 @@ export type ExplainResult = {
   plan: ExplainNode;
   planningTimeMs: number;
   executionTimeMs?: number;
+  leadingHint?: LeadingHintInfo;
 };
 
 export type SourceNormalizationInfo = {
   state: "complete" | "partial";
+  originalExpr: string;
+  normalizedExpr: string;
   pushdownExpr: string;
   leftoverExpr: string;
+};
+
+export type LeadingHintInfo = {
+  requested: string[];
+  fixed: string[];
+  plannerChosen: string[];
+  finalOrder: string[];
 };
 
 // 8. Stats provenance helpers
@@ -2357,14 +2368,18 @@ export function buildNormalizationInfoBySource(
   expr: LuaExpression | undefined,
   sourceNames: Set<string>,
 ): Map<string, SourceNormalizationInfo> {
+  if (!expr) return new Map();
+
+  // Capture user-authored per-source conjuncts BEFORE normalization so the
+  // explain output can faithfully show what the user wrote.
+  const originalBySource = collectOriginalConjunctsBySource(expr, sourceNames);
+
+  const normalized = normalizePushdownExpression(expr);
+
   const info = new Map<
     string,
     { pushed: LuaExpression[]; leftover: LuaExpression[] }
   >();
-
-  if (!expr) return new Map();
-
-  const normalized = normalizePushdownExpression(expr);
   collectNormalizationInfo(normalized, sourceNames, info);
 
   const result = new Map<string, SourceNormalizationInfo>();
@@ -2373,14 +2388,53 @@ export function buildNormalizationInfoBySource(
     if (!pushedExpr) continue;
 
     const leftoverExpr = rebuildAndExpression(parts.leftover);
+    const fullNormalizedExpr = rebuildAndExpression([
+      ...parts.pushed,
+      ...parts.leftover,
+    ]);
+
+    const originalConjuncts = originalBySource.get(sourceName) ?? [];
+    const originalAndExpr = rebuildAndExpression(originalConjuncts);
+
     result.set(sourceName, {
       state: leftoverExpr ? "partial" : "complete",
-      pushdownExpr: exprToString(pushedExpr),
-      leftoverExpr: leftoverExpr ? exprToString(leftoverExpr) : "none",
+      originalExpr: originalAndExpr
+        ? exprToDisplayString(originalAndExpr)
+        : exprToDisplayString(pushedExpr),
+      normalizedExpr: fullNormalizedExpr
+        ? exprToDisplayString(fullNormalizedExpr)
+        : exprToDisplayString(pushedExpr),
+      pushdownExpr: exprToDisplayString(pushedExpr),
+      leftoverExpr: leftoverExpr ? exprToDisplayString(leftoverExpr) : "none",
     });
   }
 
   return result;
+}
+
+function collectOriginalConjunctsBySource(
+  expr: LuaExpression,
+  sourceNames: Set<string>,
+): Map<string, LuaExpression[]> {
+  const out = new Map<string, LuaExpression[]>();
+  const visit = (e: LuaExpression) => {
+    if (e.type === "Binary" && e.operator === "and") {
+      visit(e.left);
+      visit(e.right);
+      return;
+    }
+    const refs = collectReferencedSources(e, sourceNames);
+    if (refs.size !== 1) return;
+    const [sourceName] = refs;
+    let arr = out.get(sourceName);
+    if (!arr) {
+      arr = [];
+      out.set(sourceName, arr);
+    }
+    arr.push(e);
+  };
+  visit(expr);
+  return out;
 }
 
 function collectNormalizationInfo(
@@ -2524,19 +2578,71 @@ function isPushdownSafeExpressionForSource(
           sourceNames,
           targetSource,
         ) &&
-        isPushdownSafeExpressionForSource(
-          expr.right,
-          sourceNames,
-          targetSource,
-        )
+        isPushdownSafeExpressionForSource(expr.right, sourceNames, targetSource)
       );
+
+    case "TableConstructor":
+      return expr.fields.every((field) => {
+        switch (field.type) {
+          case "DynamicField":
+            return (
+              isPushdownSafeExpressionForSource(
+                field.key,
+                sourceNames,
+                targetSource,
+              ) &&
+              isPushdownSafeExpressionForSource(
+                field.value,
+                sourceNames,
+                targetSource,
+              )
+            );
+          case "PropField":
+          case "ExpressionField":
+            return isPushdownSafeExpressionForSource(
+              field.value,
+              sourceNames,
+              targetSource,
+            );
+          default:
+            return false;
+        }
+      });
 
     default:
       return false;
   }
 }
 
-function normalizePushdownExpression(expr: LuaExpression): LuaExpression {
+/** Return literal RHS expressions for `e in { ... }` when the set is a static table of literals. */
+function extractStaticInLiteralExpressions(
+  right: LuaExpression,
+): LuaExpression[] | undefined {
+  if (right.type !== "TableConstructor") {
+    return undefined;
+  }
+  const out: LuaExpression[] = [];
+  for (const field of right.fields) {
+    if (field.type === "ExpressionField") {
+      if (!isLiteralExpr(field.value)) {
+        return undefined;
+      }
+      out.push(field.value);
+    } else if (field.type === "PropField") {
+      if (!isLiteralExpr(field.value)) {
+        return undefined;
+      }
+      out.push(field.value);
+    } else {
+      return undefined;
+    }
+  }
+  return out;
+}
+
+export function normalizePushdownExpression(
+  expr: LuaExpression,
+): LuaExpression {
   switch (expr.type) {
     case "Parenthesized":
       return normalizePushdownExpression(expr.expression);
@@ -2564,11 +2670,13 @@ function normalizePushdownExpression(expr: LuaExpression): LuaExpression {
           ...collectAndChain(left),
           ...collectAndChain(right),
         ]);
-        return rebuildAndExpression(parts) ?? {
-          type: "Boolean",
-          value: true,
-          ctx: expr.ctx,
-        };
+        return (
+          rebuildAndExpression(parts) ?? {
+            type: "Boolean",
+            value: true,
+            ctx: expr.ctx,
+          }
+        );
       }
 
       if (expr.operator === "or") {
@@ -2577,11 +2685,13 @@ function normalizePushdownExpression(expr: LuaExpression): LuaExpression {
           ...collectOrChain(right),
         ]);
         const rebuilt = rebuildOrExpression(parts);
-        return normalizeSameColumnOrChain(rebuilt ?? {
-          type: "Boolean",
-          value: false,
-          ctx: expr.ctx,
-        });
+        return normalizeSameColumnOrChain(
+          rebuilt ?? {
+            type: "Boolean",
+            value: false,
+            ctx: expr.ctx,
+          },
+        );
       }
 
       return normalizeBinaryComparison({
@@ -2589,6 +2699,12 @@ function normalizePushdownExpression(expr: LuaExpression): LuaExpression {
         left,
         right,
       } as LuaExpression);
+    }
+
+    case "QueryIn": {
+      const left = normalizePushdownExpression(expr.left);
+      const right = normalizePushdownExpression(expr.right);
+      return { ...expr, left, right };
     }
 
     default:
@@ -2641,6 +2757,33 @@ function normalizeNegation(expr: LuaExpression): LuaExpression {
 
   if (arg.type === "Unary" && arg.operator === "not") {
     return normalizePushdownExpression(arg.argument);
+  }
+
+  if (arg.type === "QueryIn") {
+    const literalExprs = extractStaticInLiteralExpressions(arg.right);
+    if (literalExprs && literalExprs.length > 0) {
+      const neqParts: LuaExpression[] = literalExprs.map(
+        (litExpr) =>
+          ({
+            type: "Binary",
+            operator: "~=",
+            left: arg.left,
+            right: litExpr,
+            ctx: arg.ctx,
+          }) as LuaExpression,
+      );
+      return normalizePushdownExpression(
+        rebuildAndExpression(neqParts) ?? {
+          type: "Boolean",
+          value: true,
+          ctx: arg.ctx,
+        },
+      );
+    }
+    return {
+      ...expr,
+      argument: normalizePushdownExpression(arg),
+    };
   }
 
   if (arg.type === "Binary") {
@@ -2716,9 +2859,7 @@ function normalizeSameColumnOrChain(expr: LuaExpression): LuaExpression {
   return rebuildOrExpression(disjuncts) ?? expr;
 }
 
-function extractSameColumnOrLiteralSet(
-  expr: LuaExpression,
-): {
+function extractSameColumnOrLiteralSet(expr: LuaExpression): {
   sourceName: string;
   column: string;
   literals: LuaExpression[];
@@ -3410,15 +3551,21 @@ export function buildExplainScanNode(args: {
   const isFnScan = args.sourceExpression.type === "FunctionCall";
 
   let normalizationState: ExplainNode["normalizationState"] | undefined;
+  let originalPredicateExpr: string | undefined;
+  let normalizedPredicateExpr: string | undefined;
   let normalizedPushdownExpr: string | undefined;
   let normalizedLeftoverExpr: string | undefined;
 
   if (args.normalizationInfo) {
     normalizationState = args.normalizationInfo.state;
+    originalPredicateExpr = args.normalizationInfo.originalExpr;
+    normalizedPredicateExpr = args.normalizationInfo.normalizedExpr;
     normalizedPushdownExpr = args.normalizationInfo.pushdownExpr;
     normalizedLeftoverExpr = args.normalizationInfo.leftoverExpr;
   } else if (args.pushedFilterExpr) {
     normalizationState = "complete";
+    originalPredicateExpr = args.pushedFilterExpr;
+    normalizedPredicateExpr = args.pushedFilterExpr;
     normalizedPushdownExpr = args.pushedFilterExpr;
     normalizedLeftoverExpr = "none";
   }
@@ -3449,9 +3596,7 @@ export function buildExplainScanNode(args: {
     engines.length > 0 ? engines.map((engine) => engine.id) : undefined;
 
   const plannerCapabilitiesList =
-    plannerCapabilities.size > 0
-      ? [...plannerCapabilities].sort()
-      : undefined;
+    plannerCapabilities.size > 0 ? [...plannerCapabilities].sort() : undefined;
 
   return {
     nodeType: isFnScan ? "FunctionScan" : "Scan",
@@ -3469,6 +3614,8 @@ export function buildExplainScanNode(args: {
     executionScanKind: explainExecutionScanKind(args.stats),
     predicatePushdown: explainPredicatePushdown(args.stats),
     normalizationState,
+    originalPredicateExpr,
+    normalizedPredicateExpr,
     normalizedPushdownExpr,
     normalizedLeftoverExpr,
     engineIds,
@@ -3617,7 +3764,7 @@ export function explainJoinTree(
     method: tree.method,
     hintUsed: hintLabel,
     equiPred: tree.equiPred,
-    joinResidualExprs: tree.joinResiduals?.map(exprToString),
+    joinResidualExprs: tree.joinResiduals?.map(exprToDisplayString),
     joinFilterType:
       tree.joinResiduals && tree.joinResiduals.length > 0
         ? "join-residual"
@@ -3726,7 +3873,7 @@ function formatOutputExpression(
   runtimeConfig?: Config,
 ): string {
   const agg = formatAggregateExpression(expr, runtimeConfig);
-  return agg ?? exprToString(expr);
+  return agg ?? exprToDisplayString(expr);
 }
 
 function formatAggregateExpression(
@@ -3737,7 +3884,7 @@ function formatAggregateExpression(
     case "FilteredCall": {
       const inner = formatAggregateExpression(expr.call, runtimeConfig);
       if (!inner) return undefined;
-      return `${inner} filter(${exprToString(expr.filter)})`;
+      return `${inner} filter(${exprToDisplayString(expr.filter)})`;
     }
 
     case "AggregateCall": {
@@ -3748,7 +3895,7 @@ function formatAggregateExpression(
       }
       const orderBy = expr.orderBy
         .map((o) => {
-          let s = exprToString(o.expression);
+          let s = exprToDisplayString(o.expression);
           if (o.direction === "desc") s += " desc";
           if (o.nulls) s += ` nulls ${o.nulls}`;
           return s;
@@ -3762,12 +3909,12 @@ function formatAggregateExpression(
         expr.prefix.type === "Variable" &&
         isAggregateFunctionName(expr.prefix.name, runtimeConfig)
       ) {
-        const args = expr.args.map(exprToString).join(", ");
+        const args = expr.args.map(exprToDisplayString).join(", ");
         let s = `${expr.prefix.name}(${args})`;
         if (expr.orderBy && expr.orderBy.length > 0) {
           const orderBy = expr.orderBy
             .map((o) => {
-              let part = exprToString(o.expression);
+              let part = exprToDisplayString(o.expression);
               if (o.direction === "desc") part += " desc";
               if (o.nulls) part += ` nulls ${o.nulls}`;
               return part;
@@ -4025,11 +4172,53 @@ export function wrapPlanWithQueryOps(
     };
   }
 
-  if (query.leading && query.leading.length > 0) {
-    root.leadingHint = [...query.leading];
-  }
-
   return root;
+}
+
+/**
+ * Collect scan source names from an explain plan in execution (left-deep)
+ * order.  The join tree is left-deep, so an in-order walk of Scan leaves
+ * yields the order the planner chose.
+ */
+export function collectScanSourceOrder(plan: ExplainNode): string[] {
+  const names: string[] = [];
+  const walk = (node: ExplainNode) => {
+    if (
+      (node.nodeType === "Scan" || node.nodeType === "FunctionScan") &&
+      node.source
+    ) {
+      names.push(node.source);
+      return;
+    }
+    for (const child of node.children) {
+      walk(child);
+    }
+  };
+  walk(plan);
+  return names;
+}
+
+/**
+ * Build a structured summary of how the `leading` hint interacted with the
+ * planner.  Returns `undefined` when no leading hint was given.  The returned
+ * `finalOrder` is derived from the explain plan and reflects the planner's
+ * actual decision.
+ */
+export function buildLeadingHintInfo(
+  requestedLeading: string[] | undefined,
+  plan: ExplainNode,
+): LeadingHintInfo | undefined {
+  if (!requestedLeading || requestedLeading.length === 0) return undefined;
+  const finalOrder = collectScanSourceOrder(plan);
+  const fixedSet = new Set(requestedLeading);
+  const fixed = requestedLeading.filter((n) => finalOrder.includes(n));
+  const plannerChosen = finalOrder.filter((n) => !fixedSet.has(n));
+  return {
+    requested: [...requestedLeading],
+    fixed,
+    plannerChosen,
+    finalOrder,
+  };
 }
 
 // 20. Restricted-source validation
@@ -4310,6 +4499,45 @@ export function exprToString(expr: LuaExpression): string {
   }
 }
 
+/**
+ * Strip one matched outer parenthesis pair from `s` if it encloses the whole
+ * string.  `exprToString` always wraps Binary expressions in parens so that
+ * nested rendering stays unambiguous — but at the top level of an EXPLAIN
+ * line those outer parens are redundant noise.  Use this helper every time
+ * an expression string is about to be emitted into rendered output.
+ *
+ * `((a) and (b))` -> `(a) and (b)`
+ * `(a)`           -> `a`
+ * `(a) or (b)`    -> `(a) or (b)`  (no enclosing pair, untouched)
+ * `unknown_fn(x)` -> `unknown_fn(x)` (leading `(` is part of a call)
+ */
+export function stripOuterParens(s: string): string {
+  if (s.length < 2 || s[0] !== "(" || s[s.length - 1] !== ")") {
+    return s;
+  }
+  let depth = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c === "(") depth++;
+    else if (c === ")") {
+      depth--;
+      // If the first `(` closes before the end, it doesn't enclose the
+      // whole string — leave as-is.
+      if (depth === 0 && i < s.length - 1) return s;
+    }
+  }
+  return depth === 0 ? s.slice(1, -1) : s;
+}
+
+/**
+ * Like `exprToString` but with the outermost redundant parenthesis pair
+ * removed.  Use everywhere the resulting string is rendered directly as
+ * part of an EXPLAIN output line.
+ */
+export function exprToDisplayString(expr: LuaExpression): string {
+  return stripOuterParens(exprToString(expr));
+}
+
 function exprMatchesEquiPred(
   expr: LuaExpression,
   preds: EquiPredicate[],
@@ -4499,7 +4727,7 @@ function walkAggregates(
       if (out.length > innerBefore) {
         const last = out[out.length - 1];
         if (!last.filter) {
-          last.filter = exprToString(expr.filter);
+          last.filter = exprToDisplayString(expr.filter);
         }
         return;
       }
@@ -4509,16 +4737,16 @@ function walkAggregates(
         fc.prefix.type === "Variable" &&
         isAggregateFunctionName(fc.prefix.name, runtimeConfig)
       ) {
-        const args = fc.args.map(exprToString).join(", ");
+        const args = fc.args.map(exprToDisplayString).join(", ");
         const desc: AggregateDescription = {
           name: fc.prefix.name,
           args,
-          filter: exprToString(expr.filter),
+          filter: exprToDisplayString(expr.filter),
         };
         if (fc.orderBy && fc.orderBy.length > 0) {
           desc.orderBy = fc.orderBy
             .map((o) => {
-              let part = exprToString(o.expression);
+              let part = exprToDisplayString(o.expression);
               if (o.direction === "desc") part += " desc";
               if (o.nulls) part += ` nulls ${o.nulls}`;
               return part;
@@ -4542,7 +4770,7 @@ function walkAggregates(
         if (!last.orderBy && expr.orderBy.length > 0) {
           last.orderBy = expr.orderBy
             .map((o) => {
-              let part = exprToString(o.expression);
+              let part = exprToDisplayString(o.expression);
               if (o.direction === "desc") part += " desc";
               if (o.nulls) part += ` nulls ${o.nulls}`;
               return part;
@@ -4557,13 +4785,13 @@ function walkAggregates(
         fc.prefix.type === "Variable" &&
         isAggregateFunctionName(fc.prefix.name, runtimeConfig)
       ) {
-        const args = fc.args.map(exprToString).join(", ");
+        const args = fc.args.map(exprToDisplayString).join(", ");
         out.push({
           name: fc.prefix.name,
           args,
           orderBy: expr.orderBy
             .map((o) => {
-              let part = exprToString(o.expression);
+              let part = exprToDisplayString(o.expression);
               if (o.direction === "desc") part += " desc";
               if (o.nulls) part += ` nulls ${o.nulls}`;
               return part;
@@ -4581,12 +4809,12 @@ function walkAggregates(
         expr.prefix.type === "Variable" &&
         isAggregateFunctionName(expr.prefix.name, runtimeConfig)
       ) {
-        const args = expr.args.map(exprToString).join(", ");
+        const args = expr.args.map(exprToDisplayString).join(", ");
         const desc: AggregateDescription = { name: expr.prefix.name, args };
         if (expr.orderBy && expr.orderBy.length > 0) {
           desc.orderBy = expr.orderBy
             .map((o) => {
-              let part = exprToString(o.expression);
+              let part = exprToDisplayString(o.expression);
               if (o.direction === "desc") part += " desc";
               if (o.nulls) part += ` nulls ${o.nulls}`;
               return part;
@@ -4686,13 +4914,7 @@ function wrapAggregateLocalOps(
       estimatedRows: wrapped.estimatedRows,
       estimatedWidth: wrapped.estimatedWidth,
       filterExpr: aggregatesWithFilter
-        .map((agg) => {
-          const filter =
-            agg.filter?.startsWith("(") && agg.filter.endsWith(")")
-              ? agg.filter.slice(1, -1)
-              : agg.filter;
-          return `${agg.name}(${agg.args}) filter(${filter})`;
-        })
+        .map((agg) => `${agg.name}(${agg.args}) filter(${agg.filter})`)
         .join(", "),
       filterType: "aggregate",
       statsSource: wrapped.statsSource,
@@ -4937,6 +5159,11 @@ export function formatExplainOutput(
   opts: ExplainOptions,
 ): string {
   const lines: string[] = [];
+
+  if (opts.hints && result.leadingHint) {
+    formatLeadingHint(result.leadingHint, lines);
+  }
+
   formatNode(result.plan, opts, 0, lines);
   if (opts.summary) {
     lines.push(`Planning Time: ${result.planningTimeMs.toFixed(3)} ms`);
@@ -4961,6 +5188,16 @@ export function formatExplainOutput(
   return `\`\`\`\n${header}\n${separator}\n${indented.join("\n")}\n(${rowCount} ${rowCount === 1 ? "row" : "rows"})\n\`\`\``;
 }
 
+function formatLeadingHint(info: LeadingHintInfo, lines: string[]): void {
+  const joinList = (items: string[]) =>
+    items.length > 0 ? items.join(", ") : "(none)";
+  lines.push("Leading Hint");
+  lines.push(`  Requested:      ${joinList(info.requested)}`);
+  lines.push(`  Fixed by hint:  ${joinList(info.fixed)}`);
+  lines.push(`  Planner-chosen: ${joinList(info.plannerChosen)}`);
+  lines.push(`  Final order:    ${joinList(info.finalOrder)}`);
+}
+
 function formatNode(
   node: ExplainNode,
   opts: ExplainOptions,
@@ -4969,6 +5206,37 @@ function formatNode(
 ): void {
   const isRoot = indent === 0;
   const pad = " ".repeat(indent);
+  const detailPad = pad + (isRoot ? "  " : "      ");
+
+  lines.push(formatNodeHeaderLine(node, opts, pad, isRoot));
+
+  // Sections are emitted top-down in the order a reader typically inspects
+  // an EXPLAIN node: what the operator does, then how much it actually did,
+  // then verbose diagnostic info.
+  formatJoinConditionSection(node, opts, detailPad, lines);
+  formatFilterSection(node, opts, detailPad, lines);
+  formatOutputShapingSection(node, opts, detailPad, lines);
+  formatLimitSection(node, detailPad, lines);
+  formatOperatorStatsSection(node, opts, detailPad, lines);
+
+  if (opts.verbose) {
+    formatSourceAndHintSection(node, opts, detailPad, lines);
+    formatPushdownDetailSection(node, detailPad, lines);
+    formatExecutionEngineSection(node, detailPad, lines);
+    formatPlannerEstimationSection(node, detailPad, lines);
+  }
+
+  for (const child of node.children) {
+    formatNode(child, opts, indent + (isRoot ? 2 : 6), lines);
+  }
+}
+
+function formatNodeHeaderLine(
+  node: ExplainNode,
+  opts: ExplainOptions,
+  pad: string,
+  isRoot: boolean,
+): string {
   const prefix = isRoot ? "" : "->  ";
   const label = formatNodeLabel(node);
 
@@ -4990,10 +5258,17 @@ function formatNode(
     actBlock = ` (actual${timeStr} rows=${node.actualRows} loops=${node.actualLoops ?? 1})`;
   }
 
-  lines.push(`${pad}${prefix}${label}${estBlock}${actBlock}`);
+  return `${pad}${prefix}${label}${estBlock}${actBlock}`;
+}
 
-  const detailPad = pad + (isRoot ? "  " : "      ");
-
+// Join condition + its residuals, immediately followed by the runtime stat
+// `Rows Removed by Join Filter` so cause and effect stay adjacent.
+function formatJoinConditionSection(
+  node: ExplainNode,
+  opts: ExplainOptions,
+  detailPad: string,
+  lines: string[],
+): void {
   if (node.equiPred) {
     const condLabel =
       node.method === "hash"
@@ -5002,8 +5277,11 @@ function formatNode(
           ? "Merge Condition"
           : "Join Filter";
     const ep = node.equiPred;
+    // No outer parens: at the top level of a rendered line they are
+    // redundant noise, matching the convention used for every other
+    // expression surface in the explain output.
     lines.push(
-      `${detailPad}${condLabel}: (${ep.leftSource}.${ep.leftColumn} == ${ep.rightSource}.${ep.rightColumn})`,
+      `${detailPad}${condLabel}: ${ep.leftSource}.${ep.leftColumn} == ${ep.rightSource}.${ep.rightColumn}`,
     );
   }
 
@@ -5013,44 +5291,29 @@ function formatNode(
         ? "Residual Join Filter"
         : "Join Filter";
     for (const expr of node.joinResidualExprs) {
-      lines.push(`${detailPad}${residualLabel}: ${expr}`);
+      lines.push(`${detailPad}${residualLabel}: ${stripOuterParens(expr)}`);
     }
   }
 
-  if (node.sortKeys && node.sortKeys.length > 0) {
-    const keyLabel =
-      node.nodeType === "GroupAggregate"
-        ? "Group Key"
-        : node.sortType === "group"
-          ? "Sort Key (Group)"
-          : "Sort Key";
-    lines.push(`${detailPad}${keyLabel}: ${node.sortKeys.join(", ")}`);
+  if (
+    opts.analyze &&
+    node.rowsRemovedByJoinFilter !== undefined &&
+    node.rowsRemovedByJoinFilter > 0
+  ) {
+    lines.push(
+      `${detailPad}Rows Removed by Join Filter: ${node.rowsRemovedByJoinFilter}`,
+    );
   }
+}
 
-  if (node.outputColumns && node.outputColumns.length > 0) {
-    lines.push(`${detailPad}Output: ${node.outputColumns.join(", ")}`);
-  }
-
-  if (node.implicitGroup) {
-    lines.push(`${detailPad}Grouping: whole-table aggregate`);
-  }
-
-  if (opts.verbose && node.aggregates && node.aggregates.length > 0) {
-    for (const agg of node.aggregates) {
-      let desc = `${agg.name}(${agg.args})`;
-      if (agg.filter) desc += ` filter(${agg.filter})`;
-      if (agg.orderBy) desc += ` order by ${agg.orderBy}`;
-      lines.push(`${detailPad}Aggregate: ${desc}`);
-    }
-  }
-
-  if (node.limitCount !== undefined) {
-    lines.push(`${detailPad}Count: ${node.limitCount}`);
-  }
-  if (node.offsetCount !== undefined) {
-    lines.push(`${detailPad}Offset: ${node.offsetCount}`);
-  }
-
+// Filter expression followed by all related "Rows Removed by *" stats so the
+// effect of the filter is visible right next to its definition.
+function formatFilterSection(
+  node: ExplainNode,
+  opts: ExplainOptions,
+  detailPad: string,
+  lines: string[],
+): void {
   if (node.filterExpr) {
     let filterLabel: string;
     if (node.nodeType === "Scan" || node.nodeType === "FunctionScan") {
@@ -5062,7 +5325,9 @@ function formatNode(
     } else {
       filterLabel = "Filter";
     }
-    lines.push(`${detailPad}${filterLabel}: ${node.filterExpr}`);
+    lines.push(
+      `${detailPad}${filterLabel}: ${stripOuterParens(node.filterExpr)}`,
+    );
   }
 
   if (
@@ -5100,17 +5365,65 @@ function formatNode(
       `${detailPad}Rows Removed by Inline Filter: ${node.rowsRemovedByInlineFilter}`,
     );
   }
+}
 
-  if (
-    opts.analyze &&
-    node.rowsRemovedByJoinFilter !== undefined &&
-    node.rowsRemovedByJoinFilter > 0
-  ) {
-    lines.push(
-      `${detailPad}Rows Removed by Join Filter: ${node.rowsRemovedByJoinFilter}`,
-    );
+// Sort/group keys, the "whole-table aggregate" tag, produced columns, and
+// aggregate descriptions — everything that describes the shape of the output.
+function formatOutputShapingSection(
+  node: ExplainNode,
+  opts: ExplainOptions,
+  detailPad: string,
+  lines: string[],
+): void {
+  if (node.sortKeys && node.sortKeys.length > 0) {
+    const keyLabel =
+      node.nodeType === "GroupAggregate"
+        ? "Group Key"
+        : node.sortType === "group"
+          ? "Sort Key (Group)"
+          : "Sort Key";
+    lines.push(`${detailPad}${keyLabel}: ${node.sortKeys.join(", ")}`);
   }
 
+  if (node.implicitGroup) {
+    lines.push(`${detailPad}Grouping: whole-table aggregate`);
+  }
+
+  if (node.outputColumns && node.outputColumns.length > 0) {
+    lines.push(`${detailPad}Output: ${node.outputColumns.join(", ")}`);
+  }
+
+  if (opts.verbose && node.aggregates && node.aggregates.length > 0) {
+    for (const agg of node.aggregates) {
+      let desc = `${agg.name}(${agg.args})`;
+      if (agg.filter) desc += ` filter(${agg.filter})`;
+      if (agg.orderBy) desc += ` order by ${agg.orderBy}`;
+      lines.push(`${detailPad}Aggregate: ${desc}`);
+    }
+  }
+}
+
+function formatLimitSection(
+  node: ExplainNode,
+  detailPad: string,
+  lines: string[],
+): void {
+  if (node.limitCount !== undefined) {
+    lines.push(`${detailPad}Count: ${node.limitCount}`);
+  }
+  if (node.offsetCount !== undefined) {
+    lines.push(`${detailPad}Offset: ${node.offsetCount}`);
+  }
+}
+
+// Operator-level runtime stats that don't belong to a specific filter:
+// Unique's drop count and physical resources (memory, hash buckets).
+function formatOperatorStatsSection(
+  node: ExplainNode,
+  opts: ExplainOptions,
+  detailPad: string,
+  lines: string[],
+): void {
   if (
     opts.analyze &&
     node.rowsRemovedByUnique !== undefined &&
@@ -5128,94 +5441,123 @@ function formatNode(
   if (node.hashBuckets !== undefined) {
     lines.push(`${detailPad}Hash Buckets: ${node.hashBuckets}`);
   }
+}
 
-  if (opts.verbose) {
-    if (node.functionCall) {
-      lines.push(`${detailPad}Function Call: ${node.functionCall}`);
-    }
-
-    if (node.hintUsed) {
-      lines.push(`${detailPad}Join Hint: ${node.hintUsed}`);
-    }
-
-    if (opts.hints && node.leadingHint && node.leadingHint.length > 0) {
-      lines.push(`${detailPad}Leading: ${node.leadingHint.join(", ")}`);
-    }
-
-    if (opts.hints && node.sourceHints && node.sourceHints.length > 0) {
-      lines.push(`${detailPad}Hints: ${node.sourceHints.join(", ")}`);
-    }
-
-    if (node.executionScanKind) {
-      lines.push(`${detailPad}Execution Scan: ${node.executionScanKind}`);
-    }
-
-    if (node.engineIds && node.engineIds.length > 0) {
-      lines.push(`${detailPad}Engines: ${node.engineIds.join(", ")}`);
-    }
-
-    if (node.plannerCapabilities && node.plannerCapabilities.length > 0) {
-      lines.push(
-        `${detailPad}Planner Capabilities: ${node.plannerCapabilities.join(", ")}`
-      );
-    }
-
-    if (node.predicatePushdown) {
-      lines.push(`${detailPad}Pushdown Capability: ${node.predicatePushdown}`);
-    }
-
-    if (node.normalizationState) {
-      lines.push(`${detailPad}Normalization: ${node.normalizationState}`);
-      lines.push(
-        `${detailPad}Normalized Pushdown: ${node.normalizedPushdownExpr ?? "none"}`,
-      );
-      lines.push(
-        `${detailPad}Normalized Leftover: ${node.normalizedLeftoverExpr ?? "none"}`,
-      );
-    }
-
-    if (node.selectivity !== undefined) {
-      const sel = node.selectivity;
-      const formatted =
-        sel >= 0.01
-          ? sel.toFixed(4).replace(/0+$/, "").replace(/\.$/, ".0")
-          : sel.toPrecision(3);
-      lines.push(`${detailPad}Selectivity: ${formatted}`);
-    }
-
-    if (node.statsSource) {
-      lines.push(`${detailPad}Stats: ${node.statsSource}`);
-    }
-
-    if (node.ndvSource && node.joinKeyNdv) {
-      const l = node.joinKeyNdv;
-      const fmtNdv = (n: number) => (n < 0 ? "n/a" : String(n));
-      lines.push(
-        `${detailPad}NDV: ${node.ndvSource}  (values ${l.left}=${fmtNdv(l.leftNdv)} ${l.right}=${fmtNdv(l.rightNdv)})`,
-      );
-    } else if (node.ndvSource) {
-      lines.push(`${detailPad}NDV: ${node.ndvSource}`);
-    }
-
-    if (node.mcvUsed) {
-      const suffix =
-        node.mcvKeyCount !== undefined ? `  (keys=${node.mcvKeyCount})` : "";
-      lines.push(`${detailPad}MCV: both sides${suffix}`);
-    } else if (node.mcvFallback === "one-sided") {
-      const suffix =
-        node.mcvKeyCount !== undefined ? `  (keys=${node.mcvKeyCount})` : "";
-      lines.push(`${detailPad}MCV: single side${suffix}`);
-    } else if (node.mcvFallback === "suppressed") {
-      const suffix =
-        node.mcvKeyCount !== undefined ? `  (keys=${node.mcvKeyCount})` : "";
-      lines.push(`${detailPad}MCV: suppressed${suffix}`);
-    } else if (node.mcvFallback === "no-mcv") {
-      lines.push(`${detailPad}MCV: not available`);
-    }
+function formatSourceAndHintSection(
+  node: ExplainNode,
+  opts: ExplainOptions,
+  detailPad: string,
+  lines: string[],
+): void {
+  if (node.functionCall) {
+    lines.push(`${detailPad}Function Call: ${node.functionCall}`);
   }
 
-  for (const child of node.children) {
-    formatNode(child, opts, indent + (isRoot ? 2 : 6), lines);
+  if (node.hintUsed) {
+    lines.push(`${detailPad}Join Hint: ${node.hintUsed}`);
+  }
+
+  if (opts.hints && node.sourceHints && node.sourceHints.length > 0) {
+    lines.push(`${detailPad}Hints: ${node.sourceHints.join(", ")}`);
+  }
+}
+
+// Pushdown predicate decomposition: capability first (what the engine CAN
+// push down), then the user's original predicate, the normalized form,
+// and finally the split into pushed vs leftover.  Order mirrors the
+// processing pipeline so the reader follows the transformation end-to-end.
+function formatPushdownDetailSection(
+  node: ExplainNode,
+  detailPad: string,
+  lines: string[],
+): void {
+  if (node.predicatePushdown) {
+    lines.push(`${detailPad}Pushdown Capability: ${node.predicatePushdown}`);
+  }
+
+  if (node.normalizationState) {
+    lines.push(`${detailPad}Normalization: ${node.normalizationState}`);
+    if (node.originalPredicateExpr !== undefined) {
+      lines.push(
+        `${detailPad}Original Predicate: ${stripOuterParens(node.originalPredicateExpr)}`,
+      );
+    }
+    if (node.normalizedPredicateExpr !== undefined) {
+      lines.push(
+        `${detailPad}Normalized Predicate: ${stripOuterParens(node.normalizedPredicateExpr)}`,
+      );
+    }
+    lines.push(
+      `${detailPad}Normalized Pushdown: ${stripOuterParens(node.normalizedPushdownExpr ?? "none")}`,
+    );
+    lines.push(
+      `${detailPad}Normalized Leftover: ${stripOuterParens(node.normalizedLeftoverExpr ?? "none")}`,
+    );
+  }
+}
+
+function formatExecutionEngineSection(
+  node: ExplainNode,
+  detailPad: string,
+  lines: string[],
+): void {
+  if (node.executionScanKind) {
+    lines.push(`${detailPad}Execution Scan: ${node.executionScanKind}`);
+  }
+
+  if (node.engineIds && node.engineIds.length > 0) {
+    lines.push(`${detailPad}Engines: ${node.engineIds.join(", ")}`);
+  }
+
+  if (node.plannerCapabilities && node.plannerCapabilities.length > 0) {
+    lines.push(
+      `${detailPad}Planner Capabilities: ${node.plannerCapabilities.join(", ")}`,
+    );
+  }
+}
+
+function formatPlannerEstimationSection(
+  node: ExplainNode,
+  detailPad: string,
+  lines: string[],
+): void {
+  if (node.selectivity !== undefined) {
+    const sel = node.selectivity;
+    const formatted =
+      sel >= 0.01
+        ? sel.toFixed(4).replace(/0+$/, "").replace(/\.$/, ".0")
+        : sel.toPrecision(3);
+    lines.push(`${detailPad}Selectivity: ${formatted}`);
+  }
+
+  if (node.statsSource) {
+    lines.push(`${detailPad}Stats: ${node.statsSource}`);
+  }
+
+  if (node.ndvSource && node.joinKeyNdv) {
+    const l = node.joinKeyNdv;
+    const fmtNdv = (n: number) => (n < 0 ? "n/a" : String(n));
+    lines.push(
+      `${detailPad}NDV: ${node.ndvSource}  (values ${l.left}=${fmtNdv(l.leftNdv)} ${l.right}=${fmtNdv(l.rightNdv)})`,
+    );
+  } else if (node.ndvSource) {
+    lines.push(`${detailPad}NDV: ${node.ndvSource}`);
+  }
+
+  if (node.mcvUsed) {
+    const suffix =
+      node.mcvKeyCount !== undefined ? `  (keys=${node.mcvKeyCount})` : "";
+    lines.push(`${detailPad}MCV: both sides${suffix}`);
+  } else if (node.mcvFallback === "one-sided") {
+    const suffix =
+      node.mcvKeyCount !== undefined ? `  (keys=${node.mcvKeyCount})` : "";
+    lines.push(`${detailPad}MCV: single side${suffix}`);
+  } else if (node.mcvFallback === "suppressed") {
+    const suffix =
+      node.mcvKeyCount !== undefined ? `  (keys=${node.mcvKeyCount})` : "";
+    lines.push(`${detailPad}MCV: suppressed${suffix}`);
+  } else if (node.mcvFallback === "no-mcv") {
+    lines.push(`${detailPad}MCV: not available`);
   }
 }
 

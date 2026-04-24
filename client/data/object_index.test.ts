@@ -6,6 +6,11 @@ import { DataStoreMQ } from "./mq.datastore.ts";
 import { EventHook } from "../plugos/hooks/event.ts";
 import { Config } from "../config.ts";
 import { LuaEnv, LuaStackFrame } from "../space_lua/runtime.ts";
+import { parseExpressionString } from "../space_lua/parse.ts";
+
+function names(results: any[]): string[] {
+  return results.map((r: any) => r.name ?? r.rawGet?.("name")).sort();
+}
 
 // --- Test helpers ---
 
@@ -241,6 +246,41 @@ describe("ObjectIndex stats", () => {
     const stats = await index.tag("nonexistent").getStats!();
     expect(stats!.rowCount).toBe(0);
   });
+
+  test("getStats advertises bitmap-extended capabilities when trusted", async () => {
+    const { index } = createTestIndex();
+
+    await index.indexObjects("P", [
+      { tag: "item", ref: "P@1", page: "X" },
+      { tag: "item", ref: "P@2", page: "Y" },
+      { tag: "item", ref: "P@3", page: "Z" },
+    ]);
+    await index.markFullIndexComplete();
+
+    const stats = await index.tag("item").getStats!();
+    const caps = stats!.executionCapabilities!.engines[0].capabilities;
+    expect(caps).toContain("pred-in");
+    expect(caps).toContain("bool-or");
+    expect(caps).toContain("bool-not");
+    expect(caps).toContain("scan-bitmap");
+    expect(caps).toContain("stage-where");
+  });
+
+  test("per-tag stats row reports bitmap-extended pushdown label", async () => {
+    const { index } = createTestIndex();
+
+    await index.indexObjects("P", [
+      { tag: "item", ref: "P@1", page: "X" },
+      { tag: "item", ref: "P@2", page: "Y" },
+    ]);
+    await index.markFullIndexComplete();
+
+    const env = new LuaEnv();
+    const sf = LuaStackFrame.lostFrame;
+    const rows = await (await index.stats("item")).query({}, env, sf);
+    const tagRow = rows.find((r: any) => r.column === null);
+    expect(tagRow!.predicatePushdown).toBe("bitmap-extended");
+  });
 });
 
 // --- Validation ---
@@ -286,6 +326,123 @@ describe("ObjectIndex validation", () => {
     await expect(
       index.validateObjects("P", [{ tag: "strict", ref: "P@1" } as any]),
     ).rejects.toThrow();
+  });
+});
+
+// --- Bitmap predicate pushdown ---
+
+describe("ObjectIndex bitmap pushdown", () => {
+  async function seedPages(index: ObjectIndex) {
+    await index.indexObjects("P", [
+      { tag: "item", ref: "P@1", name: "A", page: "X" },
+      { tag: "item", ref: "P@2", name: "B", page: "Y" },
+      { tag: "item", ref: "P@3", name: "C", page: "Z" },
+      { tag: "item", ref: "P@4", name: "D", page: "X" },
+      { tag: "item", ref: "P@5", name: "E", page: "W" },
+    ]);
+    await index.markFullIndexComplete();
+  }
+
+  test("pred-in: `page in {X, Y}` is answered via bitmap union", async () => {
+    const { index } = createTestIndex();
+    await seedPages(index);
+
+    const env = new LuaEnv();
+    const sf = LuaStackFrame.lostFrame;
+    const where = parseExpressionString("o.page in {'X', 'Y'}");
+    const results = await index
+      .tag("item")
+      .query({ where, objectVariable: "o" }, env, sf);
+    expect(names(results)).toEqual(["A", "B", "D"]);
+  });
+
+  test("bool-or: same-column equality chain collapses to bitmap IN", async () => {
+    const { index } = createTestIndex();
+    await seedPages(index);
+
+    const env = new LuaEnv();
+    const sf = LuaStackFrame.lostFrame;
+    const where = parseExpressionString(
+      "o.page == 'X' or o.page == 'Y' or o.page == 'Z'",
+    );
+    const results = await index
+      .tag("item")
+      .query({ where, objectVariable: "o" }, env, sf);
+    expect(names(results)).toEqual(["A", "B", "C", "D"]);
+  });
+
+  test("bool-not: `not (page in {X, Y})` rewrites to neq conjunction", async () => {
+    const { index } = createTestIndex();
+    await seedPages(index);
+
+    const env = new LuaEnv();
+    const sf = LuaStackFrame.lostFrame;
+    const where = parseExpressionString("not (o.page in {'X', 'Y'})");
+    const results = await index
+      .tag("item")
+      .query({ where, objectVariable: "o" }, env, sf);
+    expect(names(results)).toEqual(["C", "E"]);
+  });
+
+  test("pred-in combined with AND of range predicate", async () => {
+    const { index } = createTestIndex();
+    await index.indexObjects("P", [
+      { tag: "item", ref: "P@1", name: "A", page: "X", count: 10 },
+      { tag: "item", ref: "P@2", name: "B", page: "Y", count: 20 },
+      { tag: "item", ref: "P@3", name: "C", page: "Z", count: 30 },
+      { tag: "item", ref: "P@4", name: "D", page: "X", count: 40 },
+      { tag: "item", ref: "P@5", name: "E", page: "W", count: 50 },
+    ]);
+    await index.markFullIndexComplete();
+
+    const env = new LuaEnv();
+    const sf = LuaStackFrame.lostFrame;
+    const where = parseExpressionString(
+      "o.page in {'X', 'Y'} and o.count >= 20",
+    );
+    const results = await index
+      .tag("item")
+      .query({ where, objectVariable: "o" }, env, sf);
+    expect(names(results)).toEqual(["B", "D"]);
+  });
+
+  test("pred-in with single value behaves like equality", async () => {
+    const { index } = createTestIndex();
+    await seedPages(index);
+
+    const env = new LuaEnv();
+    const sf = LuaStackFrame.lostFrame;
+    const where = parseExpressionString("o.page in {'Y'}");
+    const results = await index
+      .tag("item")
+      .query({ where, objectVariable: "o" }, env, sf);
+    expect(names(results)).toEqual(["B"]);
+  });
+
+  test("pred-in with value not in dictionary returns empty set", async () => {
+    const { index } = createTestIndex();
+    await seedPages(index);
+
+    const env = new LuaEnv();
+    const sf = LuaStackFrame.lostFrame;
+    const where = parseExpressionString("o.page in {'nope', 'also-nope'}");
+    const results = await index
+      .tag("item")
+      .query({ where, objectVariable: "o" }, env, sf);
+    expect(results).toHaveLength(0);
+  });
+
+  test("bool-or on different columns falls back to full scan (no bitmap push)", async () => {
+    const { index } = createTestIndex();
+    await seedPages(index);
+
+    const env = new LuaEnv();
+    const sf = LuaStackFrame.lostFrame;
+    const where = parseExpressionString("o.page == 'X' or o.name == 'C'");
+    const results = await index
+      .tag("item")
+      .query({ where, objectVariable: "o" }, env, sf);
+    expect(names(results)).toEqual(["A", "C", "D"]);
   });
 });
 

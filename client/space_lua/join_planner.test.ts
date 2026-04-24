@@ -2,11 +2,18 @@ import { describe, expect, it } from "vitest";
 import {
   attachAnalyzeQueryOpStats,
   buildJoinTree,
+  buildLeadingHintInfo,
   buildNormalizationInfoBySource,
+  collectScanSourceOrder,
   executeAndInstrument,
   executeJoinTree,
   explainJoinTree,
+  exprToDisplayString,
+  exprToString,
+  extractSingleSourceFilters,
   formatExplainOutput,
+  normalizePushdownExpression,
+  stripOuterParens,
   stripUsedJoinPredicates,
   wrapPlanWithQueryOps,
   type ExplainNode,
@@ -310,6 +317,11 @@ function makeSource(
   items?: any[],
   extraNdv?: [string, number][],
 ): JoinSource {
+  // No `executionCapabilities`: emulates a materialised source with no engine
+  // pushdown support, which is what most tests in this suite want.  The
+  // planner treats a missing `engines` array as "no capabilities advertised"
+  // (same as `engines: []`), which exactly matches the old
+  // `predicatePushdown: "none"` intent.
   return {
     name,
     expression: parseExpressionString(name),
@@ -329,10 +341,6 @@ function makeSource(
       ]),
       avgColumnCount: 4,
       statsSource: "computed-exact-small",
-      executionCapabilities: {
-        predicatePushdown: "none",
-        scanKind: "materialized",
-      },
     },
   };
 }
@@ -469,6 +477,155 @@ describe("leading join order hints", () => {
   });
 });
 
+describe("leading hint in explain output", () => {
+  function sourcesForLeadingTest(): JoinSource[] {
+    return [
+      {
+        ...makeSource("a"),
+        stats: { ...makeSource("a").stats!, rowCount: 50 },
+      },
+      {
+        ...makeSource("b"),
+        stats: { ...makeSource("b").stats!, rowCount: 80 },
+      },
+      {
+        ...makeSource("c"),
+        stats: { ...makeSource("c").stats!, rowCount: 70 },
+      },
+      {
+        ...makeSource("d"),
+        stats: { ...makeSource("d").stats!, rowCount: 60 },
+      },
+      {
+        ...makeSource("e"),
+        stats: { ...makeSource("e").stats!, rowCount: 30 },
+      },
+      {
+        ...makeSource("f"),
+        stats: { ...makeSource("f").stats!, rowCount: 40 },
+      },
+    ];
+  }
+
+  function hintOpts() {
+    return {
+      analyze: false,
+      verbose: true,
+      summary: false,
+      costs: true,
+      timing: false,
+      hints: true,
+    } as const;
+  }
+
+  it("collectScanSourceOrder returns leaves in join-tree execution order", () => {
+    const sources = sourcesForLeadingTest();
+    const tree = buildJoinTree(sources, ["a", "c", "b"]);
+    const plan = explainJoinTree(tree, hintOpts());
+    const order = collectScanSourceOrder(plan);
+    expect(order.slice(0, 3)).toEqual(["a", "c", "b"]);
+    expect(order.slice(3).sort()).toEqual(["d", "e", "f"]);
+  });
+
+  it("buildLeadingHintInfo reports fixed prefix and planner-chosen suffix", () => {
+    const sources = sourcesForLeadingTest();
+    const tree = buildJoinTree(sources, ["a", "c", "b"]);
+    const plan = explainJoinTree(tree, hintOpts());
+
+    const info = buildLeadingHintInfo(["a", "c", "b"], plan);
+    expect(info).toBeDefined();
+    expect(info!.requested).toEqual(["a", "c", "b"]);
+    expect(info!.fixed).toEqual(["a", "c", "b"]);
+    expect(info!.plannerChosen.length).toBe(3);
+    expect(info!.plannerChosen.sort()).toEqual(["d", "e", "f"]);
+    expect(info!.finalOrder.length).toBe(6);
+    expect(info!.finalOrder.slice(0, 3)).toEqual(["a", "c", "b"]);
+  });
+
+  it("buildLeadingHintInfo returns undefined when no leading clause is given", () => {
+    const sources = sourcesForLeadingTest();
+    const tree = buildJoinTree(sources);
+    const plan = explainJoinTree(tree, hintOpts());
+    expect(buildLeadingHintInfo(undefined, plan)).toBeUndefined();
+    expect(buildLeadingHintInfo([], plan)).toBeUndefined();
+  });
+
+  it("formatExplainOutput renders leading hint preamble when hints enabled", () => {
+    const sources = sourcesForLeadingTest();
+    const tree = buildJoinTree(sources, ["a", "c", "b"]);
+    const plan = explainJoinTree(tree, hintOpts());
+    const rendered = formatExplainOutput(
+      {
+        plan,
+        planningTimeMs: 0,
+        leadingHint: buildLeadingHintInfo(["a", "c", "b"], plan),
+      },
+      hintOpts(),
+    );
+
+    expect(rendered.includes("Leading Hint")).toBe(true);
+    expect(rendered.includes("Requested:      a, c, b")).toBe(true);
+    expect(rendered.includes("Fixed by hint:  a, c, b")).toBe(true);
+    // Final order begins with the fixed prefix.
+    expect(rendered).toMatch(/Final order:\s+a, c, b, /);
+    // Planner-chosen suffix contains exactly d, e, f (any order).
+    expect(rendered).toMatch(/Planner-chosen: (?:[def], ?){2}[def]/);
+  });
+
+  it("leading hint preamble is omitted when hints option is disabled", () => {
+    const sources = sourcesForLeadingTest();
+    const tree = buildJoinTree(sources, ["a", "c", "b"]);
+    const plan = explainJoinTree(tree, {
+      ...hintOpts(),
+      hints: false,
+    });
+    const rendered = formatExplainOutput(
+      {
+        plan,
+        planningTimeMs: 0,
+        leadingHint: buildLeadingHintInfo(["a", "c", "b"], plan),
+      },
+      {
+        ...hintOpts(),
+        hints: false,
+      },
+    );
+
+    expect(rendered.includes("Leading Hint")).toBe(false);
+    expect(rendered.includes("Requested:")).toBe(false);
+  });
+
+  it("leading hint preamble is omitted when no hint was given even if hints enabled", () => {
+    const sources = sourcesForLeadingTest();
+    const tree = buildJoinTree(sources);
+    const plan = explainJoinTree(tree, hintOpts());
+    const rendered = formatExplainOutput(
+      {
+        plan,
+        planningTimeMs: 0,
+        leadingHint: buildLeadingHintInfo(undefined, plan),
+      },
+      hintOpts(),
+    );
+
+    expect(rendered.includes("Leading Hint")).toBe(false);
+  });
+
+  it("leading hint no longer annotates the root node itself", () => {
+    const sources = sourcesForLeadingTest();
+    const tree = buildJoinTree(sources, ["a", "c", "b"]);
+    const plan = wrapPlanWithQueryOps(explainJoinTree(tree, hintOpts()), {
+      leading: ["a", "c", "b"],
+    });
+
+    const walk = (n: ExplainNode): boolean => {
+      if ((n as any).leadingHint !== undefined) return true;
+      return n.children.some(walk);
+    };
+    expect(walk(plan)).toBe(false);
+  });
+});
+
 describe("join residual predicate stripping and explain", () => {
   it("strips consumed equi and cross-source residual predicates from WHERE", () => {
     const sources: JoinSource[] = [makeSource("a"), makeSource("b")];
@@ -585,7 +742,7 @@ describe("join residual predicate stripping and explain", () => {
       hints: false,
     });
 
-    expect(explain.joinResidualExprs).toEqual(["(a.price > b.min_price)"]);
+    expect(explain.joinResidualExprs).toEqual(["a.price > b.min_price"]);
 
     const rendered = formatExplainOutput(
       {
@@ -603,9 +760,9 @@ describe("join residual predicate stripping and explain", () => {
     );
 
     expect(
-      rendered.includes("Residual Join Filter: (a.price > b.min_price)"),
+      rendered.includes("Residual Join Filter: a.price > b.min_price"),
     ).toBe(true);
-    expect(rendered.includes("Hash Condition: (a.id == b.id)")).toBe(true);
+    expect(rendered.includes("Hash Condition: a.id == b.id")).toBe(true);
   });
 
   it("multiple consumed residual conjuncts are all stripped from post-join WHERE", () => {
@@ -669,8 +826,8 @@ describe("join residual predicate stripping and explain", () => {
     });
 
     expect(explain.joinResidualExprs).toEqual([
-      "(a.price > b.min_price)",
-      "(a.price <= b.max_price)",
+      "a.price > b.min_price",
+      "a.price <= b.max_price",
     ]);
   });
 
@@ -716,7 +873,9 @@ describe("single-source normalization metadata", () => {
 
     expect(info.get("a")).toEqual({
       state: "complete",
-      pushdownExpr: "((a.x == 1) and (a.y == 2))",
+      originalExpr: "(a.x == 1) and (a.y == 2)",
+      normalizedExpr: "(a.x == 1) and (a.y == 2)",
+      pushdownExpr: "(a.x == 1) and (a.y == 2)",
       leftoverExpr: "none",
     });
     expect(info.has("b")).toBe(false);
@@ -728,9 +887,28 @@ describe("single-source normalization metadata", () => {
 
     expect(info.get("a")).toEqual({
       state: "partial",
-      pushdownExpr: "(a.x == 1)",
+      originalExpr: "(a.x == 1) and unknown_fn(a.y)",
+      normalizedExpr: "(a.x == 1) and unknown_fn(a.y)",
+      pushdownExpr: "a.x == 1",
       leftoverExpr: "unknown_fn(a.y)",
     });
+  });
+
+  it("preserves user's original predicate when normalization rewrites it", () => {
+    const expr = parseExpressionString("not (a.x in {1, 2}) and a.y == 3");
+    const info = buildNormalizationInfoBySource(expr, new Set(["a"]));
+
+    const entry = info.get("a");
+    expect(entry).toBeDefined();
+    expect(entry!.state).toBe("complete");
+    expect(entry!.originalExpr).toContain("not");
+    expect(entry!.originalExpr).toContain(" in ");
+    expect(entry!.pushdownExpr).toContain("a.x ~= 1");
+    expect(entry!.pushdownExpr).toContain("a.x ~= 2");
+    expect(entry!.pushdownExpr).toContain("a.y == 3");
+    expect(entry!.normalizedExpr).toContain("a.x ~= 1");
+    expect(entry!.normalizedExpr).toContain("a.x ~= 2");
+    expect(entry!.leftoverExpr).toBe("none");
   });
 
   it("explain leaf renders partial normalization lines", () => {
@@ -751,6 +929,8 @@ describe("single-source normalization metadata", () => {
           "a",
           {
             state: "partial",
+            originalExpr: "(a.x == 1) and unknown_fn(a.y)",
+            normalizedExpr: "((a.x == 1) and unknown_fn(a.y))",
             pushdownExpr: "(a.x == 1)",
             leftoverExpr: "unknown_fn(a.y)",
           },
@@ -758,7 +938,13 @@ describe("single-source normalization metadata", () => {
       ]),
     );
 
+    // Node fields preserve whatever the caller supplied; display-time
+    // stripping is applied only when rendering.
     expect(plan.normalizationState).toBe("partial");
+    expect(plan.originalPredicateExpr).toBe("(a.x == 1) and unknown_fn(a.y)");
+    expect(plan.normalizedPredicateExpr).toBe(
+      "((a.x == 1) and unknown_fn(a.y))",
+    );
     expect(plan.normalizedPushdownExpr).toBe("(a.x == 1)");
     expect(plan.normalizedLeftoverExpr).toBe("unknown_fn(a.y)");
 
@@ -778,8 +964,16 @@ describe("single-source normalization metadata", () => {
     );
 
     expect(rendered.includes("Normalization: partial")).toBe(true);
-    expect(rendered.includes("Pushdown: (a.x == 1)")).toBe(true);
-    expect(rendered.includes("Leftover: unknown_fn(a.y)")).toBe(true);
+    expect(
+      rendered.includes("Original Predicate: (a.x == 1) and unknown_fn(a.y)"),
+    ).toBe(true);
+    expect(
+      rendered.includes("Normalized Predicate: (a.x == 1) and unknown_fn(a.y)"),
+    ).toBe(true);
+    expect(rendered.includes("Normalized Pushdown: a.x == 1")).toBe(true);
+    expect(rendered.includes("Normalized Leftover: unknown_fn(a.y)")).toBe(
+      true,
+    );
   });
 
   it("does not render normalization lines when no normalization metadata exists", () => {
@@ -856,13 +1050,578 @@ describe("single-source normalization metadata", () => {
     const aLeaf = leaves.find((l) => l.source === "a");
     const bLeaf = leaves.find((l) => l.source === "b");
 
+    // Node data is the build-time (post-normalization) string with outer
+    // parens already removed by `buildNormalizationInfoBySource`.
     expect(aLeaf?.normalizationState).toBe("partial");
-    expect(aLeaf?.normalizedPushdownExpr).toBe("(a.x == 1)");
+    expect(aLeaf?.normalizedPushdownExpr).toBe("a.x == 1");
     expect(aLeaf?.normalizedLeftoverExpr).toBe("unknown_fn(a.y)");
+    expect(aLeaf?.originalPredicateExpr).toBe("(a.x == 1) and unknown_fn(a.y)");
+    expect(aLeaf?.normalizedPredicateExpr).toBe(
+      "(a.x == 1) and unknown_fn(a.y)",
+    );
 
     expect(bLeaf?.normalizationState).toBe("complete");
-    expect(bLeaf?.normalizedPushdownExpr).toBe("(b.flag == true)");
+    expect(bLeaf?.normalizedPushdownExpr).toBe("b.flag == true");
     expect(bLeaf?.normalizedLeftoverExpr).toBe("none");
+    expect(bLeaf?.originalPredicateExpr).toBe("b.flag == true");
+    expect(bLeaf?.normalizedPredicateExpr).toBe("b.flag == true");
+  });
+
+  it("renders original vs rewritten predicate lines for a scan leaf", () => {
+    const source = makeSource("a");
+    const normalizationInfo = buildNormalizationInfoBySource(
+      parseExpressionString(
+        "not (a.x in {1, 2}) and a.y == 3 and unknown_fn(a.z)",
+      ),
+      new Set(["a"]),
+    );
+
+    const plan = explainJoinTree(
+      { kind: "leaf", source },
+      {
+        analyze: false,
+        verbose: true,
+        summary: false,
+        costs: true,
+        timing: false,
+        hints: false,
+      },
+      undefined,
+      normalizationInfo,
+    );
+
+    const rendered = formatExplainOutput(
+      {
+        plan,
+        planningTimeMs: 0,
+      },
+      {
+        analyze: false,
+        verbose: true,
+        summary: false,
+        costs: true,
+        timing: false,
+        hints: false,
+      },
+    );
+
+    // Pre-normalization form is preserved for user readability.
+    expect(rendered).toContain("Original Predicate:");
+    expect(rendered).toContain("not");
+    expect(rendered).toContain(" in ");
+    // Post-normalization rewrites `not in {...}` to AND of `~=` disjuncts.
+    expect(rendered).toContain("Normalized Predicate:");
+    expect(rendered).toMatch(/a\.x ~= 1[\s\S]*a\.x ~= 2/);
+    // Separately shows the pushable part and the leftover part.
+    expect(rendered).toContain("Normalized Pushdown:");
+    expect(rendered).toContain("Normalized Leftover:");
+    expect(rendered).toContain("unknown_fn(a.z)");
+    expect(rendered).toContain("Normalization: partial");
+  });
+});
+
+describe("formatExplainOutput node section ordering", () => {
+  function requireOrder(rendered: string, labels: string[]): void {
+    const indices = labels.map((label) => ({
+      label,
+      index: rendered.indexOf(label),
+    }));
+    for (const { label, index } of indices) {
+      expect(index, `expected "${label}" to appear in output`).toBeGreaterThan(
+        -1,
+      );
+    }
+    for (let i = 1; i < indices.length; i++) {
+      expect(
+        indices[i].index,
+        `expected "${indices[i].label}" after "${indices[i - 1].label}"`,
+      ).toBeGreaterThan(indices[i - 1].index);
+    }
+  }
+
+  function makeSourceWithPushdown(name: string): JoinSource {
+    return {
+      name,
+      expression: parseExpressionString(name),
+      stats: {
+        rowCount: 100,
+        ndv: new Map<string, number>([
+          ["id", 100],
+          ["x", 100],
+          ["y", 100],
+        ]),
+        avgColumnCount: 4,
+        statsSource: "computed-exact-small",
+        executionCapabilities: {
+          engines: [
+            {
+              id: "bitmap",
+              name: "bitmap",
+              kind: "bitmap",
+              capabilities: [
+                "scan-bitmap",
+                "stage-where",
+                "pred-eq",
+                "pred-neq",
+                "pred-in",
+                "bool-and",
+                "bool-not",
+              ],
+              baseCostWeight: 0.6,
+              priority: 20,
+            },
+          ],
+        },
+      },
+    };
+  }
+
+  it("join node pairs each condition/filter with its 'Rows Removed' stat in order", async () => {
+    const aItems = [
+      { id: 1, price: 5, keep: 1 },
+      { id: 2, price: 20, keep: 1 },
+      { id: 3, price: 30, keep: 1 },
+    ];
+    const bItems = [
+      { id: 1, min_price: 10 },
+      { id: 2, min_price: 10 },
+      { id: 3, min_price: 50 },
+    ];
+
+    const sources: JoinSource[] = [
+      {
+        ...makeSource("a", aItems),
+        hint: {
+          type: "JoinHint",
+          kind: "loop",
+          ctx: {} as any,
+        },
+      },
+      makeSource("b", bItems),
+    ];
+
+    const where = parseExpressionString(
+      "a.id == b.id and a.price > b.min_price",
+    );
+
+    const joinTree = buildJoinTree(
+      sources,
+      undefined,
+      [
+        {
+          leftSource: "a",
+          leftColumn: "id",
+          rightSource: "b",
+          rightColumn: "id",
+        },
+      ],
+      [
+        {
+          leftSource: "a",
+          leftColumn: "price",
+          operator: ">",
+          rightSource: "b",
+          rightColumn: "min_price",
+        },
+      ],
+      where,
+    );
+
+    const explainOpts = {
+      analyze: true,
+      verbose: true,
+      summary: false,
+      costs: true,
+      timing: false,
+      hints: false,
+    } as const;
+
+    const plan = explainJoinTree(joinTree, explainOpts);
+    const env = testEnvWithSources({ a: aItems, b: bItems });
+    await executeAndInstrument(
+      joinTree,
+      plan,
+      env,
+      LuaStackFrame.lostFrame,
+      explainOpts,
+      undefined,
+      undefined,
+      0,
+    );
+
+    const rendered = formatExplainOutput(
+      { plan, planningTimeMs: 0 },
+      explainOpts,
+    );
+
+    // Join Filter (equi) → Residual Join Filter → Rows Removed by Join Filter:
+    // predicate definitions come first, the runtime stat sits immediately
+    // next to them.
+    requireOrder(rendered, [
+      "Join Filter: a.id == b.id",
+      "Residual Join Filter: a.price > b.min_price",
+      "Rows Removed by Join Filter:",
+    ]);
+  });
+
+  it("scan leaf orders: filter → rows removed → hints → pushdown detail → engine → estimation", () => {
+    const source = makeSourceWithPushdown("a");
+    const plan = explainJoinTree(
+      { kind: "leaf", source },
+      {
+        analyze: false,
+        verbose: true,
+        summary: false,
+        costs: true,
+        timing: false,
+        hints: false,
+      },
+      new Map([["a", "(a.x == 1)"]]),
+      new Map([
+        [
+          "a",
+          {
+            state: "partial",
+            originalExpr: "(a.x == 1) and unknown_fn(a.y)",
+            normalizedExpr: "((a.x == 1) and unknown_fn(a.y))",
+            pushdownExpr: "(a.x == 1)",
+            leftoverExpr: "unknown_fn(a.y)",
+          },
+        ],
+      ]),
+    );
+    plan.rowsRemovedByFilter = 5;
+    plan.actualRows = 10;
+
+    const rendered = formatExplainOutput(
+      { plan, planningTimeMs: 0 },
+      {
+        analyze: true,
+        verbose: true,
+        summary: false,
+        costs: true,
+        timing: false,
+        hints: false,
+      },
+    );
+
+    requireOrder(rendered, [
+      "Pushdown Filter: a.x == 1",
+      "Rows Removed by Pushdown Filter: 5",
+      "Pushdown Capability:",
+      "Normalization: partial",
+      "Original Predicate:",
+      "Normalized Predicate:",
+      "Normalized Pushdown:",
+      "Normalized Leftover:",
+      "Execution Scan:",
+      "Stats: computed-exact-small",
+    ]);
+  });
+
+  it("GroupAggregate node orders its own lines: Group Key → Aggregate → Stats", () => {
+    const basePlan: ExplainNode = {
+      nodeType: "Scan",
+      source: "t",
+      startupCost: 0,
+      estimatedCost: 100,
+      estimatedRows: 100,
+      estimatedWidth: 5,
+      statsSource: "computed-exact-small",
+      children: [],
+    };
+
+    const wrapped = wrapPlanWithQueryOps(
+      basePlan,
+      {
+        groupBy: [{ expr: parseExpressionString("t.g") }],
+        select: parseExpressionString("{ g = t.g, s = sum(t.v) }"),
+      },
+      undefined,
+      undefined,
+      undefined,
+      new Config(),
+    );
+
+    // Locate the GroupAggregate sub-block within the full render so we can
+    // check ordering inside that one node specifically.
+    const rendered = formatExplainOutput(
+      { plan: wrapped, planningTimeMs: 0 },
+      {
+        analyze: false,
+        verbose: true,
+        summary: false,
+        costs: true,
+        timing: false,
+        hints: false,
+      },
+    );
+
+    const lines = rendered.split("\n");
+    const start = lines.findIndex((l) => l.includes("Group Aggregate"));
+    expect(start).toBeGreaterThanOrEqual(0);
+    // Sub-block ends at the next `->` sibling or eof; take the next ~10 lines.
+    const block = lines.slice(start, start + 10).join("\n");
+
+    requireOrder(block, [
+      "Group Aggregate",
+      "Group Key: t.g",
+      "Aggregate: sum(t.v)",
+      "Stats: computed-exact-small",
+    ]);
+  });
+
+  it("Limit node exposes Count/Offset before operator stats", () => {
+    const basePlan: ExplainNode = {
+      nodeType: "Scan",
+      source: "t",
+      startupCost: 0,
+      estimatedCost: 100,
+      estimatedRows: 100,
+      estimatedWidth: 5,
+      statsSource: "computed-exact-small",
+      children: [],
+    };
+
+    const wrapped = wrapPlanWithQueryOps(basePlan, {
+      limit: 10,
+      offset: 5,
+    });
+
+    const rendered = formatExplainOutput(
+      { plan: wrapped, planningTimeMs: 0 },
+      {
+        analyze: false,
+        verbose: true,
+        summary: false,
+        costs: true,
+        timing: false,
+        hints: false,
+      },
+    );
+
+    requireOrder(rendered, ["Limit", "Count: 10", "Offset: 5"]);
+  });
+
+  it("verbose section comes strictly after all non-verbose operator lines", () => {
+    const source = makeSourceWithPushdown("a");
+    const plan = explainJoinTree(
+      { kind: "leaf", source },
+      {
+        analyze: true,
+        verbose: true,
+        summary: false,
+        costs: true,
+        timing: false,
+        hints: true,
+      },
+      new Map([["a", "(a.x == 1)"]]),
+      new Map([
+        [
+          "a",
+          {
+            state: "complete",
+            originalExpr: "(a.x == 1)",
+            normalizedExpr: "(a.x == 1)",
+            pushdownExpr: "(a.x == 1)",
+            leftoverExpr: "none",
+          },
+        ],
+      ]),
+    );
+    plan.rowsRemovedByFilter = 3;
+    plan.actualRows = 7;
+
+    const rendered = formatExplainOutput(
+      { plan, planningTimeMs: 0 },
+      {
+        analyze: true,
+        verbose: true,
+        summary: false,
+        costs: true,
+        timing: false,
+        hints: true,
+      },
+    );
+
+    // `Rows Removed by Pushdown Filter` is operator-level (non-verbose);
+    // everything verbose (Pushdown Capability, Normalization, Execution
+    // Scan, Stats) must appear strictly after it.
+    requireOrder(rendered, [
+      "Rows Removed by Pushdown Filter: 3",
+      "Pushdown Capability:",
+      "Normalization: complete",
+      "Execution Scan:",
+      "Stats:",
+    ]);
+  });
+});
+
+describe("expression paren normalization", () => {
+  it("stripOuterParens removes one enclosing pair only", () => {
+    expect(stripOuterParens("(a.x == 1)")).toBe("a.x == 1");
+    expect(stripOuterParens("((a) and (b))")).toBe("(a) and (b)");
+    expect(stripOuterParens("(a) or (b)")).toBe("(a) or (b)");
+    expect(stripOuterParens("unknown_fn(x)")).toBe("unknown_fn(x)");
+    expect(stripOuterParens("")).toBe("");
+    expect(stripOuterParens("()")).toBe("");
+  });
+
+  it("exprToDisplayString drops the outermost parens from Binary expressions", () => {
+    const expr = parseExpressionString("a.x == 1");
+    expect(exprToString(expr)).toBe("(a.x == 1)");
+    expect(exprToDisplayString(expr)).toBe("a.x == 1");
+  });
+
+  it("exprToDisplayString keeps nested parens intact", () => {
+    const expr = parseExpressionString("(a.x == 1) and (a.y == 2)");
+    expect(exprToString(expr)).toBe("((a.x == 1) and (a.y == 2))");
+    expect(exprToDisplayString(expr)).toBe("(a.x == 1) and (a.y == 2)");
+  });
+
+  it("every expression surface in the rendered output is paren-free at the outer level", async () => {
+    const aItems = [
+      { id: 1, x: 1, y: 3, keep: true, price: 10 },
+      { id: 2, x: 2, y: 3, keep: true, price: 20 },
+      { id: 3, x: 5, y: 3, keep: false, price: 30 },
+    ];
+    const bItems = [
+      { id: 1, min_price: 5 },
+      { id: 2, min_price: 15 },
+      { id: 3, min_price: 50 },
+    ];
+
+    const sources: JoinSource[] = [
+      makeSource("a", aItems),
+      makeSource("b", bItems),
+    ];
+
+    const where = parseExpressionString(
+      "a.id == b.id and a.price > b.min_price and a.keep == true",
+    );
+
+    const joinTree = buildJoinTree(
+      sources,
+      undefined,
+      [
+        {
+          leftSource: "a",
+          leftColumn: "id",
+          rightSource: "b",
+          rightColumn: "id",
+        },
+      ],
+      [
+        {
+          leftSource: "a",
+          leftColumn: "price",
+          operator: ">",
+          rightSource: "b",
+          rightColumn: "min_price",
+        },
+      ],
+      where,
+    );
+
+    const residualWhere = stripUsedJoinPredicates(where, joinTree);
+
+    const normInfo = buildNormalizationInfoBySource(where, new Set(["a", "b"]));
+    const pushedByName = new Map<string, string>();
+    for (const [name, info] of normInfo) {
+      pushedByName.set(name, info.pushdownExpr);
+    }
+
+    const explainOpts = {
+      analyze: false,
+      verbose: true,
+      summary: false,
+      costs: false,
+      timing: false,
+      hints: false,
+    } as const;
+
+    const plan = wrapPlanWithQueryOps(
+      explainJoinTree(joinTree, explainOpts, pushedByName, normInfo),
+      {
+        where: residualWhere,
+        orderBy: [
+          {
+            expr: parseExpressionString("a.id"),
+            desc: false,
+          },
+        ],
+        groupBy: [{ expr: parseExpressionString("a.keep") }],
+        select: parseExpressionString(
+          "{ k = a.keep, total = sum(a.price) filter(where a.price > 5) }",
+        ),
+      },
+      undefined,
+      undefined,
+      undefined,
+      new Config(),
+    );
+
+    const rendered = formatExplainOutput(
+      { plan, planningTimeMs: 0 },
+      explainOpts,
+    );
+
+    // Every line that carries an expression after a `<label>:` prefix must
+    // NOT have its expression wrapped in redundant outer parens.
+    const labelPrefixes = [
+      "Filter",
+      "Pushdown Filter",
+      "Having Condition",
+      "Aggregate Filter",
+      "Hash Condition",
+      "Merge Condition",
+      "Join Filter",
+      "Residual Join Filter",
+      "Original Predicate",
+      "Normalized Predicate",
+      "Normalized Pushdown",
+      "Normalized Leftover",
+    ];
+
+    for (const line of rendered.split("\n")) {
+      const trimmed = line.trim();
+      for (const prefix of labelPrefixes) {
+        const marker = `${prefix}: `;
+        const idx = trimmed.indexOf(marker);
+        if (idx !== 0) continue;
+        const value = trimmed.slice(marker.length);
+        // An outer `(...)` pair that encloses the whole value is redundant.
+        expect(
+          !(
+            value.length >= 2 &&
+            value.startsWith("(") &&
+            value.endsWith(")") &&
+            stripOuterParens(value) !== value
+          ),
+          `line "${line}" still has redundant outer parens`,
+        ).toBe(true);
+      }
+    }
+
+    // Positive: expected paren-free strings are present for the sample
+    // query.  This dataset picks Nested Loop over Hash Join, so the
+    // equi-condition is labelled `Join Filter:`.
+    expect(rendered).toContain("Sort Key: a.id");
+    expect(rendered).toContain("Group Key: a.keep");
+    expect(rendered).toContain(
+      "Output: k = a.keep, total = sum(a.price) filter(a.price > 5)",
+    );
+    expect(rendered).toContain("Join Filter: a.id == b.id");
+    expect(rendered).toContain("Residual Join Filter: a.price > b.min_price");
+    expect(rendered).toContain("Filter: a.keep == true");
+    expect(rendered).toContain("Pushdown Filter: a.keep == true");
+    expect(rendered).toContain("Original Predicate: a.keep == true");
+    expect(rendered).toContain("Normalized Predicate: a.keep == true");
+    expect(rendered).toContain("Normalized Pushdown: a.keep == true");
+    expect(rendered).toContain(
+      "Aggregate Filter: sum(a.price) filter(a.price > 5)",
+    );
+    expect(rendered).toContain("Aggregate: sum(a.price) filter(a.price > 5)");
   });
 });
 
@@ -1085,9 +1844,9 @@ describe("join residual execution", () => {
 
     expect(explain.nodeType).toBe("Project");
     expect(explain.children[0].nodeType).toBe("Filter");
-    expect(explain.children[0].filterExpr).toBe("(a.keep == 1)");
+    expect(explain.children[0].filterExpr).toBe("a.keep == 1");
     expect(explain.children[0].children[0].joinResidualExprs).toEqual([
-      "(a.price > b.min_price)",
+      "a.price > b.min_price",
     ]);
   });
 
@@ -1402,10 +2161,6 @@ describe("source with-hints in explain and planning", () => {
         ndv: new Map([["id", 100]]),
         avgColumnCount: 8,
         statsSource: "computed-exact-small",
-        executionCapabilities: {
-          predicatePushdown: "none",
-          scanKind: "materialized",
-        },
       },
       withHints: {
         rows: 7,
@@ -1444,10 +2199,6 @@ describe("source with-hints in explain and planning", () => {
         ndv: new Map([["id", 100]]),
         avgColumnCount: 8,
         statsSource: "computed-exact-small",
-        executionCapabilities: {
-          predicatePushdown: "none",
-          scanKind: "materialized",
-        },
       },
       withHints: {
         rows: 5,
@@ -1496,10 +2247,6 @@ describe("source with-hints in explain and planning", () => {
         ndv: new Map([["id", 100]]),
         avgColumnCount: 8,
         statsSource: "computed-exact-small",
-        executionCapabilities: {
-          predicatePushdown: "none",
-          scanKind: "materialized",
-        },
       },
       withHints: {
         rows: 7,
@@ -1922,10 +2669,6 @@ describe("aggregate filter analyze stats", () => {
             ]),
             avgColumnCount: 2,
             statsSource: "computed-exact-small",
-            executionCapabilities: {
-              predicatePushdown: "none",
-              scanKind: "materialized",
-            },
           },
         ],
       ]),
@@ -1962,5 +2705,75 @@ describe("aggregate filter analyze stats", () => {
 
     expect(rendered.includes("Filter (Aggregate)")).toBe(true);
     expect(rendered.includes("Rows Removed by Aggregate Filter: 3")).toBe(true);
+  });
+});
+
+describe("normalizePushdownExpression IN / NOT IN rewrites", () => {
+  it("preserves `o.x in {1,2,3}` as a QueryIn over a literal table", () => {
+    const expr = parseExpressionString("o.x in {1, 2, 3}");
+    const normalized = normalizePushdownExpression(expr);
+    expect(normalized.type).toBe("QueryIn");
+    const rendered = exprToString(normalized);
+    expect(rendered).toContain("o.x in");
+    expect(rendered).toContain("1");
+    expect(rendered).toContain("2");
+    expect(rendered).toContain("3");
+  });
+
+  it("rewrites `not (o.x in {1, 2, 3})` into `o.x ~= 1 and o.x ~= 2 and o.x ~= 3`", () => {
+    const expr = parseExpressionString("not (o.x in {1, 2, 3})");
+    const normalized = normalizePushdownExpression(expr);
+    expect(normalized.type).toBe("Binary");
+    const rendered = exprToString(normalized);
+    expect(rendered).toContain("o.x ~= 1");
+    expect(rendered).toContain("o.x ~= 2");
+    expect(rendered).toContain("o.x ~= 3");
+    expect(rendered).not.toContain(" in ");
+    expect(rendered).not.toContain("not ");
+  });
+
+  it("leaves `not (o.x in other)` unchanged when RHS is not a literal table", () => {
+    const expr = parseExpressionString("not (o.x in other_table)");
+    const normalized = normalizePushdownExpression(expr);
+    const rendered = exprToString(normalized);
+    expect(rendered).toContain("not ");
+    expect(rendered).toContain(" in ");
+  });
+});
+
+describe("extractSingleSourceFilters with IN / NOT IN", () => {
+  it("pushes down `o.x in {literal, ...}` as a single-source filter", () => {
+    const expr = parseExpressionString("o.x in {1, 2, 3}");
+    const { pushed, residual } = extractSingleSourceFilters(
+      expr,
+      new Set(["o"]),
+    );
+    expect(residual).toBeUndefined();
+    expect(pushed).toHaveLength(1);
+    expect(pushed[0].sourceName).toBe("o");
+  });
+
+  it("pushes `not (o.x in {literals})` as a single-source filter (rewritten to ANDed ~=)", () => {
+    const expr = parseExpressionString("not (o.x in {1, 2, 3})");
+    const { pushed, residual } = extractSingleSourceFilters(
+      expr,
+      new Set(["o"]),
+    );
+    expect(residual).toBeUndefined();
+    expect(pushed).toHaveLength(1);
+    expect(pushed[0].sourceName).toBe("o");
+    const rendered = exprToString(pushed[0].expression);
+    expect(rendered).toContain("o.x ~= 1");
+    expect(rendered).toContain("o.x ~= 3");
+  });
+
+  it("keeps a mixed-source `in` out of single-source pushdown", () => {
+    const expr = parseExpressionString("o.x in {1, b.y, 3}");
+    const { pushed, residual } = extractSingleSourceFilters(
+      expr,
+      new Set(["o", "b"]),
+    );
+    expect(pushed).toHaveLength(0);
+    expect(residual).toBeDefined();
   });
 });

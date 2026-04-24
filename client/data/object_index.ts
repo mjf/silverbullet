@@ -33,6 +33,8 @@ import {
 } from "./bitmap/bitmap_index.ts";
 import { RoaringBitmap } from "./bitmap/roaring_bitmap.ts";
 import { MCVList } from "../space_lua/mcv.ts";
+import { normalizePushdownExpression } from "../space_lua/join_planner.ts";
+import type { LuaExpression } from "../space_lua/ast.ts";
 
 // KV key prefixes
 const indexKey = "idx";
@@ -90,6 +92,11 @@ type BitmapPredicate =
       kind: "lte";
       column: string;
       value: string | number | boolean;
+    }
+  | {
+      kind: "in";
+      column: string;
+      values: (string | number | boolean)[];
     };
 
 type IndexStorageStats = {
@@ -149,7 +156,106 @@ function propertyNameForSourceExpr(
   return undefined;
 }
 
+function collectOrChainForBitmap(expr: any): any[] {
+  if (expr.type === "Binary" && expr.operator === "or") {
+    return [
+      ...collectOrChainForBitmap(expr.left),
+      ...collectOrChainForBitmap(expr.right),
+    ];
+  }
+  return [expr];
+}
+
+function extractInValuesFromTableConstructor(
+  right: any,
+): (string | number | boolean)[] | undefined {
+  if (right?.type !== "TableConstructor") {
+    return undefined;
+  }
+  const out: (string | number | boolean)[] = [];
+  for (const field of right.fields) {
+    if (field.type === "ExpressionField") {
+      const v = literalValueFromExpr(field.value);
+      if (v === undefined) {
+        return undefined;
+      }
+      out.push(v);
+    } else if (field.type === "PropField") {
+      const v = literalValueFromExpr(field.value);
+      if (v === undefined) {
+        return undefined;
+      }
+      out.push(v);
+    } else {
+      return undefined;
+    }
+  }
+  return out;
+}
+
+function tryColumnEqFromBinary(
+  expr: any,
+  sourceName: string | undefined,
+): { column: string; value: string | number | boolean } | undefined {
+  if (expr.type !== "Binary" || expr.operator !== "==") {
+    return undefined;
+  }
+  const leftCol = propertyNameForSourceExpr(expr.left, sourceName);
+  const rightLit = literalValueFromExpr(expr.right);
+  if (leftCol && rightLit !== undefined) {
+    return { column: leftCol, value: rightLit };
+  }
+  const rightCol = propertyNameForSourceExpr(expr.right, sourceName);
+  const leftLit = literalValueFromExpr(expr.left);
+  if (rightCol && leftLit !== undefined) {
+    return { column: rightCol, value: leftLit };
+  }
+  return undefined;
+}
+
+function trySameColumnInFromOr(
+  expr: any,
+  sourceName: string | undefined,
+): BitmapPredicate | undefined {
+  const parts = collectOrChainForBitmap(expr);
+  if (parts.length < 2) {
+    return undefined;
+  }
+  let col: string | undefined;
+  const values: (string | number | boolean)[] = [];
+  for (const p of parts) {
+    const eq = tryColumnEqFromBinary(p, sourceName);
+    if (!eq) {
+      return undefined;
+    }
+    if (col === undefined) {
+      col = eq.column;
+    }
+    if (col !== eq.column) {
+      return undefined;
+    }
+    values.push(eq.value);
+  }
+  if (col === undefined) {
+    return undefined;
+  }
+  return { kind: "in", column: col, values };
+}
+
 function extractBitmapPredicates(
+  expr: LuaExpression | undefined,
+  sourceName: string | undefined,
+): BitmapPredicate[] {
+  if (!expr) {
+    return [];
+  }
+  return extractBitmapPredicatesInner(
+    normalizePushdownExpression(expr),
+    sourceName,
+  );
+}
+
+function extractBitmapPredicatesInner(
   expr: any,
   sourceName: string | undefined,
 ): BitmapPredicate[] {
@@ -158,9 +264,29 @@ function extractBitmapPredicates(
   // Flatten AND conjunctions
   if (expr.type === "Binary" && expr.operator === "and") {
     return [
-      ...extractBitmapPredicates(expr.left, sourceName),
-      ...extractBitmapPredicates(expr.right, sourceName),
+      ...extractBitmapPredicatesInner(expr.left, sourceName),
+      ...extractBitmapPredicatesInner(expr.right, sourceName),
     ];
+  }
+
+  if (expr.type === "QueryIn") {
+    const col = propertyNameForSourceExpr(expr.left, sourceName);
+    const values = extractInValuesFromTableConstructor(expr.right);
+    if (col && values && values.length > 0) {
+      if (values.length === 1) {
+        return [{ kind: "eq", column: col, value: values[0]! }];
+      }
+      return [{ kind: "in", column: col, values }];
+    }
+    return [];
+  }
+
+  if (expr.type === "Binary" && expr.operator === "or") {
+    const inPred = trySameColumnInFromOr(expr, sourceName);
+    if (inPred) {
+      return [inPred];
+    }
+    return [];
   }
 
   if (expr.type !== "Binary") return [];
@@ -552,6 +678,7 @@ export class ObjectIndex {
                       "stage-where",
                       "pred-eq",
                       "pred-neq",
+                      "pred-in",
                       "pred-gt",
                       "pred-gte",
                       "pred-lt",
@@ -560,24 +687,33 @@ export class ObjectIndex {
                       "expr-column-qualified",
                       "expr-column-unqualified",
                       "bool-and",
+                      "bool-or",
+                      "bool-not",
                       "stats-row-count",
-                      ...(indexComplete ? (["stats-ndv", "stats-mcv"] as const) : []),
+                      ...(indexComplete
+                        ? (["stats-ndv", "stats-mcv"] as const)
+                        : []),
                     ]
                   : [
                       "scan-index",
                       "stats-row-count",
-                      ...(indexComplete ? (["stats-ndv", "stats-mcv"] as const) : []),
+                      ...(indexComplete
+                        ? (["stats-ndv", "stats-mcv"] as const)
+                        : []),
                     ],
                 baseCostWeight: indexTrusted ? 0.6 : 1.0,
                 capabilityCosts: indexTrusted
                   ? {
                       "pred-eq": 0.7,
                       "pred-neq": 0.9,
+                      "pred-in": 0.75,
                       "pred-gt": 0.8,
                       "pred-gte": 0.8,
                       "pred-lt": 0.8,
                       "pred-lte": 0.8,
                       "bool-and": 0.7,
+                      "bool-or": 0.75,
+                      "bool-not": 0.85,
                     }
                   : undefined,
                 priority: indexTrusted ? 20 : 10,
@@ -1386,6 +1522,21 @@ export class ObjectIndex {
       }
       const bm = this.bitmapIndex.getBitmap(tagId, predicate.column, valueId);
       return bm ?? new RoaringBitmap();
+    }
+
+    if (predicate.kind === "in") {
+      let union: RoaringBitmap | undefined;
+      for (const v of predicate.values) {
+        const valueId = dict.tryEncode(v);
+        if (valueId === undefined) {
+          continue;
+        }
+        const bm = this.bitmapIndex.getBitmap(tagId, predicate.column, valueId);
+        if (bm) {
+          union = union ? RoaringBitmap.or(union, bm) : bm;
+        }
+      }
+      return union ?? new RoaringBitmap();
     }
 
     if (predicate.kind === "neq") {
